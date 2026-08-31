@@ -18,26 +18,15 @@ pub enum Number {
     Getpid = 4,
 }
 
-impl Number {
-    pub fn from_u64(value: u64) -> Option<Self> {
-        match value {
-            0 => Some(Self::Yield),
-            1 => Some(Self::Read),
-            2 => Some(Self::Write),
-            3 => Some(Self::Exit),
-            4 => Some(Self::Getpid),
-            _ => None,
-        }
-    }
-}
-
 pub fn emit(number: Number) {
     REQUEST.store(number as u64, Ordering::Release);
 
+    // SAFETY: IDT vector 0x80 is installed before shell commands run. The
+    // current handler only records the request and returns through the CPU's
+    // interrupt frame; it never schedules or changes privilege level.
     unsafe {
         asm!(
             "int 0x80",
-            in("rax") number as u64,
             options(nomem, nostack, preserves_flags)
         );
     }
@@ -50,43 +39,16 @@ pub fn test() -> bool {
         && LAST_COMPLETED.load(Ordering::Acquire) == Number::Yield as u64
 }
 
-pub fn dispatch(number: Number) {
-    match number {
-        Number::Yield => {
-            crate::serial::write_fmt(format_args!("SYSCALL: YIELD\n"));
-            crate::task::yield_now();
-        }
-        Number::Read => {
-            crate::serial::write_fmt(format_args!("SYSCALL: READ\n"));
-        }
-        Number::Write => {
-            crate::serial::write_fmt(format_args!("SYSCALL: WRITE\n"));
-        }
-        Number::Exit => {
-            crate::serial::write_fmt(format_args!("SYSCALL: EXIT\n"));
-            crate::task::exit_current_process();
-        }
-        Number::Getpid => {
-            crate::serial::write_fmt(format_args!("SYSCALL: GETPID\n"));
-            if let Some(process) = crate::task::current_process() {
-                crate::serial::write_fmt(format_args!("PID: {}\n", process.id.as_u64()));
-            }
-        }
-    }
-}
-
 pub fn handle_interrupt() {
     let request = REQUEST.swap(NO_REQUEST, Ordering::AcqRel);
     if request == NO_REQUEST {
         return;
     }
 
-    let Some(number) = Number::from_u64(request) else {
-        crate::serial::write_fmt(format_args!("SYSCALL: UNKNOWN NUMBER {request:#x}\n"));
+    if request > Number::Getpid as u64 {
         return;
-    };
+    }
 
     LAST_COMPLETED.store(request, Ordering::Release);
     COMPLETIONS.fetch_add(1, Ordering::Release);
-    dispatch(number);
 }
