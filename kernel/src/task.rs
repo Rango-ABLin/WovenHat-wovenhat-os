@@ -41,7 +41,7 @@ unsafe extern "C" {
     fn wovenhat_context_switch(previous_rsp: *mut u64, next_rsp: u64);
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TaskId(u64);
 
 impl TaskId {
@@ -123,6 +123,12 @@ pub struct Summary {
     pub current_name: &'static str,
     pub context_switches: u64,
     pub idle_heartbeats: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityError {
+    PermissionDenied,
+    UnknownTask,
 }
 
 struct Scheduler {
@@ -218,6 +224,53 @@ pub fn current_has(capability: Capability) -> bool {
         .contains(capability)
 }
 
+pub fn grant(target: TaskId, capability: Capability) -> Result<(), CapabilityError> {
+    let mut scheduler = SCHEDULER.lock();
+    assert!(scheduler.task_count != 0, "scheduler not initialized");
+
+    let authority = scheduler.tasks[scheduler.current_slot].capabilities;
+    if !authority.contains(Capability::TaskControl) || !authority.contains(capability) {
+        return Err(CapabilityError::PermissionDenied);
+    }
+
+    let target_task = scheduler
+        .tasks
+        .iter_mut()
+        .find(|task| task.state != TaskState::Empty && task.id == target)
+        .ok_or(CapabilityError::UnknownTask)?;
+    target_task.capabilities = target_task.capabilities.with(capability);
+    Ok(())
+}
+
+pub fn revoke(target: TaskId, capability: Capability) -> Result<(), CapabilityError> {
+    let mut scheduler = SCHEDULER.lock();
+    assert!(scheduler.task_count != 0, "scheduler not initialized");
+
+    if !scheduler.tasks[scheduler.current_slot]
+        .capabilities
+        .contains(Capability::TaskControl)
+    {
+        return Err(CapabilityError::PermissionDenied);
+    }
+
+    let target_task = scheduler
+        .tasks
+        .iter_mut()
+        .find(|task| task.state != TaskState::Empty && task.id == target)
+        .ok_or(CapabilityError::UnknownTask)?;
+    target_task.capabilities = target_task.capabilities.without(capability);
+    Ok(())
+}
+
+fn task_has(task_id: TaskId, capability: Capability) -> bool {
+    SCHEDULER
+        .lock()
+        .tasks
+        .iter()
+        .find(|task| task.state != TaskState::Empty && task.id == task_id)
+        .is_some_and(|task| task.capabilities.contains(capability))
+}
+
 pub fn capability_policy_valid() -> bool {
     let scheduler = SCHEDULER.lock();
     assert!(scheduler.task_count >= 2, "bootstrap tasks are missing");
@@ -226,6 +279,7 @@ pub fn capability_policy_valid() -> bool {
         Capability::Console,
         Capability::TimerRead,
         Capability::TaskInspect,
+        Capability::TaskControl,
         Capability::DeviceIo,
         Capability::InterruptControl,
     ];
@@ -236,6 +290,15 @@ pub fn capability_policy_valid() -> bool {
         && required
             .iter()
             .all(|capability| !scheduler.tasks[1].capabilities.contains(*capability))
+}
+
+pub fn capability_delegation_valid() -> bool {
+    let granted = grant(IDLE_TASK_ID, Capability::TimerRead).is_ok();
+    let observed = task_has(IDLE_TASK_ID, Capability::TimerRead);
+    let revoked = revoke(IDLE_TASK_ID, Capability::TimerRead).is_ok();
+    let denied_after_revoke = !task_has(IDLE_TASK_ID, Capability::TimerRead);
+
+    granted && observed && revoked && denied_after_revoke
 }
 
 fn idle_task() -> ! {

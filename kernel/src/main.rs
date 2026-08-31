@@ -41,7 +41,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("SECURE INTELLIGENCE PLATFORM");
     console.println("");
 
-    console.println("WOVENHAT KERNEL 0.0.6");
+    console.println("WOVENHAT KERNEL 0.0.7");
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
@@ -65,6 +65,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("CAPABILITY POLICY: ONLINE");
     } else {
         console.println("CAPABILITY POLICY: FAILED");
+        halt();
+    }
+
+    if task::capability_delegation_valid() {
+        console.println("CAPABILITY DELEGATION: OK");
+    } else {
+        console.println("CAPABILITY DELEGATION: FAILED");
         halt();
     }
 

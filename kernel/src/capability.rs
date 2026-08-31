@@ -4,8 +4,9 @@ pub enum Capability {
     Console = 0,
     TimerRead = 1,
     TaskInspect = 2,
-    DeviceIo = 3,
-    InterruptControl = 4,
+    TaskControl = 3,
+    DeviceIo = 4,
+    InterruptControl = 5,
 }
 
 #[derive(Clone, Copy)]
@@ -23,6 +24,7 @@ impl CapabilitySet {
             .with(Capability::Console)
             .with(Capability::TimerRead)
             .with(Capability::TaskInspect)
+            .with(Capability::TaskControl)
             .with(Capability::DeviceIo)
             .with(Capability::InterruptControl)
     }
@@ -35,6 +37,12 @@ impl CapabilitySet {
 
     pub const fn contains(self, capability: Capability) -> bool {
         self.bits & capability.bit() != 0
+    }
+
+    pub const fn without(self, capability: Capability) -> Self {
+        Self {
+            bits: self.bits & !capability.bit(),
+        }
     }
 }
 

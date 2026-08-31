@@ -72,7 +72,7 @@ impl Shell {
                 console.clear();
             }
             "version" => {
-                console.println("WOVENHAT KERNEL 0.0.6");
+                console.println("WOVENHAT KERNEL 0.0.7");
             }
             "ticks" => {
                 if !authorize(Capability::TimerRead, console) {
@@ -108,6 +108,7 @@ impl Shell {
                 print_capability(console, Capability::Console, " CONSOLE");
                 print_capability(console, Capability::TimerRead, " TIMER_READ");
                 print_capability(console, Capability::TaskInspect, " TASK_INSPECT");
+                print_capability(console, Capability::TaskControl, " TASK_CONTROL");
                 print_capability(console, Capability::DeviceIo, " DEVICE_IO");
                 print_capability(console, Capability::InterruptControl, " INTERRUPT_CONTROL");
                 console.newline();
