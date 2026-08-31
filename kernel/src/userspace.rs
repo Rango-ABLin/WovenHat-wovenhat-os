@@ -29,6 +29,39 @@ impl UserImage {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct UserStack {
+    pub base: u64,
+    pub top: u64,
+    pub size: usize,
+}
+
+impl UserStack {
+    pub const SIZE: usize = 4096 * 2;
+
+    pub fn new(base: u64) -> Self {
+        Self {
+            base,
+            top: base + Self::SIZE as u64,
+            size: Self::SIZE,
+        }
+    }
+
+    pub fn is_aligned(self) -> bool {
+        self.base % 16 == 0 && self.top % 16 == 0
+    }
+}
+
+pub fn allocate_user_stack() -> Option<UserStack> {
+    let layout = core::alloc::Layout::from_size_align(UserStack::SIZE, 16).ok()?;
+    let ptr = unsafe { alloc::alloc::alloc(layout) };
+    if ptr.is_null() {
+        return None;
+    }
+    let base = ptr as u64;
+    Some(UserStack::new(base))
+}
+
 pub fn stub_program(entry: usize, stack_top: usize) -> UserImage {
     UserImage::new(entry as u64, stack_top as u64)
 }
@@ -40,4 +73,8 @@ pub fn validate_stub(entry: usize, stack_top: usize) -> bool {
 pub fn describe(entry: usize, stack_top: usize) -> (u64, u64, u64) {
     let image = stub_program(entry, stack_top);
     (image.entry, image.stack_top, image.image_size)
+}
+
+unsafe extern "C" {
+    pub fn wovenhat_user_stub() -> !;
 }

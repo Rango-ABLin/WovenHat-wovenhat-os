@@ -67,9 +67,19 @@ global_asm!(
     "iretq",
 );
 
+global_asm!(
+    ".global wovenhat_user_stub",
+    "wovenhat_user_stub:",
+    "cli",
+    "mov rax, 0xDEADBEEF",
+    "2:",
+    "jmp 2b",
+);
+
 unsafe extern "C" {
     fn wovenhat_context_switch(previous_rsp: *mut u64, next_rsp: u64);
     fn wovenhat_enter_user_mode(entry: u64, stack_top: u64, user_cs: u16, user_ss: u16) -> !;
+    fn wovenhat_user_stub() -> !;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -631,6 +641,7 @@ pub fn capability_policy_valid() -> bool {
         Capability::DeviceIo,
         Capability::InterruptControl,
         Capability::MemoryInspect,
+        Capability::FileRead,
     ];
 
     required

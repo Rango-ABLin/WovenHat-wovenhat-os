@@ -1,6 +1,6 @@
 use crate::{
     capability::Capability, console::Console, heap, keyboard::Key, memory, paging, syscall, task,
-    timer,
+    timer, userspace, vfs,
 };
 
 const PROMPT: &str = "WOVENHAT> ";
@@ -64,7 +64,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP SPAWN SYSCALL USER RING3");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP FS CAT SPAWN SYSCALL USER RING3");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -123,6 +123,7 @@ impl Shell {
                 print_capability(console, Capability::DeviceIo, " DEVICE_IO");
                 print_capability(console, Capability::InterruptControl, " INTERRUPT_CONTROL");
                 print_capability(console, Capability::MemoryInspect, " MEMORY_INSPECT");
+                print_capability(console, Capability::FileRead, " FILE_READ");
                 console.newline();
             }
             "memory" => {
@@ -158,6 +159,42 @@ impl Shell {
                 console.print(" ALLOCATIONS: ");
                 print_u64(console, stats.allocations as u64);
                 console.newline();
+            }
+            "fs" => {
+                if !authorize(Capability::FileRead, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                let stats = vfs::stats();
+                console.print("VFS NODES: ");
+                print_u64(console, stats.nodes as u64);
+                console.print(" OPEN: ");
+                print_u64(console, stats.open_files as u64);
+                console.print(" CAPACITY: ");
+                print_u64(console, stats.capacity as u64);
+                console.newline();
+            }
+            "cat" => {
+                if !authorize(Capability::FileRead, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                let Ok(file) = vfs::open("/etc/motd") else {
+                    console.println("VFS OPEN FAILED");
+                    self.finish(console);
+                    return;
+                };
+                let mut buffer = [0_u8; 64];
+                match vfs::read(file, &mut buffer) {
+                    Ok(length) => {
+                        let text = core::str::from_utf8(&buffer[..length]).unwrap_or("INVALID UTF-8");
+                        console.print(text);
+                    }
+                    Err(_) => console.println("VFS READ FAILED"),
+                }
+                let _ = vfs::close(file);
             }
             "spawn" => {
                 if !authorize(Capability::TaskControl, console) {
@@ -195,7 +232,7 @@ impl Shell {
                     return;
                 }
 
-                let entry = task::user_stub_entry as usize;
+                let entry = task::user_stub_entry as *const () as usize;
                 let stack_top = 0x2000000usize;
                 match task::register_user_launch("usermode", entry, stack_top) {
                     Ok((id, context)) => {
@@ -222,14 +259,25 @@ impl Shell {
                     return;
                 }
 
-                let entry = 0x1000usize;
-                let stack_top = 0x2000000usize;
-                if task::validate_user_task(entry, stack_top) {
-                    console.println("RING3 ENTRY STUB: READY");
-                    console.println("ATTEMPTING USER MODE TRANSITION...");
-                    task::enter_user_mode(entry, stack_top);
+                console.println("ALLOCATING USER STACK...");
+                if let Some(user_stack) = userspace::allocate_user_stack() {
+                    console.print("USER STACK ALLOCATED: BASE=");
+                    print_hex_u64(console, user_stack.base);
+                    console.print(" TOP=");
+                    print_hex_u64(console, user_stack.top);
+                    console.newline();
+                    
+                    unsafe {
+                        let entry = userspace::wovenhat_user_stub as *const () as usize;
+                        console.print("USER ENTRY POINT: ");
+                        print_hex_u64(console, entry as u64);
+                        console.newline();
+                        
+                        console.println("INITIATING RING-3 TRANSITION...");
+                        task::enter_user_mode(entry, user_stack.top as usize);
+                    }
                 } else {
-                    console.println("RING3 ENTRY STUB: INVALID");
+                    console.println("USER STACK ALLOCATION FAILED: HEAP FULL");
                 }
             }
             "paging" => {
