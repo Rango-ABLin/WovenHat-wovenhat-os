@@ -5,6 +5,7 @@
 mod console;
 mod interrupts;
 mod keyboard;
+mod serial;
 
 use bootloader_api::{BootInfo, entry_point, info::Optional};
 
@@ -38,6 +39,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
 
+    serial::init();
     //
     // Interrupt Descriptor Table
     //
