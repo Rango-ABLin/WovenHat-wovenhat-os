@@ -8,13 +8,15 @@ mod interrupts;
 mod keyboard;
 mod pic;
 mod serial;
+mod shell;
 mod timer;
 
 use bootloader_api::{BootInfo, entry_point, info::Optional};
 
 use console::Console;
 use core::panic::PanicInfo;
-use keyboard::{Key, Keyboard};
+use keyboard::Keyboard;
+use shell::Shell;
 
 use x86_64::instructions::interrupts::int3;
 
@@ -37,7 +39,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("SECURE INTELLIGENCE PLATFORM");
     console.println("");
 
-    console.println("WOVENHAT KERNEL 0.0.3");
+    console.println("WOVENHAT KERNEL 0.0.5");
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
@@ -85,7 +87,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     console.println("");
-    console.print("WOVENHAT> ");
+    let mut shell = Shell::new();
+    shell.print_prompt(&mut console);
 
     //
     // Interrupt-driven keyboard input. The IRQ handler only queues raw
@@ -96,20 +99,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     loop {
         if let Some(key) = keyboard.poll() {
-            match key {
-                Key::Char(character) => {
-                    console.put_char(character);
-                }
-
-                Key::Backspace => {
-                    console.backspace();
-                }
-
-                Key::Enter => {
-                    console.newline();
-                    console.print("WOVENHAT> ");
-                }
-            }
+            shell.handle_key(key, &mut console);
         }
 
         core::hint::spin_loop();
