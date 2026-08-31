@@ -15,6 +15,7 @@ const IDLE_TASK_ID: TaskId = TaskId(1);
 
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::empty());
 static IDLE_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(2);
 static TASK_STACKS: [TaskStack; MAX_TASKS] = [const { TaskStack::new() }; MAX_TASKS];
 
 global_asm!(
@@ -95,6 +96,7 @@ struct TaskControlBlock {
     id: TaskId,
     name: &'static str,
     state: TaskState,
+    priority: u8,
     context: Context,
     capabilities: CapabilitySet,
 }
@@ -105,6 +107,7 @@ impl TaskControlBlock {
             id: TaskId(u64::MAX),
             name: "",
             state: TaskState::Empty,
+            priority: 0,
             context: Context { stack_pointer: 0 },
             capabilities: CapabilitySet::empty(),
         }
@@ -114,6 +117,7 @@ impl TaskControlBlock {
         self.id = id;
         self.name = name;
         self.state = TaskState::Ready;
+        self.priority = 1;
 
         let stack_start = TASK_STACKS[slot].0.get().cast::<u8>() as usize;
         let stack_top = stack_start + TASK_STACK_SIZE;
@@ -148,6 +152,11 @@ pub struct Summary {
 pub enum CapabilityError {
     PermissionDenied,
     UnknownTask,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpawnError {
+    Full,
 }
 
 struct Scheduler {
@@ -232,6 +241,22 @@ impl Scheduler {
 
 pub fn init() {
     SCHEDULER.lock().initialize();
+}
+
+pub fn spawn(name: &'static str, entry: fn() -> !) -> Result<TaskId, SpawnError> {
+    let mut scheduler = SCHEDULER.lock();
+    assert!(scheduler.task_count != 0, "scheduler not initialized");
+
+    let slot = scheduler
+        .tasks
+        .iter()
+        .position(|task| task.state == TaskState::Empty)
+        .ok_or(SpawnError::Full)?;
+
+    let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    scheduler.tasks[slot].initialize(slot, id, name, entry);
+    scheduler.task_count += 1;
+    Ok(id)
 }
 
 pub fn yield_now() {
