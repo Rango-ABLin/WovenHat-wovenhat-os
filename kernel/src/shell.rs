@@ -64,7 +64,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP SPAWN SYSCALL USER");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP SPAWN SYSCALL USER RING3");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -204,6 +204,20 @@ impl Shell {
                     Err(_) => {
                         console.println("USER TASK REGISTRATION FAILED: PROCESS TABLE FULL");
                     }
+                }
+            }
+            "ring3" => {
+                if !authorize(Capability::TaskControl, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                let entry = 0x1000usize;
+                let stack_top = 0x2000000usize;
+                if task::validate_user_task(entry, stack_top) {
+                    console.println("RING3 ENTRY STUB: READY");
+                } else {
+                    console.println("RING3 ENTRY STUB: INVALID");
                 }
             }
             "paging" => {

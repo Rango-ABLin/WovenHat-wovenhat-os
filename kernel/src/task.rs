@@ -50,12 +50,6 @@ global_asm!(
 global_asm!(
     ".global wovenhat_enter_user_mode",
     "wovenhat_enter_user_mode:",
-    "mov ax, cx",
-    "mov ds, ax",
-    "mov es, ax",
-    "mov fs, ax",
-    "mov gs, ax",
-    "mov ss, ax",
     "push rcx",
     "push rsi",
     "pushfq",
@@ -368,6 +362,10 @@ pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> R
     let _ = register_process(process)?;
     let _context = prepare_user_context(entry, stack_top);
     Ok(id)
+}
+
+pub fn validate_user_task(entry: usize, stack_top: usize) -> bool {
+    userspace::validate_stub(entry, stack_top)
 }
 
 pub fn exit_current_process() {
