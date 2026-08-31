@@ -1,4 +1,6 @@
-use crate::{capability::Capability, console::Console, keyboard::Key, memory, paging, task, timer};
+use crate::{
+    capability::Capability, console::Console, heap, keyboard::Key, memory, paging, task, timer,
+};
 
 const PROMPT: &str = "WOVENHAT> ";
 const COMMAND_CAPACITY: usize = 128;
@@ -61,7 +63,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -152,6 +154,23 @@ impl Shell {
                 } else {
                     "FAILED"
                 });
+                console.newline();
+            }
+            "heap" => {
+                if !authorize(Capability::MemoryInspect, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                let stats = heap::stats();
+                console.print("HEAP START: ");
+                print_hex_u64(console, stats.start);
+                console.print(" SIZE: ");
+                print_u64(console, stats.size as u64);
+                console.print(" USED: ");
+                print_u64(console, stats.allocated_bytes as u64);
+                console.print(" ALLOCS: ");
+                print_u64(console, stats.allocations as u64);
                 console.newline();
             }
             _ => {

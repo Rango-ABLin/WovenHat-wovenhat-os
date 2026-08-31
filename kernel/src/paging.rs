@@ -3,8 +3,8 @@ use x86_64::{
     VirtAddr,
     registers::control::Cr3,
     structures::paging::{
-        FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, Size4KiB,
-        Translate,
+        FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags,
+        Size4KiB, Translate,
     },
 };
 
@@ -28,6 +28,15 @@ pub enum InitError {
     MissingPhysicalMemoryMapping,
     AlreadyInitialized,
     AddressOverflow,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MapRangeError {
+    NotInitialized,
+    InvalidRange,
+    AlreadyMapped,
+    OutOfFrames,
+    MappingFailed,
 }
 
 struct PagingState {
@@ -146,6 +155,44 @@ pub fn mapping_self_test() -> bool {
     let passed = value == TEST_VALUE && mapper.translate_addr(page.start_address()).is_none();
     paging.mapping_test_passed = passed;
     passed
+}
+
+pub fn map_range(start: u64, size: usize) -> Result<(), MapRangeError> {
+    if size == 0 || start % Size4KiB::SIZE != 0 || size % Size4KiB::SIZE as usize != 0 {
+        return Err(MapRangeError::InvalidRange);
+    }
+
+    let size = u64::try_from(size).map_err(|_| MapRangeError::InvalidRange)?;
+    let last_address = start
+        .checked_add(size - 1)
+        .ok_or(MapRangeError::InvalidRange)?;
+    let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(start));
+    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(last_address));
+
+    let mut paging = PAGING.lock();
+    let Some(mapper) = paging.mapper.as_mut() else {
+        return Err(MapRangeError::NotInitialized);
+    };
+    let mut allocator = memory::allocator();
+
+    for page in Page::range_inclusive(start_page, end_page) {
+        if mapper.translate_addr(page.start_address()).is_some() {
+            return Err(MapRangeError::AlreadyMapped);
+        }
+
+        let frame = allocator
+            .allocate_frame()
+            .ok_or(MapRangeError::OutOfFrames)?;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+        // SAFETY: Each page is checked to be unmapped and each frame comes
+        // uniquely from the physical allocator. Both allocators are locked.
+        let flush = unsafe { mapper.map_to(page, frame, flags, &mut *allocator) }
+            .map_err(|_| MapRangeError::MappingFailed)?;
+        flush.flush();
+    }
+
+    Ok(())
 }
 
 pub fn stats() -> Stats {
