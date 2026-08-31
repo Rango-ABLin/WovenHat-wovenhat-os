@@ -207,6 +207,7 @@ impl TaskControlBlock {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Process {
     pub id: ProcessId,
     pub parent: Option<ProcessId>,
@@ -348,10 +349,11 @@ pub fn create_process(name: &'static str, entry: usize, stack_top: usize, ring: 
 }
 
 pub fn register_process(process: Process) -> Result<ProcessId, ProcessError> {
+    let id = process.id;
     let mut table = PROCESS_TABLE.lock();
     let slot = table.iter().position(|entry| entry.is_none()).ok_or(ProcessError::Full)?;
     table[slot] = Some(process);
-    Ok(process.id)
+    Ok(id)
 }
 
 pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> Result<ProcessId, ProcessError> {
