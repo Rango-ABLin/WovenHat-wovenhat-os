@@ -64,7 +64,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP SPAWN SYSCALL");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP SPAWN SYSCALL USER");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -187,6 +187,23 @@ impl Shell {
                     console.println("SYSCALL HANDLER: OK");
                 } else {
                     console.println("SYSCALL HANDLER: FAILED");
+                }
+            }
+            "user" => {
+                if !authorize(Capability::TaskControl, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                match task::launch_user_task("usermode", 0x1000, 0x2000000) {
+                    Ok(id) => {
+                        console.print("USER TASK REGISTERED: ");
+                        print_u64(console, id.as_u64());
+                        console.newline();
+                    }
+                    Err(_) => {
+                        console.println("USER TASK REGISTRATION FAILED: PROCESS TABLE FULL");
+                    }
                 }
             }
             "paging" => {

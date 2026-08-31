@@ -358,7 +358,10 @@ pub fn register_process(process: Process) -> Result<ProcessId, ProcessError> {
 
 pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> Result<ProcessId, ProcessError> {
     let process = create_process(name, entry, stack_top, 3);
-    register_process(process)
+    let id = process.id;
+    let _ = register_process(process)?;
+    let _context = prepare_user_context(entry, stack_top);
+    Ok(id)
 }
 
 pub fn process_count() -> usize {
