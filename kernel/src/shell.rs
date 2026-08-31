@@ -1,4 +1,4 @@
-use crate::{console::Console, keyboard::Key, task, timer};
+use crate::{capability::Capability, console::Console, keyboard::Key, task, timer};
 
 const PROMPT: &str = "WOVENHAT> ";
 const COMMAND_CAPACITY: usize = 128;
@@ -61,20 +61,35 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS");
             }
             "clear" => {
+                if !authorize(Capability::Console, console) {
+                    self.finish(console);
+                    return;
+                }
+
                 console.clear();
             }
             "version" => {
                 console.println("WOVENHAT KERNEL 0.0.6");
             }
             "ticks" => {
+                if !authorize(Capability::TimerRead, console) {
+                    self.finish(console);
+                    return;
+                }
+
                 console.print("TIMER TICKS: ");
                 print_u64(console, timer::ticks());
                 console.newline();
             }
             "tasks" => {
+                if !authorize(Capability::TaskInspect, console) {
+                    self.finish(console);
+                    return;
+                }
+
                 let summary = task::summary();
                 console.print("TASKS: ");
                 print_u64(console, summary.task_count as u64);
@@ -88,14 +103,42 @@ impl Shell {
                 print_u64(console, summary.idle_heartbeats);
                 console.newline();
             }
+            "caps" => {
+                console.print("CAPS:");
+                print_capability(console, Capability::Console, " CONSOLE");
+                print_capability(console, Capability::TimerRead, " TIMER_READ");
+                print_capability(console, Capability::TaskInspect, " TASK_INSPECT");
+                print_capability(console, Capability::DeviceIo, " DEVICE_IO");
+                print_capability(console, Capability::InterruptControl, " INTERRUPT_CONTROL");
+                console.newline();
+            }
             _ => {
                 console.print("UNKNOWN COMMAND: ");
                 console.println(command);
             }
         }
 
+        self.finish(console);
+    }
+
+    fn finish(&mut self, console: &mut Console<'_>) {
         self.length = 0;
         self.print_prompt(console);
+    }
+}
+
+fn authorize(capability: Capability, console: &mut Console<'_>) -> bool {
+    if task::current_has(capability) {
+        return true;
+    }
+
+    console.println("ACCESS DENIED: MISSING CAPABILITY");
+    false
+}
+
+fn print_capability(console: &mut Console<'_>, capability: Capability, name: &str) {
+    if task::current_has(capability) {
+        console.print(name);
     }
 }
 

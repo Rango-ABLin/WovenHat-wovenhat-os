@@ -6,6 +6,8 @@ use core::{
 
 use spin::Mutex;
 
+use crate::capability::{Capability, CapabilitySet};
+
 const MAX_TASKS: usize = 4;
 const TASK_STACK_SIZE: usize = 4096 * 2;
 const KERNEL_TASK_ID: TaskId = TaskId(0);
@@ -78,6 +80,7 @@ struct TaskControlBlock {
     name: &'static str,
     state: TaskState,
     context: Context,
+    capabilities: CapabilitySet,
 }
 
 impl TaskControlBlock {
@@ -87,6 +90,7 @@ impl TaskControlBlock {
             name: "",
             state: TaskState::Empty,
             context: Context { stack_pointer: 0 },
+            capabilities: CapabilitySet::empty(),
         }
     }
 
@@ -144,6 +148,7 @@ impl Scheduler {
         self.tasks[0].id = KERNEL_TASK_ID;
         self.tasks[0].name = "kernel";
         self.tasks[0].state = TaskState::Running;
+        self.tasks[0].capabilities = CapabilitySet::kernel_bootstrap();
         self.tasks[1].initialize(1, IDLE_TASK_ID, "idle", idle_task);
         self.task_count = 2;
     }
@@ -203,6 +208,34 @@ pub fn summary() -> Summary {
     let scheduler = SCHEDULER.lock();
     assert!(scheduler.task_count != 0, "scheduler not initialized");
     scheduler.summary()
+}
+
+pub fn current_has(capability: Capability) -> bool {
+    let scheduler = SCHEDULER.lock();
+    assert!(scheduler.task_count != 0, "scheduler not initialized");
+    scheduler.tasks[scheduler.current_slot]
+        .capabilities
+        .contains(capability)
+}
+
+pub fn capability_policy_valid() -> bool {
+    let scheduler = SCHEDULER.lock();
+    assert!(scheduler.task_count >= 2, "bootstrap tasks are missing");
+
+    let required = [
+        Capability::Console,
+        Capability::TimerRead,
+        Capability::TaskInspect,
+        Capability::DeviceIo,
+        Capability::InterruptControl,
+    ];
+
+    required
+        .iter()
+        .all(|capability| scheduler.tasks[0].capabilities.contains(*capability))
+        && required
+            .iter()
+            .all(|capability| !scheduler.tasks[1].capabilities.contains(*capability))
 }
 
 fn idle_task() -> ! {

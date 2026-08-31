@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+mod capability;
 mod console;
 mod gdt;
 mod interrupts;
@@ -59,6 +60,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     task::init();
     console.println("SCHEDULER: INITIALIZED");
+
+    if task::capability_policy_valid() {
+        console.println("CAPABILITY POLICY: ONLINE");
+    } else {
+        console.println("CAPABILITY POLICY: FAILED");
+        halt();
+    }
 
     pic::init();
     console.println("PIC: INITIALIZED (ALL IRQS MASKED)");
