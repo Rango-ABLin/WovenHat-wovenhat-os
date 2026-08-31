@@ -155,6 +155,7 @@ struct Scheduler {
     current_slot: usize,
     task_count: usize,
     context_switches: u64,
+    quantum: u64,
 }
 
 impl Scheduler {
@@ -164,6 +165,7 @@ impl Scheduler {
             current_slot: 0,
             task_count: 0,
             context_switches: 0,
+            quantum: 0,
         }
     }
 
@@ -212,6 +214,20 @@ impl Scheduler {
             idle_heartbeats: IDLE_HEARTBEATS.load(Ordering::Relaxed),
         }
     }
+
+    fn tick(&mut self) -> bool {
+        if self.task_count < 2 {
+            return false;
+        }
+
+        self.quantum += 1;
+        if self.quantum < 2 {
+            return false;
+        }
+
+        self.quantum = 0;
+        true
+    }
 }
 
 pub fn init() {
@@ -233,6 +249,18 @@ pub fn yield_now() {
     // control blocks. The scheduler lock was released before switching, and
     // only cooperative calls to this function can change the running task.
     unsafe { wovenhat_context_switch(previous_rsp, next_rsp) };
+}
+
+pub fn tick() {
+    let should_switch = {
+        let mut scheduler = SCHEDULER.lock();
+        assert!(scheduler.task_count != 0, "scheduler not initialized");
+        scheduler.tick()
+    };
+
+    if should_switch {
+        yield_now();
+    }
 }
 
 pub fn summary() -> Summary {
