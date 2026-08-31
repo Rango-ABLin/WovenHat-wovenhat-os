@@ -31,6 +31,8 @@ static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 struct Selectors {
     code: SegmentSelector,
     data: SegmentSelector,
+    user_code: SegmentSelector,
+    user_data: SegmentSelector,
     tss: SegmentSelector,
 }
 
@@ -48,6 +50,8 @@ pub fn init() {
         let selectors = Selectors {
             code: gdt.append(Descriptor::kernel_code_segment()),
             data: gdt.append(Descriptor::kernel_data_segment()),
+            user_code: gdt.append(Descriptor::user_code_segment()),
+            user_data: gdt.append(Descriptor::user_data_segment()),
             tss: gdt.append(Descriptor::tss_segment(tss)),
         };
         (gdt, selectors)
@@ -65,4 +69,11 @@ pub fn init() {
         ES::set_reg(selectors.data);
         load_tss(selectors.tss);
     }
+}
+
+pub fn user_segments() -> (SegmentSelector, SegmentSelector) {
+    let (_, selectors) = GDT
+        .get()
+        .expect("GDT must be initialized before user mode is configured");
+    (selectors.user_code, selectors.user_data)
 }

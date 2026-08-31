@@ -7,7 +7,7 @@ use x86_64::{
     structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
 };
 
-use crate::{gdt, keyboard, pic, serial, task, timer};
+use crate::{gdt, keyboard, pic, serial, syscall, task, timer};
 
 static BREAKPOINT_REACHED: AtomicBool = AtomicBool::new(false);
 
@@ -112,9 +112,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 }
 
 extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame) {
-    let syscall_id = unsafe { x86_64::registers::model_specific::Efer::read() };
-    serial::write_fmt(format_args!("SYSCALL INTERRUPT: {syscall_id:?}\n"));
-    task::preemption_point();
+    syscall::handle_interrupt();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

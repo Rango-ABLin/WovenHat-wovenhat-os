@@ -183,8 +183,11 @@ impl Shell {
                 }
 
                 console.println("TRIGGERING SYSCALL 0x80");
-                syscall::test();
-                console.println("SYSCALL HANDLER RETURNED");
+                if syscall::test() {
+                    console.println("SYSCALL HANDLER: OK");
+                } else {
+                    console.println("SYSCALL HANDLER: FAILED");
+                }
             }
             "paging" => {
                 if !authorize(Capability::MemoryInspect, console) {

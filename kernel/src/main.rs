@@ -125,7 +125,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     gdt::init();
+    let _user_segments = gdt::user_segments();
     console.println("GDT/TSS: INSTALLED");
+    console.println("USER MODE SEGMENTS: READY");
 
     //
     // Interrupt Descriptor Table
