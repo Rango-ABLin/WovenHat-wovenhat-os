@@ -6,6 +6,7 @@ mod console;
 mod gdt;
 mod interrupts;
 mod keyboard;
+mod pic;
 mod serial;
 
 use bootloader_api::{BootInfo, entry_point, info::Optional};
@@ -51,6 +52,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init();
 
     console.println("IDT: INSTALLED");
+
+    pic::init();
+    console.println("PIC: INITIALIZED (ALL IRQS MASKED)");
 
     //
     // Breakpoint exception test
