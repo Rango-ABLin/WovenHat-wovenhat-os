@@ -59,6 +59,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     timer::init();
     pic::unmask(timer::IRQ);
+    pic::unmask(keyboard::IRQ);
     x86_64::instructions::interrupts::enable();
 
     while timer::ticks() < 3 {
@@ -66,6 +67,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     console.println("TIMER IRQ: OK");
+    console.println("KEYBOARD IRQ: READY");
 
     //
     // Breakpoint exception test
@@ -86,9 +88,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.print("WOVENHAT> ");
 
     //
-    // Temporary polling keyboard.
-    //
-    // We will replace this after IRQ support is working.
+    // Interrupt-driven keyboard input. The IRQ handler only queues raw
+    // scancodes; decoding and rendering remain in the main loop.
     //
 
     let mut keyboard = Keyboard::new();

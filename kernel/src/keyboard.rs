@@ -1,4 +1,68 @@
-use core::arch::asm;
+use core::{
+    arch::asm,
+    cell::UnsafeCell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+pub const IRQ: u8 = 1;
+
+const DATA_PORT: u16 = 0x60;
+const STATUS_PORT: u16 = 0x64;
+const SCANCODE_QUEUE_CAPACITY: usize = 64;
+
+static SCANCODES: ScancodeQueue = ScancodeQueue::new();
+
+struct ScancodeQueue {
+    buffer: UnsafeCell<[u8; SCANCODE_QUEUE_CAPACITY]>,
+    read_index: AtomicUsize,
+    write_index: AtomicUsize,
+}
+
+// SAFETY: This is a single-producer/single-consumer queue. IRQ1 is the only
+// producer and the kernel main loop is the only consumer. Release/acquire
+// ordering publishes each byte before the consumer observes its index.
+unsafe impl Sync for ScancodeQueue {}
+
+impl ScancodeQueue {
+    const fn new() -> Self {
+        Self {
+            buffer: UnsafeCell::new([0; SCANCODE_QUEUE_CAPACITY]),
+            read_index: AtomicUsize::new(0),
+            write_index: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, scancode: u8) {
+        let write_index = self.write_index.load(Ordering::Relaxed);
+        let next_index = (write_index + 1) % SCANCODE_QUEUE_CAPACITY;
+
+        if next_index == self.read_index.load(Ordering::Acquire) {
+            return;
+        }
+
+        // SAFETY: Only IRQ1 writes queue slots. A slot is not reused until the
+        // consumer advances `read_index`, so this write cannot alias a read.
+        unsafe { (*self.buffer.get())[write_index] = scancode };
+        self.write_index.store(next_index, Ordering::Release);
+    }
+
+    fn pop(&self) -> Option<u8> {
+        let read_index = self.read_index.load(Ordering::Relaxed);
+
+        if read_index == self.write_index.load(Ordering::Acquire) {
+            return None;
+        }
+
+        // SAFETY: The producer published this slot with a release store and
+        // cannot reuse it until `read_index` is advanced below.
+        let scancode = unsafe { (*self.buffer.get())[read_index] };
+        self.read_index.store(
+            (read_index + 1) % SCANCODE_QUEUE_CAPACITY,
+            Ordering::Release,
+        );
+        Some(scancode)
+    }
+}
 
 pub enum Key {
     Char(char),
@@ -16,16 +80,33 @@ impl Keyboard {
     }
 
     pub fn poll(&mut self) -> Option<Key> {
+        if let Some(scancode) = SCANCODES.pop() {
+            return self.decode(scancode);
+        }
+
+        if !x86_64::instructions::interrupts::are_enabled() {
+            return self.poll_legacy();
+        }
+
+        None
+    }
+
+    /// Temporary fallback for use while CPU interrupts are disabled.
+    pub fn poll_legacy(&mut self) -> Option<Key> {
         // PS/2 controller status register:
         // bit 0 == output buffer contains keyboard data.
-        let status = unsafe { inb(0x64) };
+        let status = unsafe { inb(STATUS_PORT) };
 
         if status & 1 == 0 {
             return None;
         }
 
-        let scancode = unsafe { inb(0x60) };
+        let scancode = unsafe { inb(DATA_PORT) };
 
+        self.decode(scancode)
+    }
+
+    fn decode(&mut self, scancode: u8) -> Option<Key> {
         match scancode {
             // Shift pressed
             0x2A | 0x36 => {
@@ -48,6 +129,13 @@ impl Keyboard {
             code => decode_scancode(code, self.shift).map(Key::Char),
         }
     }
+}
+
+pub fn handle_interrupt() {
+    // SAFETY: IRQ1 means the PS/2 controller has placed a keyboard scancode in
+    // its output buffer. Reading port 0x60 consumes exactly that byte.
+    let scancode = unsafe { inb(DATA_PORT) };
+    SCANCODES.push(scancode);
 }
 
 /// Read one byte from an x86 I/O port.
