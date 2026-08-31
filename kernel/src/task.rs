@@ -364,6 +364,21 @@ pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> R
     Ok(id)
 }
 
+pub fn exit_current_process() {
+    let mut scheduler = SCHEDULER.lock();
+    let slot = scheduler.current_slot;
+    let current = &mut scheduler.tasks[slot];
+
+    if current.state == TaskState::Empty || current.id == KERNEL_TASK_ID {
+        return;
+    }
+
+    current.state = TaskState::Dead;
+    current.name = "exited";
+    scheduler.task_count = scheduler.task_count.saturating_sub(1);
+    let _ = scheduler.prepare_switch();
+}
+
 pub fn process_count() -> usize {
     PROCESS_TABLE
         .lock()
