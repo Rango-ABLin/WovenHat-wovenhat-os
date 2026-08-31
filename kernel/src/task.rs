@@ -1,7 +1,7 @@
 use core::{
     arch::global_asm,
     cell::UnsafeCell,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use spin::Mutex;
@@ -16,6 +16,8 @@ const IDLE_TASK_ID: TaskId = TaskId(1);
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::empty());
 static IDLE_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(2);
+static PREEMPTION_TICKS: AtomicU64 = AtomicU64::new(0);
+static PREEMPTION_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TASK_STACKS: [TaskStack; MAX_TASKS] = [const { TaskStack::new() }; MAX_TASKS];
 
 global_asm!(
@@ -47,6 +49,19 @@ pub struct TaskId(u64);
 
 impl TaskId {
     pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskPriority(u8);
+
+impl TaskPriority {
+    pub const LOW: Self = Self(0);
+    pub const NORMAL: Self = Self(1);
+    pub const HIGH: Self = Self(2);
+
+    pub const fn as_u8(self) -> u8 {
         self.0
     }
 }
@@ -96,7 +111,7 @@ struct TaskControlBlock {
     id: TaskId,
     name: &'static str,
     state: TaskState,
-    priority: u8,
+    priority: TaskPriority,
     context: Context,
     capabilities: CapabilitySet,
 }
@@ -107,17 +122,17 @@ impl TaskControlBlock {
             id: TaskId(u64::MAX),
             name: "",
             state: TaskState::Empty,
-            priority: 0,
+            priority: TaskPriority::NORMAL,
             context: Context { stack_pointer: 0 },
             capabilities: CapabilitySet::empty(),
         }
     }
 
-    fn initialize(&mut self, slot: usize, id: TaskId, name: &'static str, entry: fn() -> !) {
+    fn initialize(&mut self, slot: usize, id: TaskId, name: &'static str, entry: fn() -> !, priority: TaskPriority) {
         self.id = id;
         self.name = name;
         self.state = TaskState::Ready;
-        self.priority = 1;
+        self.priority = priority;
 
         let stack_start = TASK_STACKS[slot].0.get().cast::<u8>() as usize;
         let stack_top = stack_start + TASK_STACK_SIZE;
@@ -144,6 +159,7 @@ pub struct Summary {
     pub current_id: TaskId,
     pub current_name: &'static str,
     pub current_state: &'static str,
+    pub current_priority: u8,
     pub context_switches: u64,
     pub idle_heartbeats: u64,
 }
@@ -164,7 +180,6 @@ struct Scheduler {
     current_slot: usize,
     task_count: usize,
     context_switches: u64,
-    quantum: u64,
 }
 
 impl Scheduler {
@@ -174,7 +189,6 @@ impl Scheduler {
             current_slot: 0,
             task_count: 0,
             context_switches: 0,
-            quantum: 0,
         }
     }
 
@@ -184,16 +198,30 @@ impl Scheduler {
         self.tasks[0].id = KERNEL_TASK_ID;
         self.tasks[0].name = "kernel";
         self.tasks[0].state = TaskState::Running;
+        self.tasks[0].priority = TaskPriority::HIGH;
         self.tasks[0].capabilities = CapabilitySet::kernel_bootstrap();
-        self.tasks[1].initialize(1, IDLE_TASK_ID, "idle", idle_task);
+        self.tasks[1].initialize(1, IDLE_TASK_ID, "idle", idle_task, TaskPriority::LOW);
         self.task_count = 2;
     }
 
     fn prepare_switch(&mut self) -> Option<(*mut u64, u64)> {
-        let next_slot = (1..=MAX_TASKS)
-            .map(|offset| (self.current_slot + offset) % MAX_TASKS)
-            .find(|slot| self.tasks[*slot].state == TaskState::Ready)?;
+        let mut best_slot = None;
+        let mut best_priority = TaskPriority::LOW;
 
+        for offset in 0..MAX_TASKS {
+            let slot = (self.current_slot + offset) % MAX_TASKS;
+            let task = &self.tasks[slot];
+            if task.state != TaskState::Ready {
+                continue;
+            }
+
+            if task.priority >= best_priority {
+                best_priority = task.priority;
+                best_slot = Some(slot);
+            }
+        }
+
+        let next_slot = best_slot?;
         let previous_slot = self.current_slot;
         self.tasks[previous_slot].state = TaskState::Ready;
         self.tasks[next_slot].state = TaskState::Running;
@@ -219,24 +247,12 @@ impl Scheduler {
             current_id: task.id,
             current_name: task.name,
             current_state: task.state.name(),
+            current_priority: task.priority.as_u8(),
             context_switches: self.context_switches,
             idle_heartbeats: IDLE_HEARTBEATS.load(Ordering::Relaxed),
         }
     }
 
-    fn tick(&mut self) -> bool {
-        if self.task_count < 2 {
-            return false;
-        }
-
-        self.quantum += 1;
-        if self.quantum < 2 {
-            return false;
-        }
-
-        self.quantum = 0;
-        true
-    }
 }
 
 pub fn init() {
@@ -244,6 +260,14 @@ pub fn init() {
 }
 
 pub fn spawn(name: &'static str, entry: fn() -> !) -> Result<TaskId, SpawnError> {
+    spawn_with_priority(name, entry, TaskPriority::NORMAL)
+}
+
+pub fn spawn_with_priority(
+    name: &'static str,
+    entry: fn() -> !,
+    priority: TaskPriority,
+) -> Result<TaskId, SpawnError> {
     let mut scheduler = SCHEDULER.lock();
     assert!(scheduler.task_count != 0, "scheduler not initialized");
 
@@ -254,7 +278,7 @@ pub fn spawn(name: &'static str, entry: fn() -> !) -> Result<TaskId, SpawnError>
         .ok_or(SpawnError::Full)?;
 
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
-    scheduler.tasks[slot].initialize(slot, id, name, entry);
+    scheduler.tasks[slot].initialize(slot, id, name, entry, priority);
     scheduler.task_count += 1;
     Ok(id)
 }
@@ -277,13 +301,14 @@ pub fn yield_now() {
 }
 
 pub fn tick() {
-    let should_switch = {
-        let mut scheduler = SCHEDULER.lock();
-        assert!(scheduler.task_count != 0, "scheduler not initialized");
-        scheduler.tick()
-    };
+    if PREEMPTION_TICKS.fetch_add(1, Ordering::Relaxed) + 1 >= 2 {
+        PREEMPTION_TICKS.store(0, Ordering::Relaxed);
+        PREEMPTION_REQUESTED.store(true, Ordering::Release);
+    }
+}
 
-    if should_switch {
+pub fn preemption_point() {
+    if PREEMPTION_REQUESTED.swap(false, Ordering::AcqRel) {
         yield_now();
     }
 }

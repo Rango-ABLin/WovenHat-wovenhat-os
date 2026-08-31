@@ -105,6 +105,8 @@ impl Shell {
                 console.print(summary.current_name);
                 console.print(" STATE: ");
                 console.print(summary.current_state);
+                console.print(" PRIORITY: ");
+                print_u64(console, summary.current_priority as u64);
                 console.print(" SWITCHES: ");
                 print_u64(console, summary.context_switches);
                 console.print(" IDLE: ");
