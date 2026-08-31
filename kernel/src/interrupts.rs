@@ -7,7 +7,7 @@ use x86_64::{
     structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
 };
 
-use crate::serial;
+use crate::{gdt, serial};
 
 static BREAKPOINT_REACHED: AtomicBool = AtomicBool::new(false);
 
@@ -20,6 +20,13 @@ pub fn init() {
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        // SAFETY: The selected IST entry is initialized with a dedicated,
+        // statically allocated stack by `gdt::init` before this IDT is loaded.
+        unsafe {
+            idt.double_fault
+                .set_handler_fn(double_fault_handler)
+                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        }
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
@@ -48,6 +55,16 @@ extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame)
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     serial::write_fmt(format_args!(
         "\nEXCEPTION: INVALID OPCODE\n{stack_frame:#?}\n"
+    ));
+    halt();
+}
+
+extern "x86-interrupt" fn double_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) -> ! {
+    serial::write_fmt(format_args!(
+        "\nEXCEPTION: DOUBLE FAULT\nERROR CODE: {error_code:#x}\n{stack_frame:#?}\n"
     ));
     halt();
 }

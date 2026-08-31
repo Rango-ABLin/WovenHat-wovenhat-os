@@ -3,6 +3,7 @@
 #![feature(abi_x86_interrupt)]
 
 mod console;
+mod gdt;
 mod interrupts;
 mod keyboard;
 mod serial;
@@ -40,6 +41,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("");
 
     serial::init();
+    gdt::init();
+    console.println("GDT/TSS: INSTALLED");
+
     //
     // Interrupt Descriptor Table
     //
