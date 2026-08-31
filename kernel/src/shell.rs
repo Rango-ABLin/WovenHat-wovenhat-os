@@ -195,10 +195,20 @@ impl Shell {
                     return;
                 }
 
-                match task::launch_user_task("usermode", 0x1000, 0x2000000) {
-                    Ok(id) => {
+                let entry = task::user_stub_entry as usize;
+                let stack_top = 0x2000000usize;
+                match task::register_user_launch("usermode", entry, stack_top) {
+                    Ok((id, context)) => {
                         console.print("USER TASK REGISTERED: ");
                         print_u64(console, id.as_u64());
+                        console.print(" ENTRY: ");
+                        print_hex_u64(console, context.entry);
+                        console.print(" STACK: ");
+                        print_hex_u64(console, context.stack_top);
+                        console.print(" CS: ");
+                        print_hex_u64(console, context.code_segment as u64);
+                        console.print(" SS: ");
+                        print_hex_u64(console, context.data_segment as u64);
                         console.newline();
                     }
                     Err(_) => {
@@ -216,6 +226,8 @@ impl Shell {
                 let stack_top = 0x2000000usize;
                 if task::validate_user_task(entry, stack_top) {
                     console.println("RING3 ENTRY STUB: READY");
+                    console.println("ATTEMPTING USER MODE TRANSITION...");
+                    task::enter_user_mode(entry, stack_top);
                 } else {
                     console.println("RING3 ENTRY STUB: INVALID");
                 }

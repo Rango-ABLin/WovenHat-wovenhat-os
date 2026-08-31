@@ -50,12 +50,14 @@ global_asm!(
 global_asm!(
     ".global wovenhat_enter_user_mode",
     "wovenhat_enter_user_mode:",
+    "cli",
     "mov ax, cx",
     "mov ds, ax",
     "mov es, ax",
     "mov fs, ax",
     "mov gs, ax",
     "mov ss, ax",
+    "mov rsp, rsi",
     "push rcx",
     "push rsi",
     "pushfq",
@@ -371,18 +373,18 @@ pub fn update_process_state(id: ProcessId, state: ProcessState) -> bool {
     false
 }
 
-pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> Result<ProcessId, ProcessError> {
-    let program = userspace::stub_program(entry, stack_top);
-    if !program.is_valid() {
-        return Err(ProcessError::Full);
+pub extern "C" fn user_stub_entry() -> ! {
+    loop {
+        x86_64::instructions::hlt();
     }
+}
 
-    let process = create_process(name, entry, stack_top, 3);
+pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> Result<ProcessId, ProcessError> {
+    let (mut process, context) = prepare_user_launch(name, entry, stack_top)?;
+    process.state = ProcessState::Ready;
     let id = process.id;
-    let mut ready_process = process;
-    ready_process.state = ProcessState::Ready;
-    let _ = register_process(ready_process)?;
-    let _context = prepare_user_context(entry, stack_top);
+    let _ = register_process(process)?;
+    let _ = context;
     Ok(id)
 }
 
@@ -396,6 +398,13 @@ pub fn prepare_user_launch(name: &'static str, entry: usize, stack_top: usize) -
     process.state = ProcessState::Ready;
     let context = prepare_user_context(entry, stack_top);
     Ok((process, context))
+}
+
+pub fn register_user_launch(name: &'static str, entry: usize, stack_top: usize) -> Result<(ProcessId, UserTaskContext), ProcessError> {
+    let (process, context) = prepare_user_launch(name, entry, stack_top)?;
+    let id = process.id;
+    register_process(process)?;
+    Ok((id, context))
 }
 
 pub fn validate_user_task(entry: usize, stack_top: usize) -> bool {
