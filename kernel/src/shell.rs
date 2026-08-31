@@ -1,4 +1,4 @@
-use crate::{console::Console, keyboard::Key, timer};
+use crate::{console::Console, keyboard::Key, task, timer};
 
 const PROMPT: &str = "WOVENHAT> ";
 const COMMAND_CAPACITY: usize = 128;
@@ -61,7 +61,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS");
             }
             "clear" => {
                 console.clear();
@@ -73,6 +73,15 @@ impl Shell {
                 console.print("TIMER TICKS: ");
                 print_u64(console, timer::ticks());
                 console.newline();
+            }
+            "tasks" => {
+                let summary = task::summary();
+                console.print("TASKS: ");
+                print_u64(console, summary.task_count as u64);
+                console.print(" CURRENT: ");
+                print_u64(console, summary.current_id.as_u64());
+                console.print(" ");
+                console.println(summary.current_name);
             }
             _ => {
                 console.print("UNKNOWN COMMAND: ");

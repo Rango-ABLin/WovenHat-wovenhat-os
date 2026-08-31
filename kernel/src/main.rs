@@ -9,6 +9,7 @@ mod keyboard;
 mod pic;
 mod serial;
 mod shell;
+mod task;
 mod timer;
 
 use bootloader_api::{BootInfo, entry_point, info::Optional};
@@ -47,6 +48,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
     gdt::init();
     console.println("GDT/TSS: INSTALLED");
+
+    task::init();
+    console.println("SCHEDULER: INITIALIZED");
 
     //
     // Interrupt Descriptor Table
