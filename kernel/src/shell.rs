@@ -63,7 +63,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP SPAWN");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -158,6 +158,23 @@ impl Shell {
                 print_u64(console, stats.allocations as u64);
                 console.newline();
             }
+            "spawn" => {
+                if !authorize(Capability::TaskControl, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                match task::spawn("demo", demo_task) {
+                    Ok(id) => {
+                        console.print("TASK SPAWNED: ");
+                        print_u64(console, id.as_u64());
+                        console.newline();
+                    }
+                    Err(_) => {
+                        console.println("TASK SPAWN FAILED: SCHEDULER FULL");
+                    }
+                }
+            }
             "paging" => {
                 if !authorize(Capability::MemoryInspect, console) {
                     self.finish(console);
@@ -193,6 +210,12 @@ impl Shell {
     fn finish(&mut self, console: &mut Console<'_>) {
         self.length = 0;
         self.print_prompt(console);
+    }
+}
+
+fn demo_task() -> ! {
+    loop {
+        task::yield_now();
     }
 }
 
