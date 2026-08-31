@@ -8,13 +8,19 @@ mod gdt;
 mod interrupts;
 mod keyboard;
 mod memory;
+mod paging;
 mod pic;
 mod serial;
 mod shell;
 mod task;
 mod timer;
 
-use bootloader_api::{BootInfo, entry_point, info::Optional};
+use bootloader_api::{
+    BootInfo, BootloaderConfig,
+    config::Mapping,
+    entry_point,
+    info::Optional,
+};
 
 use console::Console;
 use core::panic::PanicInfo;
@@ -23,10 +29,21 @@ use shell::Shell;
 
 use x86_64::instructions::interrupts::int3;
 
-entry_point!(kernel_main);
+static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let memory_init = memory::init(&boot_info.memory_regions);
+    let paging_init = match &boot_info.physical_memory_offset {
+        Optional::Some(offset) => paging::init(*offset),
+        Optional::None => Err(paging::InitError::MissingPhysicalMemoryMapping),
+    };
+    let boot_info_address = boot_info as *const BootInfo as u64;
 
     let framebuffer = match &mut boot_info.framebuffer {
         Optional::Some(framebuffer) => framebuffer,
@@ -35,6 +52,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let info = framebuffer.info();
     let buffer = framebuffer.buffer_mut();
+    let framebuffer_address = buffer.as_ptr() as u64;
+    let stack_probe = &info as *const _ as u64;
 
     let mut console = Console::new(buffer, info, 40, 40, 2);
 
@@ -58,6 +77,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("FRAME ALLOCATOR: OK");
     } else {
         console.println("FRAME ALLOCATOR: SELF TEST FAILED");
+        halt();
+    }
+
+    if paging_init.is_err() {
+        console.println("PAGING: INITIALIZATION FAILED");
+        halt();
+    }
+
+    let translation_probes = [
+        kernel_main as *const () as u64,
+        boot_info_address,
+        framebuffer_address,
+        stack_probe,
+    ];
+    if paging::self_test(&translation_probes) {
+        console.println("PAGING TRANSLATION: 4/4 OK");
+    } else {
+        console.println("PAGING TRANSLATION: FAILED");
         halt();
     }
 

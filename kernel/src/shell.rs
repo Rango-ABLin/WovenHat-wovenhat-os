@@ -1,4 +1,4 @@
-use crate::{capability::Capability, console::Console, keyboard::Key, memory, task, timer};
+use crate::{capability::Capability, console::Console, keyboard::Key, memory, paging, task, timer};
 
 const PROMPT: &str = "WOVENHAT> ";
 const COMMAND_CAPACITY: usize = 128;
@@ -61,7 +61,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -131,6 +131,23 @@ impl Shell {
                 print_u64(console, stats.remaining_frames);
                 console.newline();
             }
+            "paging" => {
+                if !authorize(Capability::MemoryInspect, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                let stats = paging::stats();
+                console.print("PAGING: ");
+                print_u64(console, stats.successful_translations as u64);
+                console.print("/");
+                print_u64(console, stats.tested_translations as u64);
+                console.print(" L4: ");
+                print_hex_u64(console, stats.level_4_frame);
+                console.print(" OFFSET: ");
+                print_hex_u64(console, stats.physical_memory_offset);
+                console.newline();
+            }
             _ => {
                 console.print("UNKNOWN COMMAND: ");
                 console.println(command);
@@ -178,5 +195,19 @@ fn print_u64(console: &mut Console<'_>, mut value: u64) {
 
     for digit in &digits[index..] {
         console.put_char(*digit as char);
+    }
+}
+
+fn print_hex_u64(console: &mut Console<'_>, value: u64) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    console.print("0X");
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let digit = ((value >> (shift * 4)) & 0xf) as usize;
+        if digit != 0 || started || shift == 0 {
+            started = true;
+            console.put_char(HEX[digit] as char);
+        }
     }
 }
