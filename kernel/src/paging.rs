@@ -2,8 +2,16 @@ use spin::Mutex;
 use x86_64::{
     VirtAddr,
     registers::control::Cr3,
-    structures::paging::{OffsetPageTable, PageTable, Translate},
+    structures::paging::{
+        FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, Size4KiB,
+        Translate,
+    },
 };
+
+use crate::memory;
+
+const TEST_PAGE_ADDRESS: u64 = 0x4444_4444_0000;
+const TEST_VALUE: u64 = 0x574F_5645_4E48_4154;
 
 static PAGING: Mutex<PagingState> = Mutex::new(PagingState::empty());
 
@@ -12,6 +20,7 @@ pub struct Stats {
     pub level_4_frame: u64,
     pub successful_translations: usize,
     pub tested_translations: usize,
+    pub mapping_test_passed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,6 +36,7 @@ struct PagingState {
     level_4_frame: u64,
     successful_translations: usize,
     tested_translations: usize,
+    mapping_test_passed: bool,
 }
 
 impl PagingState {
@@ -37,6 +47,7 @@ impl PagingState {
             level_4_frame: 0,
             successful_translations: 0,
             tested_translations: 0,
+            mapping_test_passed: false,
         }
     }
 
@@ -46,6 +57,7 @@ impl PagingState {
             level_4_frame: self.level_4_frame,
             successful_translations: self.successful_translations,
             tested_translations: self.tested_translations,
+            mapping_test_passed: self.mapping_test_passed,
         }
     }
 }
@@ -91,6 +103,49 @@ pub fn self_test(addresses: &[u64]) -> bool {
     paging.successful_translations = successful;
     paging.tested_translations = addresses.len();
     successful == addresses.len()
+}
+
+pub fn mapping_self_test() -> bool {
+    let mut paging = PAGING.lock();
+    let Some(mapper) = paging.mapper.as_mut() else {
+        return false;
+    };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(TEST_PAGE_ADDRESS));
+    if mapper.translate_addr(page.start_address()).is_some() {
+        return false;
+    }
+
+    let mut allocator = memory::allocator();
+    let Some(frame) = allocator.allocate_frame() else {
+        return false;
+    };
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+    // SAFETY: `frame` was freshly allocated and `page` was verified unmapped.
+    // The paging mutex provides exclusive access to the active page tables.
+    let mapping = unsafe { mapper.map_to(page, frame, flags, &mut *allocator) };
+    let Ok(flush) = mapping else {
+        return false;
+    };
+    flush.flush();
+
+    let pointer = page.start_address().as_mut_ptr::<u64>();
+    // SAFETY: The page is present and writable for this test, and the pointer
+    // is naturally aligned within that mapping.
+    unsafe { pointer.write_volatile(TEST_VALUE) };
+    // SAFETY: The same live mapping and aligned location are read back before
+    // the page is unmapped.
+    let value = unsafe { pointer.read_volatile() };
+
+    let Ok((_frame, flush)) = mapper.unmap(page) else {
+        return false;
+    };
+    flush.flush();
+
+    let passed = value == TEST_VALUE && mapper.translate_addr(page.start_address()).is_none();
+    paging.mapping_test_passed = passed;
+    passed
 }
 
 pub fn stats() -> Stats {

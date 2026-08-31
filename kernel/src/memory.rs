@@ -1,5 +1,5 @@
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use spin::Mutex;
+use spin::{Mutex, MutexGuard};
 use x86_64::{
     PhysAddr,
     structures::paging::{FrameAllocator, PageSize, PhysFrame, Size4KiB},
@@ -42,7 +42,7 @@ pub enum InitError {
     NoUsableFrames,
 }
 
-struct PhysicalFrameAllocator {
+pub(crate) struct PhysicalFrameAllocator {
     ranges: [FrameRange; MAX_USABLE_REGIONS],
     range_count: usize,
     current_range: usize,
@@ -152,6 +152,10 @@ pub fn init(regions: &[MemoryRegion]) -> Result<(), InitError> {
 
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
     ALLOCATOR.lock().allocate_frame()
+}
+
+pub(crate) fn allocator() -> MutexGuard<'static, PhysicalFrameAllocator> {
+    ALLOCATOR.lock()
 }
 
 pub fn stats() -> Stats {

@@ -146,6 +146,12 @@ impl Shell {
                 print_hex_u64(console, stats.level_4_frame);
                 console.print(" OFFSET: ");
                 print_hex_u64(console, stats.physical_memory_offset);
+                console.print(" MAP: ");
+                console.print(if stats.mapping_test_passed {
+                    "OK"
+                } else {
+                    "FAILED"
+                });
                 console.newline();
             }
             _ => {

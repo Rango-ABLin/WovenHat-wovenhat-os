@@ -98,6 +98,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
+    if paging::mapping_self_test() {
+        console.println("PAGING MAP/WRITE/UNMAP: OK");
+    } else {
+        console.println("PAGING MAP/WRITE/UNMAP: FAILED");
+        halt();
+    }
+
     serial::init();
     gdt::init();
     console.println("GDT/TSS: INSTALLED");
