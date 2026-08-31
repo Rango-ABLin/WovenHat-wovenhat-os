@@ -7,7 +7,7 @@ use x86_64::{
     structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
 };
 
-use crate::{gdt, serial};
+use crate::{gdt, pic, serial, timer};
 
 static BREAKPOINT_REACHED: AtomicBool = AtomicBool::new(false);
 
@@ -30,6 +30,7 @@ pub fn init() {
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt[pic::MASTER_OFFSET + timer::IRQ].set_handler_fn(timer_interrupt_handler);
 
         idt
     });
@@ -88,6 +89,11 @@ extern "x86-interrupt" fn page_fault_handler(
         Cr2::read()
     ));
     halt();
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    timer::record_tick();
+    pic::notify_end_of_interrupt(timer::IRQ);
 }
 
 fn halt() -> ! {

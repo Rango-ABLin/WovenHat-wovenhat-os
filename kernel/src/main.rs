@@ -8,6 +8,7 @@ mod interrupts;
 mod keyboard;
 mod pic;
 mod serial;
+mod timer;
 
 use bootloader_api::{BootInfo, entry_point, info::Optional};
 
@@ -55,6 +56,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     pic::init();
     console.println("PIC: INITIALIZED (ALL IRQS MASKED)");
+
+    timer::init();
+    pic::unmask(timer::IRQ);
+    x86_64::instructions::interrupts::enable();
+
+    while timer::ticks() < 3 {
+        core::hint::spin_loop();
+    }
+
+    console.println("TIMER IRQ: OK");
 
     //
     // Breakpoint exception test
