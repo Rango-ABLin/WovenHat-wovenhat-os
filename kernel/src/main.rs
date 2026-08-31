@@ -19,6 +19,7 @@ mod shell;
 mod syscall;
 mod task;
 mod timer;
+mod userspace;
 
 use bootloader_api::{
     BootInfo, BootloaderConfig,

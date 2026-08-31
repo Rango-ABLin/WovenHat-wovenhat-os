@@ -9,6 +9,7 @@ use spin::Mutex;
 use crate::{
     capability::{Capability, CapabilitySet},
     gdt,
+    userspace,
 };
 
 const MAX_TASKS: usize = 4;
@@ -357,6 +358,11 @@ pub fn register_process(process: Process) -> Result<ProcessId, ProcessError> {
 }
 
 pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> Result<ProcessId, ProcessError> {
+    let program = userspace::stub_program(entry, stack_top);
+    if !program.is_valid() {
+        return Err(ProcessError::Full);
+    }
+
     let process = create_process(name, entry, stack_top, 3);
     let id = process.id;
     let _ = register_process(process)?;
