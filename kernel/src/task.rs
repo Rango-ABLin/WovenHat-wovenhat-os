@@ -6,7 +6,10 @@ use core::{
 
 use spin::Mutex;
 
-use crate::capability::{Capability, CapabilitySet};
+use crate::{
+    capability::{Capability, CapabilitySet},
+    gdt,
+};
 
 const MAX_TASKS: usize = 4;
 const TASK_STACK_SIZE: usize = 4096 * 2;
@@ -40,8 +43,27 @@ global_asm!(
     "ret",
 );
 
+global_asm!(
+    ".global wovenhat_enter_user_mode",
+    "wovenhat_enter_user_mode:",
+    "mov ax, cx",
+    "mov ds, ax",
+    "mov es, ax",
+    "mov fs, ax",
+    "mov gs, ax",
+    "mov ss, ax",
+    "push rcx",
+    "push rsi",
+    "pushfq",
+    "or qword ptr [rsp], 0x200",
+    "push rdx",
+    "push rdi",
+    "iretq",
+);
+
 unsafe extern "C" {
     fn wovenhat_context_switch(previous_rsp: *mut u64, next_rsp: u64);
+    fn wovenhat_enter_user_mode(entry: u64, stack_top: u64, user_cs: u16, user_ss: u16) -> !;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -259,6 +281,36 @@ pub fn init() {
     SCHEDULER.lock().initialize();
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct UserTaskContext {
+    pub entry: u64,
+    pub stack_top: u64,
+    pub code_segment: u16,
+    pub data_segment: u16,
+}
+
+pub fn prepare_user_context(entry: usize, stack_top: usize) -> UserTaskContext {
+    let (code_segment, data_segment) = gdt::user_segments();
+    UserTaskContext {
+        entry: entry as u64,
+        stack_top: stack_top as u64,
+        code_segment: code_segment.0,
+        data_segment: data_segment.0,
+    }
+}
+
+pub fn enter_user_mode(entry: usize, stack_top: usize) -> ! {
+    let context = prepare_user_context(entry, stack_top);
+    unsafe {
+        wovenhat_enter_user_mode(
+            context.entry,
+            context.stack_top,
+            context.code_segment,
+            context.data_segment,
+        )
+    }
+}
+
 pub fn spawn(name: &'static str, entry: fn() -> !) -> Result<TaskId, SpawnError> {
     spawn_with_priority(name, entry, TaskPriority::NORMAL)
 }
@@ -408,6 +460,7 @@ pub fn capability_delegation_valid() -> bool {
 fn idle_task() -> ! {
     loop {
         IDLE_HEARTBEATS.fetch_add(1, Ordering::Relaxed);
+        preemption_point();
         yield_now();
     }
 }
