@@ -1,10 +1,14 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 mod capability;
 mod console;
 mod gdt;
+mod heap;
 mod interrupts;
 mod keyboard;
 mod memory;
@@ -23,7 +27,7 @@ use bootloader_api::{
 };
 
 use console::Console;
-use core::panic::PanicInfo;
+use core::{alloc::Layout, panic::PanicInfo};
 use keyboard::Keyboard;
 use shell::Shell;
 
@@ -102,6 +106,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("PAGING MAP/WRITE/UNMAP: OK");
     } else {
         console.println("PAGING MAP/WRITE/UNMAP: FAILED");
+        halt();
+    }
+
+    if heap::init().is_err() {
+        console.println("KERNEL HEAP: INITIALIZATION FAILED");
+        halt();
+    }
+
+    if heap::self_test() {
+        console.println("KERNEL HEAP: 256 KIB OK");
+    } else {
+        console.println("KERNEL HEAP: SELF TEST FAILED");
         halt();
     }
 
@@ -191,6 +207,12 @@ fn halt() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    serial::write_fmt(format_args!("\nKERNEL PANIC: {info}\n"));
+    halt()
+}
+
+#[alloc_error_handler]
+fn allocation_error(_layout: Layout) -> ! {
     halt()
 }

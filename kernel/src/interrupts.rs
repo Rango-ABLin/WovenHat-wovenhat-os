@@ -47,17 +47,29 @@ extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) 
     BREAKPOINT_REACHED.store(true, Ordering::SeqCst);
 }
 
-extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
+fn dump_exception_context(label: &str, stack_frame: &InterruptStackFrame, error_code: Option<u64>) {
+    serial::write_fmt(format_args!("\nEXCEPTION: {label}\n"));
+    if let Some(code) = error_code {
+        serial::write_fmt(format_args!("ERROR CODE: {code:#x}\n"));
+    }
+
     serial::write_fmt(format_args!(
-        "\nEXCEPTION: DIVIDE ERROR\n{stack_frame:#?}\n"
+        "RIP: {:#x}\nCS: {:#x}\nRFLAGS: {:#x}\nRSP: {:#x}\nSS: {:#x}\n",
+        stack_frame.instruction_pointer.as_u64(),
+        stack_frame.code_segment.0,
+        stack_frame.cpu_flags,
+        stack_frame.stack_pointer.as_u64(),
+        stack_frame.stack_segment.0,
     ));
+}
+
+extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
+    dump_exception_context("DIVIDE ERROR", &stack_frame, None);
     halt();
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
-    serial::write_fmt(format_args!(
-        "\nEXCEPTION: INVALID OPCODE\n{stack_frame:#?}\n"
-    ));
+    dump_exception_context("INVALID OPCODE", &stack_frame, None);
     halt();
 }
 
@@ -65,9 +77,7 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) -> ! {
-    serial::write_fmt(format_args!(
-        "\nEXCEPTION: DOUBLE FAULT\nERROR CODE: {error_code:#x}\n{stack_frame:#?}\n"
-    ));
+    dump_exception_context("DOUBLE FAULT", &stack_frame, Some(error_code));
     halt();
 }
 
@@ -75,9 +85,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    serial::write_fmt(format_args!(
-        "\nEXCEPTION: GENERAL PROTECTION FAULT\nERROR CODE: {error_code:#x}\n{stack_frame:#?}\n"
-    ));
+    dump_exception_context("GENERAL PROTECTION FAULT", &stack_frame, Some(error_code));
     halt();
 }
 
@@ -85,10 +93,14 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    serial::write_fmt(format_args!(
-        "\nEXCEPTION: PAGE FAULT\nADDRESS: {:?}\nERROR CODE: {error_code:?}\n{stack_frame:#?}\n",
-        Cr2::read()
-    ));
+    let address = Cr2::read();
+    dump_exception_context("PAGE FAULT", &stack_frame, Some(error_code.bits()));
+    if let Ok(addr) = address {
+        serial::write_fmt(format_args!("FAULT ADDRESS: {:#x}\n", addr.as_u64()));
+    } else {
+        serial::write_fmt(format_args!("FAULT ADDRESS: UNAVAILABLE\n"));
+    }
+    serial::write_fmt(format_args!("PAGE FAULT DETAILS: {error_code:?}\n"));
     halt();
 }
 
