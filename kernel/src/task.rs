@@ -357,6 +357,20 @@ pub fn register_process(process: Process) -> Result<ProcessId, ProcessError> {
     Ok(id)
 }
 
+pub fn update_process_state(id: ProcessId, state: ProcessState) -> bool {
+    let mut table = PROCESS_TABLE.lock();
+    let Some(slot) = table.iter_mut().position(|entry| matches!(entry, Some(process) if process.id == id)) else {
+        return false;
+    };
+
+    if let Some(process) = table[slot].as_mut() {
+        process.state = state;
+        return true;
+    }
+
+    false
+}
+
 pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> Result<ProcessId, ProcessError> {
     let program = userspace::stub_program(entry, stack_top);
     if !program.is_valid() {
@@ -386,6 +400,11 @@ pub fn exit_current_process() {
     current.state = TaskState::Dead;
     current.name = "exited";
     scheduler.task_count = scheduler.task_count.saturating_sub(1);
+
+    if let Some(process) = current_process() {
+        let _ = update_process_state(process.id, ProcessState::Exited);
+    }
+
     let _ = scheduler.prepare_switch();
 }
 
