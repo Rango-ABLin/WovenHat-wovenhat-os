@@ -50,6 +50,12 @@ global_asm!(
 global_asm!(
     ".global wovenhat_enter_user_mode",
     "wovenhat_enter_user_mode:",
+    "mov ax, cx",
+    "mov ds, ax",
+    "mov es, ax",
+    "mov fs, ax",
+    "mov gs, ax",
+    "mov ss, ax",
     "push rcx",
     "push rsi",
     "pushfq",
@@ -435,8 +441,17 @@ pub fn prepare_user_context(entry: usize, stack_top: usize) -> UserTaskContext {
     }
 }
 
-pub fn enter_user_mode(entry: usize, stack_top: usize) -> ! {
+pub fn build_ring3_frame(entry: usize, stack_top: usize) -> UserTaskContext {
     let context = prepare_user_context(entry, stack_top);
+    let mut frame = context;
+    frame.stack_top = stack_top as u64;
+    frame.entry = entry as u64;
+    frame.data_segment = context.data_segment;
+    frame
+}
+
+pub fn enter_user_mode(entry: usize, stack_top: usize) -> ! {
+    let context = build_ring3_frame(entry, stack_top);
     unsafe {
         wovenhat_enter_user_mode(
             context.entry,
