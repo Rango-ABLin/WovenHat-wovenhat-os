@@ -379,9 +379,23 @@ pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> R
 
     let process = create_process(name, entry, stack_top, 3);
     let id = process.id;
-    let _ = register_process(process)?;
+    let mut ready_process = process;
+    ready_process.state = ProcessState::Ready;
+    let _ = register_process(ready_process)?;
     let _context = prepare_user_context(entry, stack_top);
     Ok(id)
+}
+
+pub fn prepare_user_launch(name: &'static str, entry: usize, stack_top: usize) -> Result<(Process, UserTaskContext), ProcessError> {
+    let image = userspace::stub_program(entry, stack_top);
+    if !image.is_valid() {
+        return Err(ProcessError::Full);
+    }
+
+    let mut process = create_process(name, entry, stack_top, 3);
+    process.state = ProcessState::Ready;
+    let context = prepare_user_context(entry, stack_top);
+    Ok((process, context))
 }
 
 pub fn validate_user_task(entry: usize, stack_top: usize) -> bool {

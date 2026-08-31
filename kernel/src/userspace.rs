@@ -1,5 +1,5 @@
 #[derive(Clone, Copy, Debug)]
-pub struct ElfStub {
+pub struct UserImage {
     pub magic: [u8; 4],
     pub class: u8,
     pub endian: u8,
@@ -9,7 +9,7 @@ pub struct ElfStub {
     pub image_size: u64,
 }
 
-impl ElfStub {
+impl UserImage {
     pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
     pub const fn new(entry: u64, stack_top: u64) -> Self {
@@ -29,10 +29,15 @@ impl ElfStub {
     }
 }
 
-pub fn stub_program(entry: usize, stack_top: usize) -> ElfStub {
-    ElfStub::new(entry as u64, stack_top as u64)
+pub fn stub_program(entry: usize, stack_top: usize) -> UserImage {
+    UserImage::new(entry as u64, stack_top as u64)
 }
 
 pub fn validate_stub(entry: usize, stack_top: usize) -> bool {
     stub_program(entry, stack_top).is_valid()
+}
+
+pub fn describe(entry: usize, stack_top: usize) -> (u64, u64, u64) {
+    let image = stub_program(entry, stack_top);
+    (image.entry, image.stack_top, image.image_size)
 }
