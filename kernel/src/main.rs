@@ -109,6 +109,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
+    serial::init();
+
     if heap::init().is_err() {
         console.println("KERNEL HEAP: INITIALIZATION FAILED");
         halt();
@@ -121,7 +123,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
-    serial::init();
     gdt::init();
     console.println("GDT/TSS: INSTALLED");
 
@@ -206,13 +207,14 @@ fn halt() -> ! {
     }
 }
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    serial::write_fmt(format_args!("\nKERNEL PANIC: {info}\n"));
+#[alloc_error_handler]
+fn alloc_error_handler(layout: Layout) -> ! {
+    serial::write_fmt(format_args!("\nKERNEL ALLOC ERROR: layout size={} align={}\n", layout.size(), layout.align()));
     halt()
 }
 
-#[alloc_error_handler]
-fn allocation_error(_layout: Layout) -> ! {
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    serial::write_fmt(format_args!("\nKERNEL PANIC: {info}\n"));
     halt()
 }
