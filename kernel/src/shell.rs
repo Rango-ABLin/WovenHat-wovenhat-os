@@ -1,5 +1,6 @@
 use crate::{
-    capability::Capability, console::Console, heap, keyboard::Key, memory, paging, task, timer,
+    capability::Capability, console::Console, heap, keyboard::Key, memory, paging, syscall, task,
+    timer,
 };
 
 const PROMPT: &str = "WOVENHAT> ";
@@ -63,7 +64,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP SPAWN");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP SPAWN SYSCALL");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -174,6 +175,16 @@ impl Shell {
                         console.println("TASK SPAWN FAILED: SCHEDULER FULL");
                     }
                 }
+            }
+            "syscall" => {
+                if !authorize(Capability::InterruptControl, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                console.println("TRIGGERING SYSCALL 0x80");
+                syscall::test();
+                console.println("SYSCALL HANDLER RETURNED");
             }
             "paging" => {
                 if !authorize(Capability::MemoryInspect, console) {

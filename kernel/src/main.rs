@@ -16,6 +16,7 @@ mod paging;
 mod pic;
 mod serial;
 mod shell;
+mod syscall;
 mod task;
 mod timer;
 
@@ -197,13 +198,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             shell.handle_key(key, &mut console);
         }
 
-        core::hint::spin_loop();
+        task::preemption_point();
+        x86_64::instructions::hlt();
     }
 }
 
 fn halt() -> ! {
+    x86_64::instructions::interrupts::disable();
     loop {
-        core::hint::spin_loop();
+        x86_64::instructions::hlt();
     }
 }
 

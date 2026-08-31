@@ -30,6 +30,7 @@ pub fn init() {
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt[0x80].set_handler_fn(syscall_handler);
         idt[pic::MASTER_OFFSET + timer::IRQ].set_handler_fn(timer_interrupt_handler);
         idt[pic::MASTER_OFFSET + keyboard::IRQ].set_handler_fn(keyboard_interrupt_handler);
 
@@ -108,6 +109,12 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     timer::record_tick();
     task::tick();
     pic::notify_end_of_interrupt(timer::IRQ);
+}
+
+extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame) {
+    let syscall_id = unsafe { x86_64::registers::model_specific::Efer::read() };
+    serial::write_fmt(format_args!("SYSCALL INTERRUPT: {syscall_id:?}\n"));
+    task::preemption_point();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
