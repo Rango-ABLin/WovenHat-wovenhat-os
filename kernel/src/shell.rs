@@ -67,7 +67,7 @@ impl Shell {
                 console.clear();
             }
             "version" => {
-                console.println("WOVENHAT KERNEL 0.0.5");
+                console.println("WOVENHAT KERNEL 0.0.6");
             }
             "ticks" => {
                 console.print("TIMER TICKS: ");
@@ -81,7 +81,12 @@ impl Shell {
                 console.print(" CURRENT: ");
                 print_u64(console, summary.current_id.as_u64());
                 console.print(" ");
-                console.println(summary.current_name);
+                console.print(summary.current_name);
+                console.print(" SWITCHES: ");
+                print_u64(console, summary.context_switches);
+                console.print(" IDLE: ");
+                print_u64(console, summary.idle_heartbeats);
+                console.newline();
             }
             _ => {
                 console.print("UNKNOWN COMMAND: ");

@@ -40,7 +40,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("SECURE INTELLIGENCE PLATFORM");
     console.println("");
 
-    console.println("WOVENHAT KERNEL 0.0.5");
+    console.println("WOVENHAT KERNEL 0.0.6");
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
@@ -49,9 +49,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     gdt::init();
     console.println("GDT/TSS: INSTALLED");
 
-    task::init();
-    console.println("SCHEDULER: INITIALIZED");
-
     //
     // Interrupt Descriptor Table
     //
@@ -59,6 +56,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init();
 
     console.println("IDT: INSTALLED");
+
+    task::init();
+    console.println("SCHEDULER: INITIALIZED");
 
     pic::init();
     console.println("PIC: INITIALIZED (ALL IRQS MASKED)");
@@ -69,7 +69,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::enable();
 
     while timer::ticks() < 3 {
-        core::hint::spin_loop();
+        task::yield_now();
     }
 
     console.println("TIMER IRQ: OK");
