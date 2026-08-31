@@ -201,6 +201,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             shell.handle_key(key, &mut console);
         }
 
+        syscall::service_pending();
         task::preemption_point();
         x86_64::instructions::hlt();
     }

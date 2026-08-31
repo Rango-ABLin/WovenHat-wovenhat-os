@@ -6,6 +6,7 @@ use core::{
 const NO_REQUEST: u64 = u64::MAX;
 
 static REQUEST: AtomicU64 = AtomicU64::new(NO_REQUEST);
+static PENDING: AtomicU64 = AtomicU64::new(NO_REQUEST);
 static LAST_COMPLETED: AtomicU64 = AtomicU64::new(NO_REQUEST);
 static COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -49,6 +50,14 @@ pub fn handle_interrupt() {
         return;
     }
 
+    PENDING.store(request, Ordering::Release);
     LAST_COMPLETED.store(request, Ordering::Release);
     COMPLETIONS.fetch_add(1, Ordering::Release);
+}
+
+pub fn service_pending() {
+    let request = PENDING.swap(NO_REQUEST, Ordering::AcqRel);
+    if request == Number::Yield as u64 {
+        crate::task::yield_now();
+    }
 }
