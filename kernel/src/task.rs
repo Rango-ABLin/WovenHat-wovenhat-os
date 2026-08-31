@@ -12,13 +12,16 @@ use crate::{
 };
 
 const MAX_TASKS: usize = 4;
+const MAX_PROCESSES: usize = 8;
 const TASK_STACK_SIZE: usize = 4096 * 2;
 const KERNEL_TASK_ID: TaskId = TaskId(0);
 const IDLE_TASK_ID: TaskId = TaskId(1);
 
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::empty());
+static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([const { None }; MAX_PROCESSES]);
 static IDLE_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(2);
+static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 static PREEMPTION_TICKS: AtomicU64 = AtomicU64::new(0);
 static PREEMPTION_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TASK_STACKS: [TaskStack; MAX_TASKS] = [const { TaskStack::new() }; MAX_TASKS];
@@ -216,6 +219,11 @@ pub struct Process {
     pub stack_size: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProcessError {
+    Full,
+}
+
 pub struct Summary {
     pub task_count: usize,
     pub ready_tasks: usize,
@@ -319,33 +327,44 @@ impl Scheduler {
 
 }
 
-static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
-
 pub fn init() {
     SCHEDULER.lock().initialize();
 }
 
 pub fn create_process(name: &'static str, entry: usize, stack_top: usize, ring: u8) -> Process {
-    let task_id = SCHEDULER
-        .lock()
-        .tasks
-        .iter()
-        .find(|task| task.state == TaskState::Empty)
-        .map(|_| TaskId(NEXT_TASK_ID.load(Ordering::Relaxed)))
-        .unwrap_or(TaskId(0));
-
     let id = ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed));
+    let task_id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     Process {
         id,
         parent: None,
         task_id,
         name,
-        state: ProcessState::Ready,
+        state: ProcessState::New,
         ring,
         entry: entry as u64,
         stack_top: stack_top as u64,
         stack_size: 4096,
     }
+}
+
+pub fn register_process(process: Process) -> Result<ProcessId, ProcessError> {
+    let mut table = PROCESS_TABLE.lock();
+    let slot = table.iter().position(|entry| entry.is_none()).ok_or(ProcessError::Full)?;
+    table[slot] = Some(process);
+    Ok(process.id)
+}
+
+pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> Result<ProcessId, ProcessError> {
+    let process = create_process(name, entry, stack_top, 3);
+    register_process(process)
+}
+
+pub fn process_count() -> usize {
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .filter(|entry| entry.is_some())
+        .count()
 }
 
 pub fn current_process() -> Option<Process> {
@@ -355,17 +374,23 @@ pub fn current_process() -> Option<Process> {
         return None;
     }
 
-    Some(Process {
-        id: ProcessId(0),
-        parent: None,
-        task_id: task.id,
-        name: task.name,
-        state: ProcessState::Running,
-        ring: 0,
-        entry: 0,
-        stack_top: task.context.stack_pointer,
-        stack_size: TASK_STACK_SIZE as u64,
-    })
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .find(|process| process.task_id == task.id)
+        .copied()
+        .or(Some(Process {
+            id: ProcessId(0),
+            parent: None,
+            task_id: task.id,
+            name: task.name,
+            state: ProcessState::Running,
+            ring: 0,
+            entry: 0,
+            stack_top: task.context.stack_pointer,
+            stack_size: TASK_STACK_SIZE as u64,
+        }))
 }
 
 #[derive(Clone, Copy, Debug)]
