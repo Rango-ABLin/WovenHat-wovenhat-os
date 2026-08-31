@@ -282,6 +282,7 @@ pub fn capability_policy_valid() -> bool {
         Capability::TaskControl,
         Capability::DeviceIo,
         Capability::InterruptControl,
+        Capability::MemoryInspect,
     ];
 
     required

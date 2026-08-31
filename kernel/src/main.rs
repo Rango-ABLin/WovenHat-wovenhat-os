@@ -7,6 +7,7 @@ mod console;
 mod gdt;
 mod interrupts;
 mod keyboard;
+mod memory;
 mod pic;
 mod serial;
 mod shell;
@@ -25,6 +26,8 @@ use x86_64::instructions::interrupts::int3;
 entry_point!(kernel_main);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    let memory_init = memory::init(&boot_info.memory_regions);
+
     let framebuffer = match &mut boot_info.framebuffer {
         Optional::Some(framebuffer) => framebuffer,
         Optional::None => halt(),
@@ -45,6 +48,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
+
+    if memory_init.is_err() {
+        console.println("FRAME ALLOCATOR: INITIALIZATION FAILED");
+        halt();
+    }
+
+    if memory::self_test() {
+        console.println("FRAME ALLOCATOR: OK");
+    } else {
+        console.println("FRAME ALLOCATOR: SELF TEST FAILED");
+        halt();
+    }
 
     serial::init();
     gdt::init();

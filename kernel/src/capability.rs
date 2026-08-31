@@ -7,6 +7,7 @@ pub enum Capability {
     TaskControl = 3,
     DeviceIo = 4,
     InterruptControl = 5,
+    MemoryInspect = 6,
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +28,7 @@ impl CapabilitySet {
             .with(Capability::TaskControl)
             .with(Capability::DeviceIo)
             .with(Capability::InterruptControl)
+            .with(Capability::MemoryInspect)
     }
 
     pub const fn with(self, capability: Capability) -> Self {

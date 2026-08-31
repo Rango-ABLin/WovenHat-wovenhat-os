@@ -1,4 +1,4 @@
-use crate::{capability::Capability, console::Console, keyboard::Key, task, timer};
+use crate::{capability::Capability, console::Console, keyboard::Key, memory, task, timer};
 
 const PROMPT: &str = "WOVENHAT> ";
 const COMMAND_CAPACITY: usize = 128;
@@ -61,7 +61,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -111,6 +111,24 @@ impl Shell {
                 print_capability(console, Capability::TaskControl, " TASK_CONTROL");
                 print_capability(console, Capability::DeviceIo, " DEVICE_IO");
                 print_capability(console, Capability::InterruptControl, " INTERRUPT_CONTROL");
+                print_capability(console, Capability::MemoryInspect, " MEMORY_INSPECT");
+                console.newline();
+            }
+            "memory" => {
+                if !authorize(Capability::MemoryInspect, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                let stats = memory::stats();
+                console.print("MEMORY REGIONS: ");
+                print_u64(console, stats.usable_regions as u64);
+                console.print(" FRAMES: ");
+                print_u64(console, stats.total_frames);
+                console.print(" USED: ");
+                print_u64(console, stats.allocated_frames);
+                console.print(" FREE: ");
+                print_u64(console, stats.remaining_frames);
                 console.newline();
             }
             _ => {
