@@ -55,6 +55,22 @@ enum TaskState {
     Empty,
     Ready,
     Running,
+    Blocked,
+    Sleeping,
+    Dead,
+}
+
+impl TaskState {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Sleeping => "sleeping",
+            Self::Dead => "dead",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -119,8 +135,11 @@ impl TaskControlBlock {
 
 pub struct Summary {
     pub task_count: usize,
+    pub ready_tasks: usize,
+    pub blocked_tasks: usize,
     pub current_id: TaskId,
     pub current_name: &'static str,
+    pub current_state: &'static str,
     pub context_switches: u64,
     pub idle_heartbeats: u64,
 }
@@ -179,10 +198,16 @@ impl Scheduler {
         let task = &self.tasks[self.current_slot];
         assert!(task.state == TaskState::Running);
 
+        let ready_tasks = self.tasks.iter().filter(|task| task.state == TaskState::Ready).count();
+        let blocked_tasks = self.tasks.iter().filter(|task| task.state == TaskState::Blocked).count();
+
         Summary {
             task_count: self.task_count,
+            ready_tasks,
+            blocked_tasks,
             current_id: task.id,
             current_name: task.name,
+            current_state: task.state.name(),
             context_switches: self.context_switches,
             idle_heartbeats: IDLE_HEARTBEATS.load(Ordering::Relaxed),
         }

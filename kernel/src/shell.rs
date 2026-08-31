@@ -95,10 +95,16 @@ impl Shell {
                 let summary = task::summary();
                 console.print("TASKS: ");
                 print_u64(console, summary.task_count as u64);
+                console.print(" READY: ");
+                print_u64(console, summary.ready_tasks as u64);
+                console.print(" BLOCKED: ");
+                print_u64(console, summary.blocked_tasks as u64);
                 console.print(" CURRENT: ");
                 print_u64(console, summary.current_id.as_u64());
                 console.print(" ");
                 console.print(summary.current_name);
+                console.print(" STATE: ");
+                console.print(summary.current_state);
                 console.print(" SWITCHES: ");
                 print_u64(console, summary.context_switches);
                 console.print(" IDLE: ");
