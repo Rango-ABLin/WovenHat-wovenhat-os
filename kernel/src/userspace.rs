@@ -24,7 +24,7 @@ impl ElfStub {
         }
     }
 
-    pub const fn is_valid(self) -> bool {
+    pub fn is_valid(self) -> bool {
         self.magic == Self::ELF_MAGIC && self.class == 2 && self.endian == 1 && self.version == 1
     }
 }
