@@ -75,6 +75,36 @@ impl TaskId {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ProcessId(u64);
+
+impl ProcessId {
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    New,
+    Ready,
+    Running,
+    Blocked,
+    Exited,
+}
+
+impl ProcessState {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Exited => "exited",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TaskPriority(u8);
 
@@ -172,6 +202,18 @@ impl TaskControlBlock {
 
         self.context.stack_pointer = cursor as u64;
     }
+}
+
+pub struct Process {
+    pub id: ProcessId,
+    pub parent: Option<ProcessId>,
+    pub task_id: TaskId,
+    pub name: &'static str,
+    pub state: ProcessState,
+    pub ring: u8,
+    pub entry: u64,
+    pub stack_top: u64,
+    pub stack_size: u64,
 }
 
 pub struct Summary {
@@ -277,8 +319,53 @@ impl Scheduler {
 
 }
 
+static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
+
 pub fn init() {
     SCHEDULER.lock().initialize();
+}
+
+pub fn create_process(name: &'static str, entry: usize, stack_top: usize, ring: u8) -> Process {
+    let task_id = SCHEDULER
+        .lock()
+        .tasks
+        .iter()
+        .find(|task| task.state == TaskState::Empty)
+        .map(|_| TaskId(NEXT_TASK_ID.load(Ordering::Relaxed)))
+        .unwrap_or(TaskId(0));
+
+    let id = ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed));
+    Process {
+        id,
+        parent: None,
+        task_id,
+        name,
+        state: ProcessState::Ready,
+        ring,
+        entry: entry as u64,
+        stack_top: stack_top as u64,
+        stack_size: 4096,
+    }
+}
+
+pub fn current_process() -> Option<Process> {
+    let scheduler = SCHEDULER.lock();
+    let task = &scheduler.tasks[scheduler.current_slot];
+    if task.state == TaskState::Empty {
+        return None;
+    }
+
+    Some(Process {
+        id: ProcessId(0),
+        parent: None,
+        task_id: task.id,
+        name: task.name,
+        state: ProcessState::Running,
+        ring: 0,
+        entry: 0,
+        stack_top: task.context.stack_pointer,
+        stack_size: TASK_STACK_SIZE as u64,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
