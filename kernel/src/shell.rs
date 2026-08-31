@@ -133,6 +133,23 @@ impl Shell {
                 print_u64(console, stats.remaining_frames);
                 console.newline();
             }
+            "heap" => {
+                if !authorize(Capability::MemoryInspect, console) {
+                    self.finish(console);
+                    return;
+                }
+
+                let stats = heap::stats();
+                console.print("HEAP: START: ");
+                print_hex_u64(console, stats.start);
+                console.print(" SIZE: ");
+                print_u64(console, stats.size as u64);
+                console.print(" USED: ");
+                print_u64(console, stats.allocated_bytes as u64);
+                console.print(" ALLOCATIONS: ");
+                print_u64(console, stats.allocations as u64);
+                console.newline();
+            }
             "paging" => {
                 if !authorize(Capability::MemoryInspect, console) {
                     self.finish(console);
@@ -154,23 +171,6 @@ impl Shell {
                 } else {
                     "FAILED"
                 });
-                console.newline();
-            }
-            "heap" => {
-                if !authorize(Capability::MemoryInspect, console) {
-                    self.finish(console);
-                    return;
-                }
-
-                let stats = heap::stats();
-                console.print("HEAP START: ");
-                print_hex_u64(console, stats.start);
-                console.print(" SIZE: ");
-                print_u64(console, stats.size as u64);
-                console.print(" USED: ");
-                print_u64(console, stats.allocated_bytes as u64);
-                console.print(" ALLOCS: ");
-                print_u64(console, stats.allocations as u64);
                 console.newline();
             }
             _ => {
