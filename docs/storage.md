@@ -44,24 +44,26 @@ The parser reports corrupt and unsupported media without indexing outside a sect
 
 ## VFS mount
 
-The VFS uses a bounded 16-node registry with 64-byte paths and 4 KiB file payloads.
-Built-in files retain explicit write permissions. When ata0 contains a FAT32 volume
-starting at LBA 0, boot imports up to eight regular root files as read-only lowercase
-8.3 paths below /mnt and records the resulting node count for later lifecycle checks.
-No-disk and non-FAT media are non-fatal boot outcomes.
+The VFS uses a bounded 16-node registry with 64-byte paths and 8 KiB file payloads.
+Built-in files retain explicit write permissions. When ata0 contains a FAT32 volume,
+boot first checks for a superfloppy filesystem at LBA 0 and then checks the four primary
+MBR entries for FAT32 types 0x0B and 0x0C. Partition-relative reads are bounds checked
+against both the selected partition and the underlying device. Boot imports up to eight
+regular root files as read-only lowercase 8.3 paths below /mnt and records the resulting
+node count for later lifecycle checks. No-disk and non-FAT media are non-fatal outcomes.
 
 ## Current boundary
 
 File reads follow at most 64 clusters and may span multiple sectors and clusters.
-Subdirectory lookup, partition-table discovery, and directory mutation are not yet
+Subdirectory lookup, GPT discovery, and directory mutation are not yet
 implemented. The next storage increments are:
 
 1. Subdirectory lookup and path traversal.
-2. MBR/GPT partition discovery and partition-relative block devices.
+2. GPT partition discovery with protective-MBR handling.
 3. ATA writes plus secondary-channel and slave-device discovery.
 4. AHCI, NVMe, or virtio-blk transport.
 5. Crash-safe file and directory updates.
 
 Boot-time self-tests validate block bounds, read-only protection, FAT32 geometry,
-root-chain lookup, missing entries, invalid signatures, multi-cluster reads,
+root-chain lookup, missing entries, invalid signatures, MBR bounds and partition-relative I/O, multi-cluster reads,
 end-of-chain handling, and file/directory cycle rejection.

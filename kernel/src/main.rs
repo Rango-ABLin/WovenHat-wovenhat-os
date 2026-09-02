@@ -25,6 +25,7 @@ mod keyboard;
 mod memory;
 mod paging;
 mod panic;
+mod partition;
 mod pic;
 mod serial;
 mod shell;
@@ -205,6 +206,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("KERNEL HEAP: 256 KIB OK");
     } else {
         console.println("KERNEL HEAP: SELF TEST FAILED");
+        halt();
+    }
+    if partition::self_test() {
+        console.println("MBR PARTITIONS: VALIDATED");
+    } else {
+        console.println("MBR PARTITIONS: VALIDATION FAILED");
         halt();
     }
     if block::self_test() {
