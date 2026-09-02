@@ -21,19 +21,26 @@ sentinel. The assembly entry preserves general registers and returns with iretq.
 | 12 | message_receive | user buffer, capacity, sender output pointer |
 | 13 | getuid | none |
 | 14 | getgid | none |
+| 15 | exec | user path, path length |
 
 All paths and I/O payloads have fixed upper bounds. Pointer-bearing calls translate and
 validate each user page before copying. File and IPC calls additionally pass capability,
 credential, descriptor, and VFS/queue checks.
 
-The embedded ring-3 validation program exercises write, open, read, close, mmap, munmap,
-yield, getpid, getuid, getgid, and exit. Boot also validates waitpid and process
+The embedded ring-3 validation program exercises exec, write, open, read, close, mmap,
+munmap, yield, getpid, getuid, getgid, and exit. Boot also validates waitpid and process
 reclamation from the kernel parent.
+
+`exec` requires FileRead and ProcessCreate. The kernel copies the bounded path, reads and
+validates the complete ELF into a fresh address space, and only then commits the process
+and task records. It switches CR3 before reclaiming the previous image and anonymous
+mappings, preserves the process ID, credentials, capabilities, and open descriptors, and
+enters the new image directly. A failed load returns the error sentinel without changing
+the caller.
 
 ## Current boundary
 
-Fork and exec are not yet implemented. Process creation currently occurs through a
-validated kernel ELF-loading path, and every new userspace process receives the default
+Fork is not yet implemented. Process creation currently occurs through the validated
+kernel ELF-loading path, and every new userspace process receives the default
 unprivileged credentials and capability set. Adding fork requires copy-on-write or a
-bounded address-space clone; exec requires atomic replacement of the active process
-image and user context.
+bounded address-space and saved-register clone.

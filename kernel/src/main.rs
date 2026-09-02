@@ -5,8 +5,8 @@
 
 extern crate alloc;
 
-mod audit;
 mod ata;
+mod audit;
 mod benchmark;
 mod block;
 mod capability;
@@ -313,9 +313,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     if audit::count() < 2
-        || !audit::latest().is_some_and(|event| {
-            event.action == audit::Action::CapabilityRevoke && event.allowed
-        })
+        || !audit::latest()
+            .is_some_and(|event| event.action == audit::Action::CapabilityRevoke && event.allowed)
     {
         console.println("CAPABILITY AUDIT: FAILED");
         halt();
@@ -345,6 +344,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         storage::MountStatus::NoDevice => console.println("FAT32 MOUNT: NO BLOCK DEVICE"),
         storage::MountStatus::NotFat32 => console.println("FAT32 MOUNT: NO VOLUME"),
         storage::MountStatus::Failed => console.println("FAT32 MOUNT: FAILED"),
+    }
+    if userspace::install_stub_executable() {
+        console.println("EXEC IMAGE: INSTALLED");
+    } else {
+        console.println("EXEC IMAGE: INSTALL FAILED");
+        halt();
     }
     let vfs_nodes_before_userspace = vfs::node_count();
     let boot_devices = [
@@ -463,7 +468,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("TIMER IRQ: OK");
 
     let isolation_baseline = memory::stats().allocated_frames;
-    let Some(first_program) = userspace::create_stub_process() else {
+    let Some(first_program) = userspace::create_exec_process() else {
         console.println("USER PROCESS IMAGE: MAPPING FAILED");
         halt();
     };
@@ -547,6 +552,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("USER UID/GID SYSCALLS: FAILED");
         halt();
     }
+    if !syscall::user_exec_verified() {
+        console.println("USER EXEC SYSCALL: FAILED");
+        halt();
+    }
+    console.println("USER EXEC ATOMIC REPLACEMENT: OK");
     console.println("USER UID/GID SYSCALLS: OK");
     serial::write_line(format_args!(
         "[BOOT] user mmap/write/read/munmap and frame return verified"

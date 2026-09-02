@@ -129,6 +129,9 @@ impl Shell {
                 print_capability(console, Capability::InterruptControl, " INTERRUPT_CONTROL");
                 print_capability(console, Capability::MemoryInspect, " MEMORY_INSPECT");
                 print_capability(console, Capability::FileRead, " FILE_READ");
+                print_capability(console, Capability::FileWrite, " FILE_WRITE");
+                print_capability(console, Capability::Ipc, " IPC");
+                print_capability(console, Capability::ProcessCreate, " PROCESS_CREATE");
                 console.newline();
             }
             "memory" => {

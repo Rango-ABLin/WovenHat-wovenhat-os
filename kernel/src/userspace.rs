@@ -77,9 +77,30 @@ global_asm!(
     ".previous",
 );
 
+global_asm!(
+    ".section .rodata.wovenhat_exec_stub, \"a\"",
+    ".global wovenhat_exec_program_start",
+    ".global wovenhat_exec_program_end",
+    "wovenhat_exec_program_start:",
+    "mov eax, 15",
+    "lea rdi, [rip + wovenhat_exec_path]",
+    "mov esi, 13",
+    "int 0x80",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
+    "1:",
+    "jmp 1b",
+    "wovenhat_exec_path:",
+    ".ascii \"/bin/selftest\"",
+    "wovenhat_exec_program_end:",
+    ".previous",
+);
 unsafe extern "C" {
     static wovenhat_user_program_start: u8;
     static wovenhat_user_program_end: u8;
+    static wovenhat_exec_program_start: u8;
+    static wovenhat_exec_program_end: u8;
 }
 #[derive(Clone, Copy, Debug)]
 pub struct UserImage {
@@ -201,7 +222,26 @@ pub fn create_stub_process() -> Option<UserProgram> {
     load_elf(&elf)
 }
 
-fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
+pub fn install_stub_executable() -> bool {
+    let stub = unsafe {
+        let start = &wovenhat_user_program_start as *const u8;
+        let end = &wovenhat_user_program_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    build_stub_elf(stub)
+        .is_some_and(|elf| crate::vfs::create_read_only("/bin/selftest", &elf).is_ok())
+}
+
+pub fn create_exec_process() -> Option<UserProgram> {
+    let stub = unsafe {
+        let start = &wovenhat_exec_program_start as *const u8;
+        let end = &wovenhat_exec_program_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    let elf = build_stub_elf(stub)?;
+    load_elf(&elf)
+}
+pub fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
     let image = crate::elf::parse(bytes).ok()?;
     let page_table = paging::create_user_address_space(image.entry)?;
     let mut mappings = [UserMapping::EMPTY; MAX_ELF_SEGMENTS];

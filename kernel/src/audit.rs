@@ -9,6 +9,7 @@ pub enum Action {
     IpcSend,
     FileWrite,
     ProcessFault,
+    ProcessExec,
 }
 
 #[derive(Clone, Copy)]

@@ -636,6 +636,51 @@ pub fn credential_policy_valid() -> bool {
 fn credentials_may_ipc(sender: Credentials, receiver: Credentials) -> bool {
     sender.is_root() || sender.uid == receiver.uid || sender.gid == receiver.gid
 }
+pub fn exec_current(program: userspace::UserProgram) -> ! {
+    assert!(program.image.is_valid(), "exec received an invalid image");
+    x86_64::instructions::interrupts::disable();
+    let context = prepare_user_context(program.image.entry as usize, program.stack.top as usize);
+    let new_address_space = program.address_space;
+    let task_id = current_task_id();
+    let (old_address_space, old_mappings) = {
+        let mut scheduler = SCHEDULER.lock();
+        let slot = scheduler.current_slot;
+        assert!(scheduler.tasks[slot].id == task_id);
+
+        let mut processes = PROCESS_TABLE.lock();
+        let process = processes
+            .iter_mut()
+            .flatten()
+            .find(|process| process.task_id == task_id)
+            .expect("exec process is missing from the process table");
+        let old_address_space = process
+            .address_space
+            .replace(new_address_space)
+            .expect("exec process has no owned address space");
+        let old_mappings = core::mem::replace(
+            &mut process.memory_mappings,
+            [None; userspace::MAX_ANONYMOUS_MAPPINGS],
+        );
+
+        scheduler.tasks[slot].user_context = Some(context);
+        scheduler.tasks[slot].address_space = Some(new_address_space.paging());
+        (old_address_space, old_mappings)
+    };
+
+    paging::switch_to(new_address_space.paging());
+    for mapping in old_mappings.into_iter().flatten() {
+        assert!(
+            userspace::unmap_anonymous(old_address_space, mapping),
+            "failed to release an exec mapping"
+        );
+    }
+    assert!(
+        userspace::destroy(old_address_space),
+        "failed to release the replaced exec image"
+    );
+    x86_64::instructions::interrupts::enable();
+    enter_user_context(context)
+}
 pub fn exit_current_process(exit_code: i32) -> ! {
     x86_64::instructions::interrupts::disable();
     let (context_switch, address_space, memory_mappings) = {

@@ -62,6 +62,7 @@ const IO_MUNMAP: u64 = 1 << 5;
 const IO_FILE_WRITE: u64 = 1 << 6;
 const IO_GETUID: u64 = 1 << 7;
 const IO_GETGID: u64 = 1 << 8;
+const IO_EXEC: u64 = 1 << 9;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Number {
@@ -80,6 +81,7 @@ pub enum Number {
     MessageReceive = 12,
     Getuid = 13,
     Getgid = 14,
+    Exec = 15,
 }
 
 pub fn entry_address() -> u64 {
@@ -133,6 +135,9 @@ pub fn user_identity_verified() -> bool {
     IO_COMPLETIONS.load(Ordering::Acquire) & (IO_GETUID | IO_GETGID) == IO_GETUID | IO_GETGID
 }
 
+pub fn user_exec_verified() -> bool {
+    IO_COMPLETIONS.load(Ordering::Acquire) & IO_EXEC == IO_EXEC
+}
 pub fn last_completed(number: Number) -> bool {
     LAST_COMPLETED.load(Ordering::Acquire) == number as u64
 }
@@ -318,6 +323,56 @@ fn sys_close(descriptor: u64) -> u64 {
         Err(_) => SYSCALL_ERROR,
     }
 }
+fn sys_exec(user_path: u64, length: u64) -> u64 {
+    let actor = crate::task::current_process_id();
+    if !crate::task::current_has(crate::capability::Capability::FileRead)
+        || !crate::task::current_has(crate::capability::Capability::ProcessCreate)
+    {
+        crate::audit::record(actor, crate::audit::Action::ProcessExec, length, false);
+        return SYSCALL_ERROR;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut path = [0_u8; MAX_PATH_SIZE];
+    if crate::paging::copy_from_current_user(user_path, &mut path[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(path) = core::str::from_utf8(&path[..length]) else {
+        return SYSCALL_ERROR;
+    };
+    let mut image = alloc::vec![0_u8; crate::vfs::NODE_CAPACITY];
+    let Ok(image_length) = crate::vfs::read_all(path, &mut image) else {
+        crate::audit::record(
+            actor,
+            crate::audit::Action::ProcessExec,
+            length as u64,
+            false,
+        );
+        return SYSCALL_ERROR;
+    };
+    let Some(program) = crate::userspace::load_elf(&image[..image_length]) else {
+        crate::audit::record(
+            actor,
+            crate::audit::Action::ProcessExec,
+            length as u64,
+            false,
+        );
+        return SYSCALL_ERROR;
+    };
+    drop(image);
+    IO_COMPLETIONS.fetch_or(IO_EXEC, Ordering::Release);
+    crate::audit::record(
+        actor,
+        crate::audit::Action::ProcessExec,
+        length as u64,
+        true,
+    );
+    crate::task::exec_current(program)
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     let result = match number {
@@ -328,6 +383,7 @@ pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, a
         value if value == Number::Write as u64 => sys_write(arg0, arg1, arg2),
         value if value == Number::Open as u64 => sys_open(arg0, arg1),
         value if value == Number::Close as u64 => sys_close(arg0),
+        value if value == Number::Exec as u64 => sys_exec(arg0, arg1),
         value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),
         value if value == Number::MessageReceive as u64 => sys_message_receive(arg0, arg1, arg2),
         value if value == Number::Getuid as u64 => {

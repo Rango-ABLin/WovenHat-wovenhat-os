@@ -7,7 +7,7 @@ implicitly inheriting root identity.
 
 ## Authorization
 
-- Capabilities gate console output, file access, IPC, task control, device I/O,
+- Capabilities gate console output, file access, IPC, process creation, task control, device I/O,
   interrupt control, and memory inspection.
 - Capability grant requires both TaskControl and the capability being delegated.
 - Capability revoke requires TaskControl.
@@ -24,7 +24,7 @@ capability grant/revoke behavior, and the credentials of two real ring-3 process
 
 A bounded 64-record kernel audit ring stores a monotonic sequence number, timer tick,
 actor process ID, action, target, and allow/deny result. Capability grant/revoke, IPC
-send, and file-write outcomes are recorded. When full, the ring overwrites its oldest
+send, file-write, process-fault, and exec outcomes are recorded. When full, the ring overwrites its oldest
 record instead of allocating or blocking. Boot verifies wraparound and confirms the
 capability delegation test produced ordered audit evidence.
 
