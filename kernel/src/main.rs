@@ -148,10 +148,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(summary) => {
             console.println("ACPI TABLES: VALIDATED");
             serial::write_line(format_args!(
-                "[ACPI] revision={} tables={} APIC={} FADT={} HPET={} MCFG={} truncated={}",
+                "[ACPI] revision={} tables={} APIC={} CPUs={} IOAPICs={} ISOs={} LAPIC={:#x} FADT={} HPET={} MCFG={} truncated={}",
                 summary.revision,
                 summary.tables,
                 summary.apic as u8,
+                summary.enabled_processors,
+                summary.io_apics,
+                summary.interrupt_overrides,
+                summary.local_apic_address,
                 summary.fadt as u8,
                 summary.hpet as u8,
                 summary.mcfg as u8,

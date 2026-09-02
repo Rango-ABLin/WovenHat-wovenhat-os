@@ -31,8 +31,10 @@ The HAL consumes the physical RSDP address supplied by the bootloader. It valida
 the ACPI 1.0 checksum and, for revision 2 or newer, the extended checksum before
 following the RSDT or XSDT. Every physical read must fit within one boot memory-map
 region. SDT lengths are capped at 64 KiB, checksums are verified, and enumeration is
-capped at 256 tables. Boot reports APIC, FADT, HPET, and MCFG presence over serial;
-missing or invalid firmware data is reported without preventing fallback boot.
+capped at 256 tables. A validated MADT is parsed into bounded processor, I/O APIC,
+interrupt-override, and local-APIC-address topology. Boot reports that topology plus
+FADT, HPET, and MCFG presence over serial; missing or invalid firmware data is reported
+without preventing fallback boot. See [interrupt-controller topology](interrupt-topology.md).
 
 ## Invariants
 
@@ -45,6 +47,6 @@ missing or invalid firmware data is reported without preventing fallback boot.
 ## Extension path
 
 PCI functions are inventoried but are only added to the device registry after a driver
-binds them. MADT parsing must still supply interrupt-controller topology and IRQ
-routing. Driver binding should extend Device with bus identity and lifecycle state
+binds them. The validated MADT topology must still be applied to local APIC and I/O
+APIC initialization and IRQ routing. Driver binding should extend Device with bus identity and lifecycle state
 while preserving the name and IRQ uniqueness checks.

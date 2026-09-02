@@ -5,6 +5,9 @@ const RSDP_V2_LENGTH: usize = 36;
 const SDT_HEADER_LENGTH: usize = 36;
 const MAX_TABLE_LENGTH: usize = 64 * 1024;
 const MAX_TABLES: usize = 256;
+const MADT_HEADER_LENGTH: usize = SDT_HEADER_LENGTH + 8;
+const MAX_MADT_ENTRIES: usize = 256;
+const MAX_MADT_ENTRY_LENGTH: usize = u8::MAX as usize;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -21,6 +24,11 @@ pub struct Summary {
     pub revision: u8,
     pub tables: u16,
     pub apic: bool,
+    pub local_apic_address: u64,
+    pub enabled_processors: u16,
+    pub io_apics: u16,
+    pub interrupt_overrides: u16,
+    pub madt_entries: u16,
     pub fadt: bool,
     pub hpet: bool,
     pub mcfg: bool,
@@ -96,7 +104,16 @@ pub fn discover(
         validate_sdt_checksum(physical_offset, table_address, table.length, regions)?;
         summary.tables = summary.tables.saturating_add(1);
         match &table.signature {
-            b"APIC" => summary.apic = true,
+            b"APIC" => {
+                parse_madt(
+                    physical_offset,
+                    table_address,
+                    table.length,
+                    regions,
+                    &mut summary,
+                )?;
+                summary.apic = true;
+            }
             b"FACP" => summary.fadt = true,
             b"HPET" => summary.hpet = true,
             b"MCFG" => summary.mcfg = true,
@@ -106,6 +123,105 @@ pub fn discover(
     Ok(summary)
 }
 
+fn parse_madt(
+    physical_offset: u64,
+    address: u64,
+    length: usize,
+    regions: &[MemoryRegion],
+    summary: &mut Summary,
+) -> Result<(), Error> {
+    if length < MADT_HEADER_LENGTH {
+        return Err(Error::InvalidLength);
+    }
+    let mut fixed = [0_u8; 8];
+    read_physical(
+        physical_offset,
+        address
+            .checked_add(SDT_HEADER_LENGTH as u64)
+            .ok_or(Error::AddressOverflow)?,
+        &mut fixed,
+        regions,
+    )?;
+    summary.local_apic_address = u64::from(read_u32(&fixed, 0));
+
+    let mut offset = MADT_HEADER_LENGTH;
+    let mut entries = 0_usize;
+    while offset < length {
+        if entries == MAX_MADT_ENTRIES {
+            summary.truncated = true;
+            break;
+        }
+        let entry_address = address
+            .checked_add(offset as u64)
+            .ok_or(Error::AddressOverflow)?;
+        let mut header = [0_u8; 2];
+        read_physical(physical_offset, entry_address, &mut header, regions)?;
+        let entry_length = header[1] as usize;
+        if entry_length < 2
+            || offset
+                .checked_add(entry_length)
+                .is_none_or(|end| end > length)
+        {
+            return Err(Error::InvalidLength);
+        }
+        let mut entry = [0_u8; MAX_MADT_ENTRY_LENGTH];
+        read_physical(
+            physical_offset,
+            entry_address,
+            &mut entry[..entry_length],
+            regions,
+        )?;
+        update_madt_summary(&entry[..entry_length], summary)?;
+        entries += 1;
+        offset += entry_length;
+    }
+    summary.madt_entries = entries as u16;
+    Ok(())
+}
+
+fn update_madt_summary(entry: &[u8], summary: &mut Summary) -> Result<(), Error> {
+    if entry.len() < 2 || entry[1] as usize != entry.len() {
+        return Err(Error::InvalidLength);
+    }
+    match entry[0] {
+        0 => {
+            if entry.len() < 8 {
+                return Err(Error::InvalidLength);
+            }
+            if read_u32(entry, 4) & 3 != 0 {
+                summary.enabled_processors = summary.enabled_processors.saturating_add(1);
+            }
+        }
+        1 => {
+            if entry.len() < 12 {
+                return Err(Error::InvalidLength);
+            }
+            summary.io_apics = summary.io_apics.saturating_add(1);
+        }
+        2 => {
+            if entry.len() < 10 {
+                return Err(Error::InvalidLength);
+            }
+            summary.interrupt_overrides = summary.interrupt_overrides.saturating_add(1);
+        }
+        5 => {
+            if entry.len() < 12 {
+                return Err(Error::InvalidLength);
+            }
+            summary.local_apic_address = read_u64(entry, 4);
+        }
+        9 => {
+            if entry.len() < 16 {
+                return Err(Error::InvalidLength);
+            }
+            if read_u32(entry, 8) & 3 != 0 {
+                summary.enabled_processors = summary.enabled_processors.saturating_add(1);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 struct SdtHeader {
     signature: [u8; 4],
     length: usize,
@@ -225,5 +341,30 @@ pub fn self_test() -> bool {
     let valid =
         validate_rsdp_v1(&rsdp[..RSDP_V1_LENGTH]).is_ok() && validate_rsdp_v2(&rsdp).is_ok();
     rsdp[9] ^= 1;
-    valid && validate_rsdp_v1(&rsdp[..RSDP_V1_LENGTH]) == Err(Error::InvalidChecksum)
+    let checksum_rejected =
+        validate_rsdp_v1(&rsdp[..RSDP_V1_LENGTH]) == Err(Error::InvalidChecksum);
+
+    let mut topology = Summary {
+        local_apic_address: 0xfee0_0000,
+        ..Summary::default()
+    };
+    let local_apic = [0_u8, 8, 0, 1, 1, 0, 0, 0];
+    let io_apic = [1_u8, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let interrupt_override = [2_u8, 10, 0, 1, 1, 0, 0, 0, 0, 0];
+    let mut address_override = [0_u8; 12];
+    address_override[0] = 5;
+    address_override[1] = 12;
+    address_override[4..12].copy_from_slice(&0xfee0_1000_u64.to_le_bytes());
+    let topology_valid = update_madt_summary(&local_apic, &mut topology).is_ok()
+        && update_madt_summary(&io_apic, &mut topology).is_ok()
+        && update_madt_summary(&interrupt_override, &mut topology).is_ok()
+        && update_madt_summary(&address_override, &mut topology).is_ok()
+        && topology.enabled_processors == 1
+        && topology.io_apics == 1
+        && topology.interrupt_overrides == 1
+        && topology.local_apic_address == 0xfee0_1000;
+    let malformed_rejected =
+        update_madt_summary(&[0, 7, 0, 0, 0, 0, 0], &mut topology) == Err(Error::InvalidLength);
+
+    valid && checksum_rejected && topology_valid && malformed_rejected
 }
