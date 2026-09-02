@@ -100,6 +100,12 @@ impl Window {
         self.buttons.push(button);
     }
 
+    fn clear_focus(&mut self) {
+        for button in &mut self.buttons {
+            button.focused = false;
+        }
+    }
+
     fn render(&self, graphics: &mut Graphics<'_>) {
         graphics.fill_rect(
             self.bounds.x,
@@ -122,10 +128,15 @@ impl Window {
 
     fn handle(&mut self, event: &InputEvent) -> bool {
         if let InputEvent::Key('\t') = event {
-            if let Some(button) = self.buttons.first_mut() {
-                button.focused = true;
-                return true;
+            let next = self
+                .buttons
+                .iter()
+                .position(|button| button.focused)
+                .map_or(0, |index| (index + 1) % self.buttons.len());
+            for (index, button) in self.buttons.iter_mut().enumerate() {
+                button.focused = index == next;
             }
+            return !self.buttons.is_empty();
         }
         if let InputEvent::Key('\n') = event {
             if let Some(button) = self.buttons.iter_mut().find(|button| button.focused) {
@@ -133,7 +144,18 @@ impl Window {
                 return true;
             }
         }
-        self.buttons.iter_mut().any(|button| button.handle(event))
+        if let InputEvent::PointerDown { x, y } = event {
+            let mut handled = false;
+            for button in &mut self.buttons {
+                let hit = button.bounds.contains(*x, *y);
+                button.focused = hit;
+                if hit {
+                    handled = button.handle(event);
+                }
+            }
+            return handled;
+        }
+        false
     }
 }
 
@@ -162,23 +184,71 @@ impl Desktop {
     }
 
     pub fn handle(&mut self, event: &InputEvent) -> bool {
-        for window in self.windows.iter_mut().rev() {
-            if window.handle(event) {
-                return true;
+        if let InputEvent::PointerDown { x, y } = event {
+            let Some(active_index) = self
+                .windows
+                .iter()
+                .rposition(|window| window.bounds.contains(*x, *y))
+            else {
+                for window in &mut self.windows {
+                    window.clear_focus();
+                }
+                return false;
+            };
+
+            for (index, window) in self.windows.iter_mut().enumerate() {
+                if index != active_index {
+                    window.clear_focus();
+                }
             }
+
+            let mut active = self.windows.remove(active_index);
+            active.handle(event);
+            self.windows.push(active);
+            return true;
         }
-        false
+
+        self.windows
+            .last_mut()
+            .is_some_and(|window| window.handle(event))
     }
 }
 
 pub fn self_test() -> bool {
-    let bounds = Rect::new(10, 10, 80, 30);
     let mut desktop = Desktop::new(Color::DARK_BLUE);
     let mut window = Window::new(Rect::new(0, 0, 160, 120));
-    window.add_button(Button::new(bounds, Color::CYAN));
+    window.add_button(Button::new(Rect::new(10, 10, 60, 30), Color::CYAN));
+    window.add_button(Button::new(Rect::new(80, 10, 60, 30), Color::CYAN));
     desktop.add_window(window);
 
-    let focused = desktop.handle(&InputEvent::Key('\t'));
-    let activated = desktop.handle(&InputEvent::Key('\n'));
-    focused && activated && desktop.windows[0].buttons[0].pressed
+    let first_focused = desktop.handle(&InputEvent::Key('\t'))
+        && desktop.windows[0].buttons[0].focused;
+    let second_focused = desktop.handle(&InputEvent::Key('\t'))
+        && !desktop.windows[0].buttons[0].focused
+        && desktop.windows[0].buttons[1].focused;
+    let keyboard_activated = desktop.handle(&InputEvent::Key('\n'))
+        && desktop.windows[0].buttons[1].pressed;
+    let pointer_activated = desktop.handle(&InputEvent::PointerDown { x: 20, y: 20 })
+        && desktop.windows[0].buttons[0].focused
+        && desktop.windows[0].buttons[0].pressed
+        && !desktop.windows[0].buttons[1].focused;
+
+    let mut front_window = Window::new(Rect::new(200, 0, 100, 100));
+    front_window.add_button(Button::new(
+        Rect::new(210, 10, 60, 30),
+        Color::CYAN,
+    ));
+    desktop.add_window(front_window);
+    let raised = desktop.handle(&InputEvent::PointerDown { x: 150, y: 100 })
+        && desktop.windows.last().is_some_and(|window| window.bounds.x == 0)
+        && desktop.windows[0]
+            .buttons
+            .first()
+            .is_some_and(|button| !button.focused);
+
+    first_focused
+        && second_focused
+        && keyboard_activated
+        && pointer_activated
+        && raised
 }

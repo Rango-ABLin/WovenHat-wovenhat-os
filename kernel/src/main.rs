@@ -7,6 +7,7 @@ extern crate alloc;
 
 mod capability;
 mod console;
+mod elf;
 mod gdt;
 mod graphics;
 mod gui;
@@ -26,12 +27,7 @@ mod timer;
 mod userspace;
 mod vfs;
 
-use bootloader_api::{
-    BootInfo, BootloaderConfig,
-    config::Mapping,
-    entry_point,
-    info::Optional,
-};
+use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, BootloaderConfig};
 
 use console::Console;
 use core::{alloc::Layout, panic::PanicInfo};
@@ -228,6 +224,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         gui::Rect::new(120, 180, 180, 48),
         graphics::Color::CYAN,
     ));
+    window.add_button(gui::Button::new(
+        gui::Rect::new(320, 180, 180, 48),
+        graphics::Color::CYAN,
+    ));
     desktop.add_window(window);
     console.render_desktop(&desktop);
 
@@ -265,7 +265,11 @@ fn halt() -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: Layout) -> ! {
-    serial::write_fmt(format_args!("\nKERNEL ALLOC ERROR: layout size={} align={}\n", layout.size(), layout.align()));
+    serial::write_fmt(format_args!(
+        "\nKERNEL ALLOC ERROR: layout size={} align={}\n",
+        layout.size(),
+        layout.align()
+    ));
     halt()
 }
 

@@ -49,7 +49,7 @@ impl PanicContext {
             rip: 0,
             rsp: 0,
             rflags: 0,
-            cr2: Cr2::read().as_u64(),
+            cr2: Cr2::read().map_or(0, |address| address.as_u64()),
         };
 
         unsafe {
@@ -98,7 +98,7 @@ impl PanicContext {
             asm!("lea {0}, [rip]", out(reg) ctx.rip, options(nomem, nostack, preserves_flags));
         }
         ctx.rflags = x86_64::registers::rflags::read().bits();
-        ctx.cr2 = Cr2::read().as_u64();
+        ctx.cr2 = Cr2::read().map_or(0, |address| address.as_u64());
 
         ctx
     }

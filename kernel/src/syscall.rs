@@ -1,6 +1,6 @@
 use core::{
     arch::{asm, global_asm},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 global_asm!(
@@ -51,6 +51,7 @@ global_asm!(
 static LAST_COMPLETED: AtomicU64 = AtomicU64::new(u64::MAX);
 static COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static YIELD_PENDING: AtomicBool = AtomicBool::new(false);
 
 const IO_WRITE: u64 = 1 << 0;
 const IO_OPEN: u64 = 1 << 1;
@@ -124,6 +125,12 @@ pub fn user_memory_verified() -> bool {
 
 pub fn last_completed(number: Number) -> bool {
     LAST_COMPLETED.load(Ordering::Acquire) == number as u64
+}
+
+pub fn service_pending() {
+    if YIELD_PENDING.swap(false, Ordering::AcqRel) {
+        crate::task::yield_now();
+    }
 }
 
 const MAX_IO_SIZE: usize = 256;
@@ -254,7 +261,7 @@ pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, a
         value if value == Number::Open as u64 => sys_open(arg0, arg1),
         value if value == Number::Close as u64 => sys_close(arg0),
         value if value == Number::Yield as u64 => {
-            crate::task::yield_now();
+            YIELD_PENDING.store(true, Ordering::Release);
             0
         }
         value if value == Number::Exit as u64 => crate::task::exit_current_process(arg0 as i32),

@@ -21,8 +21,8 @@ pub fn detect_vendor() -> CpuVendor {
 }
 
 pub fn detect_features() -> CpuFeatures {
-    let basic = unsafe { __cpuid(FEATURE_INFO) };
-    let extended = unsafe { __cpuid(EXTENDED_FEATURE_INFO) };
+    let basic = __cpuid(FEATURE_INFO);
+    let extended = __cpuid(EXTENDED_FEATURE_INFO);
 
     CpuFeatures {
         has_tsc: basic.edx & TSC != 0,
@@ -35,13 +35,13 @@ pub fn detect_features() -> CpuFeatures {
 }
 
 pub fn count_logical_cpus() -> u32 {
-    let basic = unsafe { __cpuid(FEATURE_INFO) };
+    let basic = __cpuid(FEATURE_INFO);
     let count = ((basic.ebx >> 16) & 0xff) as u32;
     count.max(1)
 }
 
 fn vendor_string() -> [u8; 12] {
-    let result = unsafe { __cpuid(0) };
+    let result = __cpuid(0);
     let mut vendor = [0; 12];
     vendor[0..4].copy_from_slice(&result.ebx.to_le_bytes());
     vendor[4..8].copy_from_slice(&result.edx.to_le_bytes());
