@@ -19,6 +19,11 @@ static NODES: Mutex<[Node; 2]> = Mutex::new([
         data: padded(b"WovenHat kernel 0.0.7\n"),
         length: 22,
     },
+    Node {
+        path: "/tmp/vfs-self-test",
+        data: padded(b""),
+        length: 0,
+    },
 ]);
 
 #[derive(Clone, Copy)]
@@ -72,7 +77,23 @@ pub fn write(file: &mut OpenFile, buffer: &[u8]) -> Result<usize, Error> {
 }
 
 pub const fn node_count() -> usize {
-    2
+    3
+}
+
+pub fn self_test() -> bool {
+    let Ok(mut writer) = open("/tmp/vfs-self-test") else {
+        return false;
+    };
+    let payload = b"wovenhat-vfs";
+    if write(&mut writer, payload) != Ok(payload.len()) {
+        return false;
+    }
+
+    let Ok(mut reader) = open("/tmp/vfs-self-test") else {
+        return false;
+    };
+    let mut buffer = [0; 12];
+    read(&mut reader, &mut buffer) == Ok(payload.len()) && buffer == *payload
 }
 
 const fn padded(bytes: &[u8]) -> [u8; NODE_CAPACITY] {

@@ -8,6 +8,7 @@ extern crate alloc;
 mod capability;
 mod console;
 mod gdt;
+mod graphics;
 mod hal;
 mod heap;
 mod interrupts;
@@ -143,6 +144,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("KERNEL HEAP: 256 KIB OK");
     } else {
         console.println("KERNEL HEAP: SELF TEST FAILED");
+        halt();
+    }
+
+    if vfs::self_test() {
+        console.println("VFS READ/WRITE: OK");
+    } else {
+        console.println("VFS READ/WRITE: FAILED");
         halt();
     }
 
