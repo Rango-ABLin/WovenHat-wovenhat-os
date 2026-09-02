@@ -7,6 +7,7 @@ extern crate alloc;
 
 mod audit;
 mod ata;
+mod benchmark;
 mod block;
 mod capability;
 mod console;
@@ -284,6 +285,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     task::init();
     console.println("SCHEDULER: INITIALIZED");
+    if benchmark::self_test() {
+        console.println("BENCHMARK DELTAS: VALIDATED");
+    } else {
+        console.println("BENCHMARK DELTAS: FAILED");
+        halt();
+    }
     if syscall::test() {
         console.println("SYSCALL GATE: GETPID OK");
     } else {
