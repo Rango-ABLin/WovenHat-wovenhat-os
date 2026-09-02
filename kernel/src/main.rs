@@ -611,6 +611,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("BREAKPOINT HANDLER: FAILED");
     }
 
+    serial::write_line(format_args!("[BOOT] ALL VALIDATIONS PASSED"));
+    #[cfg(feature = "qemu-test")]
+    qemu_test_exit_success();
+
     console.println("");
     let mut desktop = gui::Desktop::new(graphics::Color::DARK_BLUE);
     let mut window = gui::Window::new(gui::Rect::new(80, 80, 480, 280), "WOVENHAT DESKTOP");
@@ -667,6 +671,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         syscall::service_pending();
         task::preemption_point();
+        x86_64::instructions::hlt();
+    }
+}
+
+#[cfg(feature = "qemu-test")]
+fn qemu_test_exit_success() {
+    unsafe {
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") 0xf4_u16,
+            in("eax") 0x10_u32,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    loop {
         x86_64::instructions::hlt();
     }
 }

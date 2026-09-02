@@ -2,6 +2,9 @@
 resolver = "3"
 members = ["kernel"]
 
+[features]
+qemu-test = ["kernel/qemu-test"]
+
 [profile.dev]
 panic = "abort"
 
