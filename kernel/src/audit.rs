@@ -8,6 +8,7 @@ pub enum Action {
     CapabilityRevoke,
     IpcSend,
     FileWrite,
+    ProcessFault,
 }
 
 #[derive(Clone, Copy)]

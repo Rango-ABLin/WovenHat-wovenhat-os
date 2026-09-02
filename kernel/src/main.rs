@@ -275,6 +275,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init();
 
     console.println("IDT: INSTALLED");
+    if interrupts::fault_policy_self_test() {
+        console.println("USER FAULT RECOVERY: ARMED");
+    } else {
+        console.println("USER FAULT RECOVERY: FAILED");
+        halt();
+    }
 
     task::init();
     console.println("SCHEDULER: INITIALIZED");
