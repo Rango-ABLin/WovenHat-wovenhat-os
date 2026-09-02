@@ -155,7 +155,7 @@ impl Window {
             self.bounds.y,
             self.bounds.width,
             self.bounds.height,
-            Color::DARK_BLUE,
+            Color::BLACK,
         );
         for button in &self.buttons {
             button.render(graphics);

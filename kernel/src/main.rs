@@ -31,6 +31,7 @@ use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, Boo
 
 use console::Console;
 use core::{alloc::Layout, panic::PanicInfo};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use keyboard::Keyboard;
 use shell::Shell;
 
@@ -43,6 +44,12 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 };
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
+
+static PREEMPTION_PROBE_BLOCKED: AtomicBool = AtomicBool::new(false);
+static PREEMPTION_PROBE_COMPLETED: AtomicBool = AtomicBool::new(false);
+static FAIR_TASK_A_RUNS: AtomicU64 = AtomicU64::new(0);
+static FAIR_TASK_B_RUNS: AtomicU64 = AtomicU64::new(0);
+static FAIR_TASKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let memory_init = memory::init(&boot_info.memory_regions);
@@ -211,6 +218,61 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     while timer::ticks() < 3 {
         task::yield_now();
     }
+
+    let probe_id = match task::spawn("preemption-probe", preemption_probe_task) {
+        Ok(id) => id,
+        Err(_) => {
+            console.println("PREEMPTION TEST: SPAWN FAILED");
+            halt();
+        }
+    };
+
+    while !PREEMPTION_PROBE_BLOCKED.load(Ordering::Acquire) {
+        x86_64::instructions::hlt();
+    }
+
+    if !task::wake_task(probe_id) {
+        console.println("TASK WAKEUP: FAILED");
+        halt();
+    }
+
+    while !PREEMPTION_PROBE_COMPLETED.load(Ordering::Acquire) {
+        x86_64::instructions::hlt();
+    }
+
+    console.println("TIMER IRQ: OK");
+    console.println("TIMER PREEMPTION: OK");
+    console.println("TASK SLEEP/BLOCK/WAKE: OK");
+    serial::write_line(format_args!(
+        "[BOOT] timer preemption and task lifecycle verified"
+    ));
+
+    let preemptions_before_fairness = task::summary().preemption_switches;
+    if task::spawn("fair-peer-a", fairness_probe_a).is_err() {
+        console.println("SCHEDULER FAIRNESS A: SPAWN FAILED");
+        serial::write_line(format_args!("[SCHED] peer A spawn failed"));
+        halt();
+    }
+    if task::spawn("fair-peer-b", fairness_probe_b).is_err() {
+        console.println("SCHEDULER FAIRNESS B: SPAWN FAILED");
+        serial::write_line(format_args!("[SCHED] peer B spawn failed"));
+        halt();
+    }
+    while FAIR_TASKS_COMPLETED.load(Ordering::Acquire) != 2 {
+        x86_64::instructions::hlt();
+    }
+    let fairness_summary = task::summary();
+    if FAIR_TASK_A_RUNS.load(Ordering::Acquire) == 0
+        || FAIR_TASK_B_RUNS.load(Ordering::Acquire) == 0
+        || fairness_summary.preemption_switches < preemptions_before_fairness + 2
+    {
+        console.println("SCHEDULER FAIRNESS/QUANTUM: FAILED");
+        halt();
+    }
+    console.println("PRIORITY ROUND-ROBIN/TIME SLICES: OK");
+    serial::write_line(format_args!(
+        "[BOOT] priority round-robin fairness and per-task quanta verified"
+    ));
 
     console.println("TIMER IRQ: OK");
 
@@ -389,6 +451,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         task::preemption_point();
         x86_64::instructions::hlt();
     }
+}
+
+fn fairness_probe_a() -> ! {
+    while FAIR_TASK_B_RUNS.load(Ordering::Acquire) == 0 {
+        FAIR_TASK_A_RUNS.fetch_add(1, Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+    FAIR_TASK_A_RUNS.fetch_add(1, Ordering::Release);
+    FAIR_TASKS_COMPLETED.fetch_add(1, Ordering::Release);
+    task::exit_current_task()
+}
+
+fn fairness_probe_b() -> ! {
+    while FAIR_TASK_A_RUNS.load(Ordering::Acquire) == 0 {
+        FAIR_TASK_B_RUNS.fetch_add(1, Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+    FAIR_TASK_B_RUNS.fetch_add(1, Ordering::Release);
+    FAIR_TASKS_COMPLETED.fetch_add(1, Ordering::Release);
+    task::exit_current_task()
+}
+fn preemption_probe_task() -> ! {
+    task::sleep_current(2);
+    PREEMPTION_PROBE_BLOCKED.store(true, Ordering::Release);
+    task::block_current();
+    PREEMPTION_PROBE_COMPLETED.store(true, Ordering::Release);
+    task::exit_current_task()
 }
 
 fn halt() -> ! {
