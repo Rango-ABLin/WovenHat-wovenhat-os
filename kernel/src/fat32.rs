@@ -126,17 +126,55 @@ pub fn find_root(
     volume: Volume,
     short_name: &[u8; 11],
 ) -> Result<DirectoryEntry, Error> {
-    let root_lba = volume.cluster_lba(volume.root_cluster)?;
+    let mut cluster = volume.root_cluster;
+    let mut visited = [0_u32; MAX_READ_CLUSTERS];
+    let mut visited_count = 0;
     let mut sector = [0_u8; SECTOR_SIZE];
-    device
-        .read_sector(root_lba, &mut sector)
-        .map_err(Error::Block)?;
 
+    loop {
+        if visited_count == visited.len() {
+            return Err(Error::ChainTooLong);
+        }
+        if visited[..visited_count].contains(&cluster) {
+            return Err(Error::ChainLoop);
+        }
+        visited[visited_count] = cluster;
+        visited_count += 1;
+
+        let cluster_lba = volume.cluster_lba(cluster)?;
+        for sector_index in 0..volume.sectors_per_cluster as u64 {
+            device
+                .read_sector(cluster_lba + sector_index, &mut sector)
+                .map_err(Error::Block)?;
+            match scan_directory_sector(&sector, short_name)? {
+                DirectoryScan::Found(entry) => return Ok(entry),
+                DirectoryScan::End => return Err(Error::NotFound),
+                DirectoryScan::Continue => {}
+            }
+        }
+
+        cluster = match next_cluster(device, volume, cluster)? {
+            ClusterLink::Next(next) => next,
+            ClusterLink::End => return Err(Error::NotFound),
+        };
+    }
+}
+
+enum DirectoryScan {
+    Found(DirectoryEntry),
+    Continue,
+    End,
+}
+
+fn scan_directory_sector(
+    sector: &[u8; SECTOR_SIZE],
+    short_name: &[u8; 11],
+) -> Result<DirectoryScan, Error> {
     for index in 0..DIRECTORY_ENTRIES_PER_SECTOR {
         let offset = index * DIRECTORY_ENTRY_SIZE;
         let first = sector[offset];
         if first == 0 {
-            break;
+            return Ok(DirectoryScan::End);
         }
         let attributes = sector[offset + 11];
         if first == 0xe5 || attributes == 0x0f || attributes & 0x08 != 0 {
@@ -148,22 +186,21 @@ pub fn find_root(
             continue;
         }
 
-        let high_cluster = read_u16(&sector, offset + 20) as u32;
-        let low_cluster = read_u16(&sector, offset + 26) as u32;
+        let high_cluster = read_u16(sector, offset + 20) as u32;
+        let low_cluster = read_u16(sector, offset + 26) as u32;
         let first_cluster = (high_cluster << 16) | low_cluster;
-        if first_cluster < 2 && read_u32(&sector, offset + 28) != 0 {
+        if first_cluster < 2 && read_u32(sector, offset + 28) != 0 {
             return Err(Error::CorruptDirectory);
         }
-        return Ok(DirectoryEntry {
+        return Ok(DirectoryScan::Found(DirectoryEntry {
             short_name: entry_name,
             first_cluster,
-            size: read_u32(&sector, offset + 28),
+            size: read_u32(sector, offset + 28),
             attributes,
-        });
+        }));
     }
-    Err(Error::NotFound)
+    Ok(DirectoryScan::Continue)
 }
-
 pub fn next_cluster(
     device: &mut impl BlockDevice,
     volume: Volume,
@@ -295,13 +332,19 @@ impl BlockDevice for TestDisk {
                 sector[511] = 0xaa;
             }
         } else if lba == Self::FAT_LBA {
+            sector[8..12].copy_from_slice(&5_u32.to_le_bytes());
             if self.cyclic_chain {
                 sector[12..16].copy_from_slice(&3_u32.to_le_bytes());
             } else {
                 sector[12..16].copy_from_slice(&4_u32.to_le_bytes());
                 sector[16..20].copy_from_slice(&FAT32_END_MIN.to_le_bytes());
             }
+            sector[20..24].copy_from_slice(&FAT32_END_MIN.to_le_bytes());
         } else if lba == Self::ROOT_LBA {
+            for index in 0..DIRECTORY_ENTRIES_PER_SECTOR {
+                sector[index * DIRECTORY_ENTRY_SIZE] = 0xe5;
+            }
+        } else if lba == Self::ROOT_LBA + 3 {
             sector[..11].copy_from_slice(b"KERNEL  BIN");
             sector[11] = 0x20;
             sector[26..28].copy_from_slice(&3_u16.to_le_bytes());
@@ -317,6 +360,26 @@ impl BlockDevice for TestDisk {
 
     fn write_sector(&mut self, _lba: u64, _sector: &[u8]) -> Result<(), BlockError> {
         Err(BlockError::ReadOnly)
+    }
+}
+
+struct RootCycleDisk(TestDisk);
+
+impl BlockDevice for RootCycleDisk {
+    fn sector_count(&self) -> u64 {
+        self.0.sector_count()
+    }
+
+    fn read_sector(&mut self, lba: u64, sector: &mut [u8]) -> Result<(), BlockError> {
+        self.0.read_sector(lba, sector)?;
+        if lba == TestDisk::FAT_LBA {
+            sector[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    fn write_sector(&mut self, lba: u64, sector: &[u8]) -> Result<(), BlockError> {
+        self.0.write_sector(lba, sector)
     }
 }
 
@@ -336,6 +399,7 @@ pub fn self_test() -> bool {
         && volume.fat_count == 2
         && volume.fat_size == 600
         && volume.cluster_lba(volume.root_cluster) == Ok(TestDisk::ROOT_LBA)
+        && next_cluster(&mut disk, volume, volume.root_cluster) == Ok(ClusterLink::Next(5))
         && entry.short_name == *b"KERNEL  BIN"
         && entry.first_cluster == 3
         && entry.size == 600
@@ -367,5 +431,13 @@ pub fn self_test() -> bool {
     let cycle_rejected = read_file(&mut cyclic, cyclic_volume, cyclic_entry, &mut oversized)
         == Err(Error::ChainLoop);
 
-    valid && invalid_rejected && cycle_rejected
+    let mut root_cycle = RootCycleDisk(TestDisk {
+        valid_signature: true,
+        cyclic_chain: false,
+    });
+    let root_cycle_rejected = mount(&mut root_cycle).is_ok_and(|volume| {
+        find_root(&mut root_cycle, volume, b"MISSING TXT") == Err(Error::ChainLoop)
+    });
+
+    valid && invalid_rejected && cycle_rejected && root_cycle_rejected
 }

@@ -170,7 +170,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     if fat32::self_test() {
-        console.println("FAT32 VOLUME/ROOT: OK");
+        console.println("FAT32 CHAIN READS: OK");
     } else {
         console.println("FAT32 VALIDATION: FAILED");
         halt();

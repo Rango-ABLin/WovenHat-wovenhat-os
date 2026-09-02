@@ -24,7 +24,7 @@ device. Boot validates an actual LBA 0 transfer when present.
 ## FAT32 validation
 
 `kernel/src/fat32.rs` provides strict mount metadata validation, short-name lookup
-in the first root-directory sector, FAT-chain decoding, and bounded file reads. It
+across the root-directory cluster chain, FAT-chain decoding, and bounded file reads. It
 validates:
 
 - the 0x55AA boot signature;
@@ -45,16 +45,15 @@ The parser reports corrupt and unsupported media without indexing outside a sect
 ## Current boundary
 
 File reads follow at most 64 clusters and may span multiple sectors and clusters.
-Root lookup is still limited to the first root-directory sector, directory mutation is
-not implemented, and FAT32 is not yet mounted from the detected physical disk. The
-next storage increments are:
+Subdirectory lookup and directory mutation are not implemented, and FAT32 is not yet
+mounted from the detected physical disk. The next storage increments are:
 
-1. Root-directory chain traversal and subdirectory lookup.
+1. Subdirectory lookup and path traversal.
 2. Mounting a FAT32 volume into the VFS namespace.
 3. ATA writes plus secondary-channel and slave-device discovery.
 4. AHCI, NVMe, or virtio-blk transport.
 5. Crash-safe file and directory updates.
 
 Boot-time self-tests validate block bounds, read-only protection, FAT32 geometry,
-root lookup, missing entries, invalid signatures, multi-cluster reads, end-of-chain
-handling, and cycle rejection.
+root-chain lookup, missing entries, invalid signatures, multi-cluster reads,
+end-of-chain handling, and file/directory cycle rejection.
