@@ -69,6 +69,18 @@ impl<'a> Graphics<'a> {
         }
     }
 
+    pub fn stroke_rect(&mut self, x: i32, y: i32, width: usize, height: usize, color: Color) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let right = x.saturating_add(width as i32 - 1);
+        let bottom = y.saturating_add(height as i32 - 1);
+        self.draw_line(x, y, right, y, color);
+        self.draw_line(x, bottom, right, bottom, color);
+        self.draw_line(x, y, x, bottom, color);
+        self.draw_line(right, y, right, bottom, color);
+    }
+
     pub fn draw_line(&mut self, start_x: i32, start_y: i32, end_x: i32, end_y: i32, color: Color) {
         let mut x = start_x;
         let mut y = start_y;

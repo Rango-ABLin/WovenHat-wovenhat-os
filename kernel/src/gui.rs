@@ -72,6 +72,15 @@ impl Button {
             self.label,
             Color::DARK_BLUE,
         );
+        if self.focused {
+            graphics.stroke_rect(
+                self.bounds.x - 2,
+                self.bounds.y - 2,
+                self.bounds.width + 4,
+                self.bounds.height + 4,
+                Color::DARK_BLUE,
+            );
+        }
     }
 
     fn handle(&mut self, event: &InputEvent) -> bool {
@@ -134,6 +143,13 @@ impl Window {
             self.bounds.width,
             self.bounds.height.saturating_sub(self.title_bar_height),
             self.body_color,
+        );
+        graphics.stroke_rect(
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.width,
+            self.bounds.height,
+            Color::DARK_BLUE,
         );
         for button in &self.buttons {
             button.render(graphics);
@@ -227,5 +243,11 @@ pub fn self_test() -> bool {
     let second_focused = desktop.handle(&InputEvent::Key('\t'))
         && desktop.windows[0].buttons[1].focused;
     let activated = desktop.handle(&InputEvent::Key('\n'));
-    first_focused && second_focused && activated && desktop.windows[0].buttons[1].pressed
+    let pointer_activation = desktop.handle(&InputEvent::PointerDown { x: 20, y: 20 });
+    first_focused
+        && second_focused
+        && activated
+        && pointer_activation
+        && desktop.windows[0].buttons[0].pressed
+        && desktop.windows[0].buttons[1].pressed
 }
