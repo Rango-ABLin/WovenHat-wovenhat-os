@@ -38,6 +38,7 @@ pub struct Button {
     pub bounds: Rect,
     pub color: Color,
     pub pressed: bool,
+    pub focused: bool,
 }
 
 impl Button {
@@ -46,11 +47,16 @@ impl Button {
             bounds,
             color,
             pressed: false,
+            focused: false,
         }
     }
 
     fn render(&self, graphics: &mut Graphics<'_>) {
-        let color = if self.pressed { Color::WHITE } else { self.color };
+        let color = if self.pressed || self.focused {
+            Color::WHITE
+        } else {
+            self.color
+        };
         graphics.fill_rect(
             self.bounds.x,
             self.bounds.y,
@@ -63,10 +69,6 @@ impl Button {
     fn handle(&mut self, event: &InputEvent) -> bool {
         match event {
             InputEvent::PointerDown { x, y } if self.bounds.contains(*x, *y) => {
-                self.pressed = !self.pressed;
-                true
-            }
-            InputEvent::Key('\n') => {
                 self.pressed = !self.pressed;
                 true
             }
@@ -119,6 +121,18 @@ impl Window {
     }
 
     fn handle(&mut self, event: &InputEvent) -> bool {
+        if let InputEvent::Key('\t') = event {
+            if let Some(button) = self.buttons.first_mut() {
+                button.focused = true;
+                return true;
+            }
+        }
+        if let InputEvent::Key('\n') = event {
+            if let Some(button) = self.buttons.iter_mut().find(|button| button.focused) {
+                button.pressed = !button.pressed;
+                return true;
+            }
+        }
         self.buttons.iter_mut().any(|button| button.handle(event))
     }
 }
@@ -164,6 +178,7 @@ pub fn self_test() -> bool {
     window.add_button(Button::new(bounds, Color::CYAN));
     desktop.add_window(window);
 
-    let handled = desktop.handle(&InputEvent::PointerDown { x: 20, y: 20 });
-    handled && desktop.windows[0].buttons[0].pressed
+    let focused = desktop.handle(&InputEvent::Key('\t'));
+    let activated = desktop.handle(&InputEvent::Key('\n'));
+    focused && activated && desktop.windows[0].buttons[0].pressed
 }

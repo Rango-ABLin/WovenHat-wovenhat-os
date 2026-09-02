@@ -68,6 +68,7 @@ pub enum Key {
     Char(char),
     Enter,
     Backspace,
+    Tab,
 }
 
 pub struct Keyboard {
@@ -125,6 +126,9 @@ impl Keyboard {
 
             // Backspace
             0x0E => Some(Key::Backspace),
+
+            // Tab
+            0x0F => Some(Key::Tab),
 
             code => decode_scancode(code, self.shift).map(Key::Char),
         }

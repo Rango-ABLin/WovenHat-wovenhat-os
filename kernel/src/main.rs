@@ -244,6 +244,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 keyboard::Key::Char(character) => gui::InputEvent::Key(character),
                 keyboard::Key::Enter => gui::InputEvent::Key('\n'),
                 keyboard::Key::Backspace => gui::InputEvent::Key('\u{8}'),
+                keyboard::Key::Tab => gui::InputEvent::Key('\t'),
             };
             desktop.handle(&event);
             console.render_desktop(&desktop);
