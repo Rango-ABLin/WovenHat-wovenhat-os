@@ -229,6 +229,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "ACTIVATE",
         graphics::Color::CYAN,
     ));
+    window.add_button(gui::Button::new(
+        gui::Rect::new(320, 180, 180, 48),
+        "SECOND",
+        graphics::Color::CYAN,
+    ));
     desktop.add_window(window);
     console.render_desktop(&desktop);
 

@@ -138,10 +138,15 @@ impl Window {
 
     fn handle(&mut self, event: &InputEvent) -> bool {
         if let InputEvent::Key('\t') = event {
-            if let Some(button) = self.buttons.first_mut() {
-                button.focused = true;
-                return true;
+            if self.buttons.is_empty() {
+                return false;
             }
+            let current = self.buttons.iter().position(|button| button.focused);
+            let next = current.map_or(0, |index| (index + 1) % self.buttons.len());
+            for (index, button) in self.buttons.iter_mut().enumerate() {
+                button.focused = index == next;
+            }
+            return true;
         }
         if let InputEvent::Key('\n') = event {
             if let Some(button) = self.buttons.iter_mut().find(|button| button.focused) {
@@ -192,9 +197,17 @@ pub fn self_test() -> bool {
     let mut desktop = Desktop::new(Color::DARK_BLUE);
     let mut window = Window::new(Rect::new(0, 0, 160, 120));
     window.add_button(Button::new(bounds, "ACTIVATE", Color::CYAN));
+    window.add_button(Button::new(
+        Rect::new(10, 50, 80, 30),
+        "SECOND",
+        Color::CYAN,
+    ));
     desktop.add_window(window);
 
-    let focused = desktop.handle(&InputEvent::Key('\t'));
+    let first_focused = desktop.handle(&InputEvent::Key('\t'))
+        && desktop.windows[0].buttons[0].focused;
+    let second_focused = desktop.handle(&InputEvent::Key('\t'))
+        && desktop.windows[0].buttons[1].focused;
     let activated = desktop.handle(&InputEvent::Key('\n'));
-    focused && activated && desktop.windows[0].buttons[0].pressed
+    first_focused && second_focused && activated && desktop.windows[0].buttons[1].pressed
 }
