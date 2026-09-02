@@ -422,7 +422,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "[BOOT] user mmap/write/read/munmap and frame return verified"
     ));
 
-    if !syscall::user_io_verified() || task::open_file_count() != 0 || vfs::node_count() != 2 {
+    if !syscall::user_io_verified() || task::open_file_count() != 0 || vfs::node_count() != 3 {
         console.println("USER VFS/DESCRIPTOR SYSCALLS: FAILED");
         halt();
     }
