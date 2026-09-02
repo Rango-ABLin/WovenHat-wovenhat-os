@@ -236,7 +236,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
     if userspace::elf_loader_self_test() {
-        console.println("ELF64 LOADER W^X: OK");
+        console.println("ELF64 W^X + STACK GUARD: OK");
     } else {
         console.println("ELF64 LOADER VALIDATION: FAILED");
         halt();
@@ -443,6 +443,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     if !first_program.stack.is_aligned()
         || first_program.stack.size != userspace::UserStack::SIZE
+        || !paging::user_range_is_unmapped_in(
+            first_program.address_space.paging(),
+            first_program.stack.guard_base,
+            userspace::UserStack::GUARD_SIZE,
+        )
+        || !paging::user_range_has_protection_in(
+            first_program.address_space.paging(),
+            first_program.stack.base,
+            first_program.stack.size,
+            true,
+            false,
+        )
+        || !paging::user_range_is_unmapped_in(
+            second_program.address_space.paging(),
+            second_program.stack.guard_base,
+            userspace::UserStack::GUARD_SIZE,
+        )
         || first_program.image.entry != second_program.image.entry
         || first_program.stack.top != second_program.stack.top
         || first_program.address_space.root_address() == second_program.address_space.root_address()
@@ -450,6 +467,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("USER ADDRESS-SPACE ISOLATION: INVALID");
         halt();
     }
+    serial::write_line(format_args!(
+        "[BOOT] independent user roots, unmapped stack guards, and RW/NX stacks verified"
+    ));
 
     let first_root = first_program.address_space.root_address();
     let second_root = second_program.address_space.root_address();

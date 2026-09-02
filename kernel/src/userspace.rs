@@ -93,16 +93,19 @@ impl UserImage {
 
 #[derive(Clone, Copy, Debug)]
 pub struct UserStack {
+    pub guard_base: u64,
     pub base: u64,
     pub top: u64,
     pub size: usize,
 }
 
 impl UserStack {
+    pub const GUARD_SIZE: usize = 4096;
     pub const SIZE: usize = 4096 * 2;
 
     pub fn new(base: u64) -> Self {
         Self {
+            guard_base: base - Self::GUARD_SIZE as u64,
             base,
             top: base + Self::SIZE as u64,
             size: Self::SIZE,
@@ -110,7 +113,10 @@ impl UserStack {
     }
 
     pub fn is_aligned(self) -> bool {
-        self.base.is_multiple_of(16) && self.top.is_multiple_of(16)
+        self.guard_base.is_multiple_of(4096)
+            && self.base == self.guard_base + Self::GUARD_SIZE as u64
+            && self.base.is_multiple_of(16)
+            && self.top.is_multiple_of(16)
     }
 }
 
@@ -194,11 +200,12 @@ fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
     let mut mapping_count = 0;
 
     let stack_base = USER_REGION_START.checked_add(USER_STACK_OFFSET)?;
+    let stack = UserStack::new(stack_base);
     for segment in image.segments() {
         let mapping_end = segment
             .mapping_start
             .checked_add(segment.mapping_size as u64)?;
-        if segment.mapping_start < USER_REGION_START || mapping_end > stack_base {
+        if segment.mapping_start < USER_REGION_START || mapping_end > stack.guard_base {
             release_partial(page_table, &mappings[..mapping_count]);
             return None;
         }
@@ -260,7 +267,13 @@ fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
         return None;
     }
 
-    let stack = UserStack::new(stack_base);
+    if !paging::user_range_is_unmapped_in(page_table, stack.guard_base, UserStack::GUARD_SIZE)
+        || !paging::user_range_has_protection_in(page_table, stack.base, stack.size, true, false)
+    {
+        release_with_stack(page_table, stack_base, &mappings[..mapping_count]);
+        return None;
+    }
+
     Some(UserProgram {
         image: UserImage {
             entry: image.entry,

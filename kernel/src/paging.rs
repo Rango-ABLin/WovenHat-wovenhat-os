@@ -448,6 +448,43 @@ pub fn destroy_user_address_space(
     Ok(())
 }
 
+pub fn user_range_is_unmapped_in(address_space: AddressSpace, start: u64, size: usize) -> bool {
+    let Ok((start_page, end_page)) = page_range(start, size) else {
+        return false;
+    };
+    let paging = PAGING.lock();
+    let Ok(mapper) = mapper_for(&paging, address_space) else {
+        return false;
+    };
+    Page::range_inclusive(start_page, end_page)
+        .all(|page| mapper.translate_addr(page.start_address()).is_none())
+}
+
+pub fn user_range_has_protection_in(
+    address_space: AddressSpace,
+    start: u64,
+    size: usize,
+    writable: bool,
+    executable: bool,
+) -> bool {
+    let Ok((start_page, end_page)) = page_range(start, size) else {
+        return false;
+    };
+    let paging = PAGING.lock();
+    let Ok(mapper) = mapper_for(&paging, address_space) else {
+        return false;
+    };
+    Page::range_inclusive(start_page, end_page).all(|page| {
+        let TranslateResult::Mapped { flags, .. } = mapper.translate(page.start_address()) else {
+            return false;
+        };
+        flags.contains(PageTableFlags::PRESENT)
+            && flags.contains(PageTableFlags::USER_ACCESSIBLE)
+            && flags.contains(PageTableFlags::WRITABLE) == writable
+            && flags.contains(PageTableFlags::NO_EXECUTE) != executable
+    })
+}
+
 pub fn discard_empty_user_address_space(address_space: AddressSpace) -> bool {
     if Cr3::read().0 == address_space.level_4_frame {
         return false;
