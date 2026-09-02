@@ -212,6 +212,107 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     console.println("TIMER IRQ: OK");
+
+    let isolation_baseline = memory::stats().allocated_frames;
+    let Some(first_program) = userspace::create_stub_process() else {
+        console.println("USER PROCESS IMAGE: MAPPING FAILED");
+        halt();
+    };
+    let Some(second_program) = userspace::create_stub_process() else {
+        console.println("SECOND USER ADDRESS SPACE: FAILED");
+        halt();
+    };
+    if !first_program.stack.is_aligned()
+        || first_program.stack.size != userspace::UserStack::SIZE
+        || first_program.image.entry != second_program.image.entry
+        || first_program.stack.top != second_program.stack.top
+        || first_program.address_space.root_address() == second_program.address_space.root_address()
+    {
+        console.println("USER ADDRESS-SPACE ISOLATION: INVALID");
+        halt();
+    }
+
+    let first_root = first_program.address_space.root_address();
+    let second_root = second_program.address_space.root_address();
+    let first_pid = match task::spawn_user_process("init-user-a", first_program) {
+        Ok((pid, context)) => {
+            serial::write_line(format_args!(
+                "[BOOT] ring3 frame CS={:#x} SS={:#x} RIP={:#x} RSP={:#x}",
+                context.code_segment, context.data_segment, context.entry, context.stack_top,
+            ));
+            pid
+        }
+        Err(_) => {
+            console.println("FIRST USER PROCESS: SPAWN FAILED");
+            halt();
+        }
+    };
+    let second_pid = match task::spawn_user_process("init-user-b", second_program) {
+        Ok((pid, _)) => pid,
+        Err(_) => {
+            console.println("SECOND USER PROCESS: SPAWN FAILED");
+            halt();
+        }
+    };
+
+    while !task::process_exited(first_pid) || !task::process_exited(second_pid) {
+        x86_64::instructions::hlt();
+    }
+
+    if !syscall::user_memory_verified() || task::anonymous_mapping_count() != 0 {
+        console.println("USER MMAP/MUNMAP: FAILED");
+        halt();
+    }
+    serial::write_line(format_args!(
+        "[BOOT] user mmap/write/read/munmap and frame return verified"
+    ));
+
+    if !syscall::user_io_verified() || task::open_file_count() != 0 || vfs::node_count() != 2 {
+        console.println("USER VFS/DESCRIPTOR SYSCALLS: FAILED");
+        halt();
+    }
+    serial::write_line(format_args!(
+        "[BOOT] user write/open/read/close and pointer validation verified"
+    ));
+
+    if !syscall::last_completed(syscall::Number::Getpid) {
+        console.println("USER SYSCALL ABI: FAILED");
+        halt();
+    }
+    if task::zombie_count() != 2 {
+        console.println("PROCESS ZOMBIE RETENTION: FAILED");
+        halt();
+    }
+    let first_status = syscall::invoke(syscall::Number::Waitpid, first_pid.as_u64(), 0, 0);
+    let second_status = syscall::invoke(syscall::Number::Waitpid, second_pid.as_u64(), 0, 0);
+    if first_status != 0 || second_status != 0 || task::zombie_count() != 0 {
+        console.println("PROCESS WAIT/REAP: FAILED");
+        halt();
+    }
+    if syscall::invoke(syscall::Number::Waitpid, first_pid.as_u64(), 0, 0) != u64::MAX {
+        console.println("PROCESS DOUBLE-WAIT REJECTION: FAILED");
+        halt();
+    }
+    serial::write_line(format_args!(
+        "[BOOT] parent-child waitpid and zombie reaping verified"
+    ));
+    if memory::stats().allocated_frames != isolation_baseline {
+        console.println("USER ADDRESS-SPACE RECLAMATION: FAILED");
+        halt();
+    }
+
+    console.println("USER CR3 ISOLATION/W^X/RECLAMATION: OK");
+    serial::write_line(format_args!(
+        "[BOOT] isolated user CR3 roots {:#x} and {:#x} verified",
+        first_root, second_root,
+    ));
+    serial::write_line(format_args!(
+        "[BOOT] ring3 W^X mapping cleanup and frame reuse verified"
+    ));
+    console.println("RING3 PROCESS GETPID/EXIT: OK");
+    serial::write_line(format_args!(
+        "[BOOT] ring3 process and syscall ABI verified"
+    ));
     console.println("KEYBOARD IRQ: READY");
 
     //
