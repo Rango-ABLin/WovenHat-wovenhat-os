@@ -7,6 +7,7 @@ extern crate alloc;
 
 mod capability;
 mod console;
+mod device;
 mod elf;
 mod gdt;
 mod graphics;
@@ -211,6 +212,40 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("PIC: INITIALIZED (ALL IRQS MASKED)");
 
     timer::init();
+    let boot_devices = [
+        device::Device {
+            name: "framebuffer-console",
+            kind: device::DeviceKind::Console,
+            irq: None,
+        },
+        device::Device {
+            name: "com1",
+            kind: device::DeviceKind::Serial,
+            irq: None,
+        },
+        device::Device {
+            name: "pit",
+            kind: device::DeviceKind::Timer,
+            irq: Some(timer::IRQ),
+        },
+        device::Device {
+            name: "ps2-keyboard",
+            kind: device::DeviceKind::Keyboard,
+            irq: Some(keyboard::IRQ),
+        },
+    ];
+    for device in boot_devices {
+        if device::register(device).is_err() {
+            console.println("DEVICE REGISTRATION: FAILED");
+            halt();
+        }
+    }
+    if device::self_test() {
+        console.println("DEVICE REGISTRY: 4 DEVICES ONLINE");
+    } else {
+        console.println("DEVICE REGISTRY: VALIDATION FAILED");
+        halt();
+    }
     pic::unmask(timer::IRQ);
     pic::unmask(keyboard::IRQ);
     x86_64::instructions::interrupts::enable();
