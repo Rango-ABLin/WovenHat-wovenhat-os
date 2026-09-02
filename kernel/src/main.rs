@@ -9,6 +9,7 @@ mod capability;
 mod console;
 mod gdt;
 mod graphics;
+mod gui;
 mod hal;
 mod heap;
 mod interrupts;
