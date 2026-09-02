@@ -110,6 +110,10 @@ impl Window {
         self.buttons.push(button);
     }
 
+    fn contains(&self, x: i32, y: i32) -> bool {
+        self.bounds.contains(x, y)
+    }
+
     fn render(&self, graphics: &mut Graphics<'_>) {
         graphics.fill_rect(
             self.bounds.x,
@@ -183,6 +187,20 @@ impl Desktop {
     }
 
     pub fn handle(&mut self, event: &InputEvent) -> bool {
+        if let InputEvent::PointerDown { x, y } = event {
+            let Some(index) = self
+                .windows
+                .iter()
+                .rposition(|window| window.contains(*x, *y))
+            else {
+                return false;
+            };
+            let window = self.windows.remove(index);
+            self.windows.push(window);
+            let window = self.windows.last_mut().expect("window was just added");
+            window.handle(event);
+            return true;
+        }
         for window in self.windows.iter_mut().rev() {
             if window.handle(event) {
                 return true;
