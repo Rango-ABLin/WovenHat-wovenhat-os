@@ -64,11 +64,13 @@ impl ScancodeQueue {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum Key {
     Char(char),
     Enter,
     Backspace,
     Tab,
+    F1,
 }
 
 pub struct Keyboard {
@@ -129,6 +131,9 @@ impl Keyboard {
 
             // Tab
             0x0F => Some(Key::Tab),
+
+            // F1
+            0x3B => Some(Key::F1),
 
             code => decode_scancode(code, self.shift).map(Key::Char),
         }

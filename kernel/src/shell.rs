@@ -28,7 +28,7 @@ impl Shell {
             Key::Char(character) => self.push_character(character, console),
             Key::Backspace => self.backspace(console),
             Key::Enter => self.submit(console),
-            Key::Tab => {}
+            Key::Tab | Key::F1 => {}
         }
     }
 

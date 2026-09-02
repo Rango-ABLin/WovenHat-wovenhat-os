@@ -32,6 +32,7 @@ use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, Boo
 use console::Console;
 use core::{alloc::Layout, panic::PanicInfo};
 use keyboard::Keyboard;
+use shell::Shell;
 
 use x86_64::instructions::interrupts::int3;
 
@@ -345,7 +346,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     ));
     desktop.add_window(window);
     console.render_desktop(&desktop);
+    let mut shell = Shell::new();
+    let mut desktop_active = true;
 
+    //
+    // F1 switches between the desktop and diagnostic shell. Keyboard IRQ
+    // decoding stays outside both interfaces.
     //
     // Interrupt-driven keyboard input. The IRQ handler only queues raw
     // scancodes; decoding and rendering remain in the main loop.
@@ -355,14 +361,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     loop {
         if let Some(key) = keyboard.poll() {
-            let event = match key {
-                keyboard::Key::Char(character) => gui::InputEvent::Key(character),
-                keyboard::Key::Enter => gui::InputEvent::Key('\n'),
-                keyboard::Key::Backspace => gui::InputEvent::Key('\u{8}'),
-                keyboard::Key::Tab => gui::InputEvent::Key('\t'),
-            };
-            desktop.handle(&event);
-            console.render_desktop(&desktop);
+            if matches!(key, keyboard::Key::F1) {
+                desktop_active = !desktop_active;
+                if desktop_active {
+                    console.render_desktop(&desktop);
+                } else {
+                    console.clear();
+                    console.println("WOVENHAT DIAGNOSTIC SHELL (F1 TO RETURN)");
+                    shell.print_prompt(&mut console);
+                }
+            } else if desktop_active {
+                let event = match key {
+                    keyboard::Key::Char(character) => gui::InputEvent::Key(character),
+                    keyboard::Key::Enter => gui::InputEvent::Key('\n'),
+                    keyboard::Key::Backspace => gui::InputEvent::Key('\u{8}'),
+                    keyboard::Key::Tab => gui::InputEvent::Key('\t'),
+                    keyboard::Key::F1 => unreachable!(),
+                };
+                desktop.handle(&event);
+                console.render_desktop(&desktop);
+            } else {
+                shell.handle_key(key, &mut console);
+            }
         }
 
         syscall::service_pending();
