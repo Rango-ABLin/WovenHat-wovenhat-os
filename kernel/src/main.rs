@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+mod audit;
 mod ata;
 mod block;
 mod capability;
@@ -255,6 +256,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
+    if audit::self_test() && task::credential_policy_valid() {
+        console.println("CREDENTIAL/AUDIT POLICY: OK");
+    } else {
+        console.println("CREDENTIAL/AUDIT POLICY: FAILED");
+        halt();
+    }
+
     gdt::init();
     let _user_segments = gdt::user_segments();
     console.println("GDT/TSS: INSTALLED");
@@ -288,6 +296,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("CAPABILITY DELEGATION: OK");
     } else {
         console.println("CAPABILITY DELEGATION: FAILED");
+        halt();
+    }
+
+    if audit::count() < 2
+        || !audit::latest().is_some_and(|event| {
+            event.action == audit::Action::CapabilityRevoke && event.allowed
+        })
+    {
+        console.println("CAPABILITY AUDIT: FAILED");
         halt();
     }
 
@@ -493,6 +510,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             halt();
         }
     };
+    if task::process_credentials(first_pid) != Some(task::Credentials::USERSPACE)
+        || task::process_credentials(second_pid) != Some(task::Credentials::USERSPACE)
+    {
+        console.println("USER CREDENTIALS: INVALID");
+        halt();
+    }
+    serial::write_line(format_args!(
+        "[AUDIT] userspace identity uid={} gid={}",
+        task::Credentials::USERSPACE.uid,
+        task::Credentials::USERSPACE.gid,
+    ));
 
     while !task::process_exited(first_pid) || !task::process_exited(second_pid) {
         x86_64::instructions::hlt();

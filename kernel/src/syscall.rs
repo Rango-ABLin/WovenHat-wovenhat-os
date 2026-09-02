@@ -224,6 +224,7 @@ fn sys_read(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
 }
 
 fn sys_file_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
+    let actor = crate::task::current_process_id();
     let Ok(length) = usize::try_from(length) else {
         return SYSCALL_ERROR;
     };
@@ -234,7 +235,14 @@ fn sys_file_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
     if crate::paging::copy_from_current_user(user_buffer, &mut buffer[..length]).is_err() {
         return SYSCALL_ERROR;
     }
-    match crate::task::write_current(descriptor, &buffer[..length]) {
+    let result = crate::task::write_current(descriptor, &buffer[..length]);
+    crate::audit::record(
+        actor,
+        crate::audit::Action::FileWrite,
+        descriptor,
+        result.is_ok(),
+    );
+    match result {
         Ok(count) => {
             IO_COMPLETIONS.fetch_or(IO_FILE_WRITE, Ordering::Release);
             count as u64
@@ -242,9 +250,12 @@ fn sys_file_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
         Err(_) => SYSCALL_ERROR,
     }
 }
-
 fn sys_message_send(receiver: u64, user_buffer: u64, length: u64) -> u64 {
-    if !crate::task::current_has(crate::capability::Capability::Ipc) {
+    let actor = crate::task::current_process_id();
+    if !crate::task::current_has(crate::capability::Capability::Ipc)
+        || !crate::task::may_ipc_with(receiver)
+    {
+        crate::audit::record(actor, crate::audit::Action::IpcSend, receiver, false);
         return SYSCALL_ERROR;
     }
     let Ok(length) = usize::try_from(length) else {
@@ -258,12 +269,15 @@ fn sys_message_send(receiver: u64, user_buffer: u64, length: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     let sender = crate::task::current_process_id();
-    match crate::ipc::send(sender, receiver, &buffer[..length]) {
-        Ok(()) => 0,
-        Err(_) => SYSCALL_ERROR,
-    }
+    let result = crate::ipc::send(sender, receiver, &buffer[..length]);
+    crate::audit::record(
+        actor,
+        crate::audit::Action::IpcSend,
+        receiver,
+        result.is_ok(),
+    );
+    result.map_or(SYSCALL_ERROR, |()| 0)
 }
-
 fn sys_message_receive(user_buffer: u64, capacity: u64, user_sender: u64) -> u64 {
     if !crate::task::current_has(crate::capability::Capability::Ipc) {
         return SYSCALL_ERROR;
@@ -307,9 +321,7 @@ pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, a
         value if value == Number::Open as u64 => sys_open(arg0, arg1),
         value if value == Number::Close as u64 => sys_close(arg0),
         value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),
-        value if value == Number::MessageReceive as u64 => {
-            sys_message_receive(arg0, arg1, arg2)
-        }
+        value if value == Number::MessageReceive as u64 => sys_message_receive(arg0, arg1, arg2),
         value if value == Number::Yield as u64 => {
             YIELD_PENDING.store(true, Ordering::Release);
             0

@@ -96,6 +96,24 @@ impl ProcessId {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Credentials {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Credentials {
+    pub const ROOT: Self = Self { uid: 0, gid: 0 };
+    pub const USERSPACE: Self = Self {
+        uid: 1000,
+        gid: 1000,
+    };
+
+    pub const fn is_root(self) -> bool {
+        self.uid == 0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     Ready,
     Exited,
@@ -291,6 +309,7 @@ pub struct Process {
     pub task_id: TaskId,
     pub state: ProcessState,
     pub parent: ProcessId,
+    pub credentials: Credentials,
     pub exit_code: i32,
     address_space: Option<userspace::AddressSpace>,
     files: [Option<vfs::OpenFile>; MAX_FILE_DESCRIPTORS],
@@ -492,6 +511,7 @@ fn create_process(
         task_id,
         state: ProcessState::Ready,
         parent,
+        credentials: Credentials::USERSPACE,
         exit_code: 0,
         address_space: Some(address_space),
         files: [None; MAX_FILE_DESCRIPTORS],
@@ -564,6 +584,58 @@ pub fn current_process_id() -> u64 {
         .map_or(task_id.as_u64(), |process| process.id.as_u64())
 }
 
+pub fn current_credentials() -> Credentials {
+    let task_id = current_task_id();
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .map_or(Credentials::ROOT, |process| process.credentials)
+}
+
+pub fn process_credentials(id: ProcessId) -> Option<Credentials> {
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .find(|process| process.id == id)
+        .map(|process| process.credentials)
+}
+
+pub fn may_ipc_with(receiver: u64) -> bool {
+    let sender = current_credentials();
+    let Some(receiver) = process_credentials(ProcessId(receiver)) else {
+        return false;
+    };
+    credentials_may_ipc(sender, receiver)
+}
+
+pub fn credential_policy_valid() -> bool {
+    let peer = Credentials {
+        uid: Credentials::USERSPACE.uid,
+        gid: 2000,
+    };
+    let group_peer = Credentials {
+        uid: 2000,
+        gid: Credentials::USERSPACE.gid,
+    };
+    let stranger = Credentials {
+        uid: 2000,
+        gid: 2000,
+    };
+    Credentials::ROOT.is_root()
+        && !Credentials::USERSPACE.is_root()
+        && Credentials::ROOT != Credentials::USERSPACE
+        && credentials_may_ipc(Credentials::ROOT, stranger)
+        && credentials_may_ipc(Credentials::USERSPACE, peer)
+        && credentials_may_ipc(Credentials::USERSPACE, group_peer)
+        && !credentials_may_ipc(Credentials::USERSPACE, stranger)
+}
+
+fn credentials_may_ipc(sender: Credentials, receiver: Credentials) -> bool {
+    sender.is_root() || sender.uid == receiver.uid || sender.gid == receiver.gid
+}
 pub fn exit_current_process(exit_code: i32) -> ! {
     x86_64::instructions::interrupts::disable();
     let (context_switch, address_space, memory_mappings) = {
@@ -1055,43 +1127,64 @@ pub fn current_has(capability: Capability) -> bool {
 }
 
 pub fn grant(target: TaskId, capability: Capability) -> Result<(), CapabilityError> {
-    let mut scheduler = SCHEDULER.lock();
-    assert!(scheduler.task_count != 0, "scheduler not initialized");
+    let actor = current_process_id();
+    let result = {
+        let mut scheduler = SCHEDULER.lock();
+        assert!(scheduler.task_count != 0, "scheduler not initialized");
 
-    let authority = scheduler.tasks[scheduler.current_slot].capabilities;
-    if !authority.contains(Capability::TaskControl) || !authority.contains(capability) {
-        return Err(CapabilityError::PermissionDenied);
-    }
-
-    let target_task = scheduler
-        .tasks
-        .iter_mut()
-        .find(|task| task.state != TaskState::Empty && task.id == target)
-        .ok_or(CapabilityError::UnknownTask)?;
-    target_task.capabilities = target_task.capabilities.with(capability);
-    Ok(())
+        let authority = scheduler.tasks[scheduler.current_slot].capabilities;
+        if !authority.contains(Capability::TaskControl) || !authority.contains(capability) {
+            Err(CapabilityError::PermissionDenied)
+        } else if let Some(target_task) = scheduler
+            .tasks
+            .iter_mut()
+            .find(|task| task.state != TaskState::Empty && task.id == target)
+        {
+            target_task.capabilities = target_task.capabilities.with(capability);
+            Ok(())
+        } else {
+            Err(CapabilityError::UnknownTask)
+        }
+    };
+    crate::audit::record(
+        actor,
+        crate::audit::Action::CapabilityGrant,
+        target.as_u64(),
+        result.is_ok(),
+    );
+    result
 }
 
 pub fn revoke(target: TaskId, capability: Capability) -> Result<(), CapabilityError> {
-    let mut scheduler = SCHEDULER.lock();
-    assert!(scheduler.task_count != 0, "scheduler not initialized");
+    let actor = current_process_id();
+    let result = {
+        let mut scheduler = SCHEDULER.lock();
+        assert!(scheduler.task_count != 0, "scheduler not initialized");
 
-    if !scheduler.tasks[scheduler.current_slot]
-        .capabilities
-        .contains(Capability::TaskControl)
-    {
-        return Err(CapabilityError::PermissionDenied);
-    }
-
-    let target_task = scheduler
-        .tasks
-        .iter_mut()
-        .find(|task| task.state != TaskState::Empty && task.id == target)
-        .ok_or(CapabilityError::UnknownTask)?;
-    target_task.capabilities = target_task.capabilities.without(capability);
-    Ok(())
+        if !scheduler.tasks[scheduler.current_slot]
+            .capabilities
+            .contains(Capability::TaskControl)
+        {
+            Err(CapabilityError::PermissionDenied)
+        } else if let Some(target_task) = scheduler
+            .tasks
+            .iter_mut()
+            .find(|task| task.state != TaskState::Empty && task.id == target)
+        {
+            target_task.capabilities = target_task.capabilities.without(capability);
+            Ok(())
+        } else {
+            Err(CapabilityError::UnknownTask)
+        }
+    };
+    crate::audit::record(
+        actor,
+        crate::audit::Action::CapabilityRevoke,
+        target.as_u64(),
+        result.is_ok(),
+    );
+    result
 }
-
 fn task_has(task_id: TaskId, capability: Capability) -> bool {
     SCHEDULER
         .lock()
