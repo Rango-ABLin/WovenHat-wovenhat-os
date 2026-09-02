@@ -25,11 +25,14 @@ global_asm!(
     "mov rsi, [rsp + 72]",
     "mov rdx, [rsp + 80]",
     "mov rcx, [rsp + 88]",
+    "mov r8, rsp",
     "mov r12, rsp",
     "and rsp, -16",
     "call wovenhat_syscall_dispatch",
     "mov rsp, r12",
     "mov [rsp + 112], rax",
+    ".global wovenhat_syscall_resume",
+    "wovenhat_syscall_resume:",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -48,6 +51,44 @@ global_asm!(
     "iretq",
 );
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct UserForkFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+impl UserForkFrame {
+    pub fn child_return(mut self) -> Self {
+        self.rax = 0;
+        self
+    }
+}
+
+pub fn resume_address() -> u64 {
+    unsafe extern "C" {
+        fn wovenhat_syscall_resume();
+    }
+    wovenhat_syscall_resume as *const () as u64
+}
 static LAST_COMPLETED: AtomicU64 = AtomicU64::new(u64::MAX);
 static COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
@@ -60,6 +101,12 @@ const IO_CLOSE: u64 = 1 << 3;
 const IO_MMAP: u64 = 1 << 4;
 const IO_MUNMAP: u64 = 1 << 5;
 const IO_FILE_WRITE: u64 = 1 << 6;
+const IO_GETUID: u64 = 1 << 7;
+const IO_GETGID: u64 = 1 << 8;
+const IO_EXEC: u64 = 1 << 9;
+const IO_FORK: u64 = 1 << 10;
+const IO_STDIN: u64 = 1 << 11;
+const IO_STDERR: u64 = 1 << 12;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Number {
@@ -76,6 +123,10 @@ pub enum Number {
     FileWrite = 10,
     MessageSend = 11,
     MessageReceive = 12,
+    Getuid = 13,
+    Getgid = 14,
+    Exec = 15,
+    Fork = 16,
 }
 
 pub fn entry_address() -> u64 {
@@ -108,10 +159,24 @@ pub fn invoke(number: Number, arg0: u64, arg1: u64, arg2: u64) -> u64 {
 
     result
 }
+fn fork_frame_layout_valid() -> bool {
+    let frame = UserForkFrame {
+        rax: 7,
+        rip: 0x4000,
+        rsp: 0x8000,
+        ..UserForkFrame::default()
+    };
+    let child = frame.child_return();
+    core::mem::size_of::<UserForkFrame>() == 20 * core::mem::size_of::<u64>()
+        && child.rax == 0
+        && child.rip == frame.rip
+        && child.rsp == frame.rsp
+}
 pub fn test() -> bool {
     let before = COMPLETIONS.load(Ordering::Acquire);
     let result = emit(Number::Getpid);
-    COMPLETIONS.load(Ordering::Acquire) == before + 1
+    fork_frame_layout_valid()
+        && COMPLETIONS.load(Ordering::Acquire) == before + 1
         && LAST_COMPLETED.load(Ordering::Acquire) == Number::Getpid as u64
         && result == crate::task::current_process_id()
 }
@@ -121,10 +186,23 @@ pub fn user_io_verified() -> bool {
         == IO_WRITE | IO_OPEN | IO_READ | IO_CLOSE
 }
 
+pub fn user_standard_streams_verified() -> bool {
+    IO_COMPLETIONS.load(Ordering::Acquire) & (IO_STDIN | IO_STDERR) == IO_STDIN | IO_STDERR
+}
 pub fn user_memory_verified() -> bool {
     IO_COMPLETIONS.load(Ordering::Acquire) & (IO_MMAP | IO_MUNMAP) == IO_MMAP | IO_MUNMAP
 }
 
+pub fn user_identity_verified() -> bool {
+    IO_COMPLETIONS.load(Ordering::Acquire) & (IO_GETUID | IO_GETGID) == IO_GETUID | IO_GETGID
+}
+
+pub fn user_exec_verified() -> bool {
+    IO_COMPLETIONS.load(Ordering::Acquire) & IO_EXEC == IO_EXEC
+}
+pub fn user_fork_verified() -> bool {
+    IO_COMPLETIONS.load(Ordering::Acquire) & IO_FORK == IO_FORK
+}
 pub fn last_completed(number: Number) -> bool {
     LAST_COMPLETED.load(Ordering::Acquire) == number as u64
 }
@@ -179,6 +257,9 @@ fn sys_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
     }
     crate::serial::write_bytes(&buffer[..length]);
     IO_COMPLETIONS.fetch_or(IO_WRITE, Ordering::Release);
+    if descriptor == 2 {
+        IO_COMPLETIONS.fetch_or(IO_STDERR, Ordering::Release);
+    }
     length as u64
 }
 
@@ -213,6 +294,17 @@ fn sys_read(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     let mut buffer = [0_u8; MAX_IO_SIZE];
+    if descriptor == 0 {
+        if !crate::task::current_has(crate::capability::Capability::Console) {
+            return SYSCALL_ERROR;
+        }
+        let count = crate::keyboard::read_bytes(&mut buffer[..length]);
+        if crate::paging::copy_to_current_user(user_buffer, &buffer[..count]).is_err() {
+            return SYSCALL_ERROR;
+        }
+        IO_COMPLETIONS.fetch_or(IO_STDIN, Ordering::Release);
+        return count as u64;
+    }
     let Ok(count) = crate::task::read_current(descriptor, &mut buffer[..length]) else {
         return SYSCALL_ERROR;
     };
@@ -224,6 +316,7 @@ fn sys_read(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
 }
 
 fn sys_file_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
+    let actor = crate::task::current_process_id();
     let Ok(length) = usize::try_from(length) else {
         return SYSCALL_ERROR;
     };
@@ -234,7 +327,14 @@ fn sys_file_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
     if crate::paging::copy_from_current_user(user_buffer, &mut buffer[..length]).is_err() {
         return SYSCALL_ERROR;
     }
-    match crate::task::write_current(descriptor, &buffer[..length]) {
+    let result = crate::task::write_current(descriptor, &buffer[..length]);
+    crate::audit::record(
+        actor,
+        crate::audit::Action::FileWrite,
+        descriptor,
+        result.is_ok(),
+    );
+    match result {
         Ok(count) => {
             IO_COMPLETIONS.fetch_or(IO_FILE_WRITE, Ordering::Release);
             count as u64
@@ -242,9 +342,12 @@ fn sys_file_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
         Err(_) => SYSCALL_ERROR,
     }
 }
-
 fn sys_message_send(receiver: u64, user_buffer: u64, length: u64) -> u64 {
-    if !crate::task::current_has(crate::capability::Capability::Ipc) {
+    let actor = crate::task::current_process_id();
+    if !crate::task::current_has(crate::capability::Capability::Ipc)
+        || !crate::task::may_ipc_with(receiver)
+    {
+        crate::audit::record(actor, crate::audit::Action::IpcSend, receiver, false);
         return SYSCALL_ERROR;
     }
     let Ok(length) = usize::try_from(length) else {
@@ -258,12 +361,15 @@ fn sys_message_send(receiver: u64, user_buffer: u64, length: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     let sender = crate::task::current_process_id();
-    match crate::ipc::send(sender, receiver, &buffer[..length]) {
-        Ok(()) => 0,
-        Err(_) => SYSCALL_ERROR,
-    }
+    let result = crate::ipc::send(sender, receiver, &buffer[..length]);
+    crate::audit::record(
+        actor,
+        crate::audit::Action::IpcSend,
+        receiver,
+        result.is_ok(),
+    );
+    result.map_or(SYSCALL_ERROR, |()| 0)
 }
-
 fn sys_message_receive(user_buffer: u64, capacity: u64, user_sender: u64) -> u64 {
     if !crate::task::current_has(crate::capability::Capability::Ipc) {
         return SYSCALL_ERROR;
@@ -296,8 +402,91 @@ fn sys_close(descriptor: u64) -> u64 {
         Err(_) => SYSCALL_ERROR,
     }
 }
+fn sys_fork(frame: *const UserForkFrame) -> u64 {
+    let actor = crate::task::current_process_id();
+    if !crate::task::current_has(crate::capability::Capability::ProcessCreate) {
+        crate::audit::record(actor, crate::audit::Action::ProcessFork, 0, false);
+        return SYSCALL_ERROR;
+    }
+    let Some(frame) = (unsafe { frame.as_ref() }) else {
+        crate::audit::record(actor, crate::audit::Action::ProcessFork, 0, false);
+        return SYSCALL_ERROR;
+    };
+    match crate::task::fork_current(*frame) {
+        Ok(child) => {
+            IO_COMPLETIONS.fetch_or(IO_FORK, Ordering::Release);
+            crate::audit::record(
+                actor,
+                crate::audit::Action::ProcessFork,
+                child.as_u64(),
+                true,
+            );
+            child.as_u64()
+        }
+        Err(_) => {
+            crate::audit::record(actor, crate::audit::Action::ProcessFork, 0, false);
+            SYSCALL_ERROR
+        }
+    }
+}
+fn sys_exec(user_path: u64, length: u64) -> u64 {
+    let actor = crate::task::current_process_id();
+    if !crate::task::current_has(crate::capability::Capability::FileRead)
+        || !crate::task::current_has(crate::capability::Capability::ProcessCreate)
+    {
+        crate::audit::record(actor, crate::audit::Action::ProcessExec, length, false);
+        return SYSCALL_ERROR;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut path = [0_u8; MAX_PATH_SIZE];
+    if crate::paging::copy_from_current_user(user_path, &mut path[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(path) = core::str::from_utf8(&path[..length]) else {
+        return SYSCALL_ERROR;
+    };
+    let mut image = alloc::vec![0_u8; crate::vfs::NODE_CAPACITY];
+    let Ok(image_length) = crate::vfs::read_all(path, &mut image) else {
+        crate::audit::record(
+            actor,
+            crate::audit::Action::ProcessExec,
+            length as u64,
+            false,
+        );
+        return SYSCALL_ERROR;
+    };
+    let Some(program) = crate::userspace::load_elf(&image[..image_length]) else {
+        crate::audit::record(
+            actor,
+            crate::audit::Action::ProcessExec,
+            length as u64,
+            false,
+        );
+        return SYSCALL_ERROR;
+    };
+    drop(image);
+    IO_COMPLETIONS.fetch_or(IO_EXEC, Ordering::Release);
+    crate::audit::record(
+        actor,
+        crate::audit::Action::ProcessExec,
+        length as u64,
+        true,
+    );
+    crate::task::exec_current(program)
+}
 #[unsafe(no_mangle)]
-pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
+pub extern "C" fn wovenhat_syscall_dispatch(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    frame: *const UserForkFrame,
+) -> u64 {
     let result = match number {
         value if value == Number::Mmap as u64 => sys_mmap(arg0, arg1),
         value if value == Number::Munmap as u64 => sys_munmap(arg0, arg1),
@@ -306,9 +495,17 @@ pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, a
         value if value == Number::Write as u64 => sys_write(arg0, arg1, arg2),
         value if value == Number::Open as u64 => sys_open(arg0, arg1),
         value if value == Number::Close as u64 => sys_close(arg0),
+        value if value == Number::Exec as u64 => sys_exec(arg0, arg1),
+        value if value == Number::Fork as u64 => sys_fork(frame),
         value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),
-        value if value == Number::MessageReceive as u64 => {
-            sys_message_receive(arg0, arg1, arg2)
+        value if value == Number::MessageReceive as u64 => sys_message_receive(arg0, arg1, arg2),
+        value if value == Number::Getuid as u64 => {
+            IO_COMPLETIONS.fetch_or(IO_GETUID, Ordering::Release);
+            u64::from(crate::task::current_credentials().uid)
+        }
+        value if value == Number::Getgid as u64 => {
+            IO_COMPLETIONS.fetch_or(IO_GETGID, Ordering::Release);
+            u64::from(crate::task::current_credentials().gid)
         }
         value if value == Number::Yield as u64 => {
             YIELD_PENDING.store(true, Ordering::Release);

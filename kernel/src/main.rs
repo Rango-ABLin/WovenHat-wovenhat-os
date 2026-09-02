@@ -6,6 +6,8 @@
 extern crate alloc;
 
 mod ata;
+mod audit;
+mod benchmark;
 mod block;
 mod capability;
 mod console;
@@ -38,7 +40,6 @@ use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, Boo
 use console::Console;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{alloc::Layout, panic::PanicInfo};
-use keyboard::Keyboard;
 use shell::Shell;
 
 use x86_64::instructions::interrupts::int3;
@@ -59,10 +60,21 @@ static FAIR_TASKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let memory_init = memory::init(&boot_info.memory_regions);
-    let paging_init = match &boot_info.physical_memory_offset {
-        Optional::Some(offset) => paging::init(*offset),
-        Optional::None => Err(paging::InitError::MissingPhysicalMemoryMapping),
+    let physical_memory_offset = match &boot_info.physical_memory_offset {
+        Optional::Some(offset) => Some(*offset),
+        Optional::None => None,
     };
+    let paging_init = match physical_memory_offset {
+        Some(offset) => paging::init(offset),
+        None => Err(paging::InitError::MissingPhysicalMemoryMapping),
+    };
+    let rsdp_address = match &boot_info.rsdp_addr {
+        Optional::Some(address) => Some(*address),
+        Optional::None => None,
+    };
+    let acpi = physical_memory_offset
+        .ok_or(hal::acpi::Error::OutOfRange)
+        .and_then(|offset| hal::acpi::discover(offset, rsdp_address, &boot_info.memory_regions));
     let boot_info_address = boot_info as *const BootInfo as u64;
 
     let framebuffer = match &mut boot_info.framebuffer {
@@ -128,6 +140,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
 
     let hardware = hal::init();
+    if !hal::acpi::self_test() {
+        console.println("ACPI PARSER: VALIDATION FAILED");
+        halt();
+    }
+    match acpi {
+        Ok(summary) => {
+            console.println("ACPI TABLES: VALIDATED");
+            serial::write_line(format_args!(
+                "[ACPI] revision={} tables={} APIC={} FADT={} HPET={} MCFG={} truncated={}",
+                summary.revision,
+                summary.tables,
+                summary.apic as u8,
+                summary.fadt as u8,
+                summary.hpet as u8,
+                summary.mcfg as u8,
+                summary.truncated as u8,
+            ));
+        }
+        Err(_) => console.println("ACPI TABLES: UNAVAILABLE"),
+    }
     let vendor = match hardware.cpu_vendor {
         hal::CpuVendor::Intel => "INTEL",
         hal::CpuVendor::Amd => "AMD",
@@ -205,12 +237,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
     if userspace::elf_loader_self_test() {
-        console.println("ELF64 LOADER W^X: OK");
+        console.println("ELF64 W^X + STACK GUARD: OK");
     } else {
         console.println("ELF64 LOADER VALIDATION: FAILED");
         halt();
     }
 
+    if keyboard::self_test() {
+        console.println("KEYBOARD DECODER: OK");
+    } else {
+        console.println("KEYBOARD DECODER: FAILED");
+        halt();
+    }
     if gui::self_test() {
         console.println("GUI INPUT: OK");
     } else {
@@ -221,6 +259,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("IPC QUEUES: VALIDATED");
     } else {
         console.println("IPC QUEUES: VALIDATION FAILED");
+        halt();
+    }
+
+    if audit::self_test() && task::credential_policy_valid() {
+        console.println("CREDENTIAL/AUDIT POLICY: OK");
+    } else {
+        console.println("CREDENTIAL/AUDIT POLICY: FAILED");
         halt();
     }
 
@@ -236,9 +281,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init();
 
     console.println("IDT: INSTALLED");
+    if interrupts::fault_policy_self_test() {
+        console.println("USER FAULT RECOVERY: ARMED");
+    } else {
+        console.println("USER FAULT RECOVERY: FAILED");
+        halt();
+    }
 
     task::init();
     console.println("SCHEDULER: INITIALIZED");
+    if benchmark::self_test() {
+        console.println("BENCHMARK DELTAS: VALIDATED");
+    } else {
+        console.println("BENCHMARK DELTAS: FAILED");
+        halt();
+    }
     if syscall::test() {
         console.println("SYSCALL GATE: GETPID OK");
     } else {
@@ -257,6 +314,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("CAPABILITY DELEGATION: OK");
     } else {
         console.println("CAPABILITY DELEGATION: FAILED");
+        halt();
+    }
+
+    if audit::count() < 2
+        || !audit::latest()
+            .is_some_and(|event| event.action == audit::Action::CapabilityRevoke && event.allowed)
+    {
+        console.println("CAPABILITY AUDIT: FAILED");
         halt();
     }
 
@@ -284,6 +349,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         storage::MountStatus::NoDevice => console.println("FAT32 MOUNT: NO BLOCK DEVICE"),
         storage::MountStatus::NotFat32 => console.println("FAT32 MOUNT: NO VOLUME"),
         storage::MountStatus::Failed => console.println("FAT32 MOUNT: FAILED"),
+    }
+    if userspace::install_stub_executable() {
+        console.println("EXEC IMAGE: INSTALLED");
+    } else {
+        console.println("EXEC IMAGE: INSTALL FAILED");
+        halt();
     }
     let vfs_nodes_before_userspace = vfs::node_count();
     let boot_devices = [
@@ -401,8 +472,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     console.println("TIMER IRQ: OK");
 
+    keyboard::inject_validation_input(2);
     let isolation_baseline = memory::stats().allocated_frames;
-    let Some(first_program) = userspace::create_stub_process() else {
+    let Some(first_program) = userspace::create_exec_process() else {
         console.println("USER PROCESS IMAGE: MAPPING FAILED");
         halt();
     };
@@ -412,6 +484,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     if !first_program.stack.is_aligned()
         || first_program.stack.size != userspace::UserStack::SIZE
+        || !paging::user_range_is_unmapped_in(
+            first_program.address_space.paging(),
+            first_program.stack.guard_base,
+            userspace::UserStack::GUARD_SIZE,
+        )
+        || !paging::user_range_has_protection_in(
+            first_program.address_space.paging(),
+            first_program.stack.base,
+            first_program.stack.size,
+            true,
+            false,
+        )
+        || !paging::user_range_is_unmapped_in(
+            second_program.address_space.paging(),
+            second_program.stack.guard_base,
+            userspace::UserStack::GUARD_SIZE,
+        )
         || first_program.image.entry != second_program.image.entry
         || first_program.stack.top != second_program.stack.top
         || first_program.address_space.root_address() == second_program.address_space.root_address()
@@ -419,6 +508,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("USER ADDRESS-SPACE ISOLATION: INVALID");
         halt();
     }
+    serial::write_line(format_args!(
+        "[BOOT] independent user roots, unmapped stack guards, and RW/NX stacks verified"
+    ));
 
     let first_root = first_program.address_space.root_address();
     let second_root = second_program.address_space.root_address();
@@ -442,6 +534,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             halt();
         }
     };
+    if task::process_credentials(first_pid) != Some(task::Credentials::USERSPACE)
+        || task::process_credentials(second_pid) != Some(task::Credentials::USERSPACE)
+    {
+        console.println("USER CREDENTIALS: INVALID");
+        halt();
+    }
+    serial::write_line(format_args!(
+        "[AUDIT] userspace identity uid={} gid={}",
+        task::Credentials::USERSPACE.uid,
+        task::Credentials::USERSPACE.gid,
+    ));
 
     while !task::process_exited(first_pid) || !task::process_exited(second_pid) {
         x86_64::instructions::hlt();
@@ -451,6 +554,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("USER MMAP/MUNMAP: FAILED");
         halt();
     }
+    if !syscall::user_identity_verified() {
+        console.println("USER UID/GID SYSCALLS: FAILED");
+        halt();
+    }
+    if !syscall::user_exec_verified() {
+        console.println("USER EXEC SYSCALL: FAILED");
+        halt();
+    }
+    console.println("USER EXEC ATOMIC REPLACEMENT: OK");
+    if !syscall::user_fork_verified() {
+        console.println("USER FORK SYSCALL: FAILED");
+        halt();
+    }
+    console.println("USER FORK ADDRESS-SPACE CLONE: OK");
+    if !syscall::user_standard_streams_verified() {
+        console.println("USER STDIN SYSCALL: FAILED");
+        halt();
+    }
+    console.println("USER STANDARD STREAMS: OK");
+    console.println("USER UID/GID SYSCALLS: OK");
     serial::write_line(format_args!(
         "[BOOT] user mmap/write/read/munmap and frame return verified"
     ));
@@ -521,6 +644,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("BREAKPOINT HANDLER: FAILED");
     }
 
+    serial::write_line(format_args!("[BOOT] ALL VALIDATIONS PASSED"));
+    #[cfg(feature = "qemu-test")]
+    qemu_test_exit_success();
+
     console.println("");
     let mut desktop = gui::Desktop::new(graphics::Color::DARK_BLUE);
     let mut window = gui::Window::new(gui::Rect::new(80, 80, 480, 280), "WOVENHAT DESKTOP");
@@ -547,10 +674,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // scancodes; decoding and rendering remain in the main loop.
     //
 
-    let mut keyboard = Keyboard::new();
-
     loop {
-        if let Some(key) = keyboard.poll() {
+        if let Some(key) = keyboard::poll() {
             if matches!(key, keyboard::Key::F1) {
                 desktop_active = !desktop_active;
                 if desktop_active {
@@ -577,6 +702,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         syscall::service_pending();
         task::preemption_point();
+        x86_64::instructions::hlt();
+    }
+}
+
+#[cfg(feature = "qemu-test")]
+fn qemu_test_exit_success() {
+    unsafe {
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") 0xf4_u16,
+            in("eax") 0x10_u32,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    loop {
         x86_64::instructions::hlt();
     }
 }

@@ -1,0 +1,41 @@
+name: kernel
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-none
+          components: clippy
+      - name: Install QEMU and OVMF
+        run: sudo apt-get update && sudo apt-get install --yes qemu-system-x86 ovmf
+      - name: Strict lint
+        run: cargo clippy --workspace -- -D warnings
+      - name: Build test image
+        run: cargo build --features qemu-test
+      - name: Boot validation
+        shell: bash
+        run: |
+          image=$(find target/debug/build -name wovenhat-os-uefi.img -print -quit)
+          ovmf=$(find /usr/share/OVMF -name 'OVMF_CODE*.fd' -print -quit)
+          test -n "$image"
+          test -n "$ovmf"
+          set +e
+          timeout 90s qemu-system-x86_64 \
+            -machine q35 \
+            -m 256M \
+            -display none \
+            -serial stdio \
+            -no-reboot \
+            -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+            -bios "$ovmf" \
+            -drive format=raw,file="$image"
+          status=$?
+          set -e
+          test "$status" -eq 33

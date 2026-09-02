@@ -3,6 +3,9 @@ name = "wovenhat-kernel"
 version = "0.0.1"
 edition = "2021"
 
+[features]
+qemu-test = []
+
 [dependencies]
 bootloader_api = "0.11.17"
 x86_64 = "0.15.5"

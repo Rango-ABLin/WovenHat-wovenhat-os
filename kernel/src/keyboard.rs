@@ -1,3 +1,5 @@
+use spin::Mutex;
+
 use core::{
     arch::asm,
     cell::UnsafeCell,
@@ -11,6 +13,7 @@ const STATUS_PORT: u16 = 0x64;
 const SCANCODE_QUEUE_CAPACITY: usize = 64;
 
 static SCANCODES: ScancodeQueue = ScancodeQueue::new();
+static DECODER: Mutex<Keyboard> = Mutex::new(Keyboard::new());
 
 struct ScancodeQueue {
     buffer: UnsafeCell<[u8; SCANCODE_QUEUE_CAPACITY]>,
@@ -140,6 +143,50 @@ impl Keyboard {
     }
 }
 
+pub fn poll() -> Option<Key> {
+    DECODER.lock().poll()
+}
+
+pub fn read_bytes(buffer: &mut [u8]) -> usize {
+    let mut decoder = DECODER.lock();
+    let mut count = 0;
+    while count < buffer.len() {
+        let Some(key) = decoder.poll() else {
+            break;
+        };
+        let byte = match key {
+            Key::Char(character) if character.is_ascii() => character as u8,
+            Key::Enter => b'\n',
+            Key::Backspace => 8,
+            Key::Tab => b'\t',
+            Key::F1 | Key::Char(_) => continue,
+        };
+        buffer[count] = byte;
+        count += 1;
+    }
+    count
+}
+
+pub fn inject_validation_input(count: usize) {
+    for _ in 0..count {
+        SCANCODES.push(0x1e);
+    }
+}
+
+pub fn self_test() -> bool {
+    let mut keyboard = Keyboard::new();
+    keyboard
+        .decode(0x1e)
+        .is_some_and(|key| matches!(key, Key::Char('a')))
+        && keyboard.decode(0x2a).is_none()
+        && keyboard
+            .decode(0x1e)
+            .is_some_and(|key| matches!(key, Key::Char('A')))
+        && keyboard.decode(0xaa).is_none()
+        && keyboard
+            .decode(0x1c)
+            .is_some_and(|key| matches!(key, Key::Enter))
+}
 pub fn handle_interrupt() {
     // SAFETY: IRQ1 means the PS/2 controller has placed a keyboard scancode in
     // its output buffer. Reading port 0x60 consumes exactly that byte.

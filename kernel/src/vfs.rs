@@ -1,6 +1,6 @@
 use spin::Mutex;
 
-pub const NODE_CAPACITY: usize = 4096;
+pub const NODE_CAPACITY: usize = 8192;
 const PATH_CAPACITY: usize = 64;
 const MAX_NODES: usize = 16;
 
@@ -147,6 +147,19 @@ pub fn read(file: &mut OpenFile, buffer: &mut [u8]) -> Result<usize, Error> {
     Ok(count)
 }
 
+pub fn read_all(path: &str, buffer: &mut [u8]) -> Result<usize, Error> {
+    let registry = REGISTRY.lock();
+    let node = registry
+        .nodes
+        .iter()
+        .find(|node| node.matches(path))
+        .ok_or(Error::NotFound)?;
+    if node.length > buffer.len() {
+        return Err(Error::Full);
+    }
+    buffer[..node.length].copy_from_slice(&node.data[..node.length]);
+    Ok(node.length)
+}
 pub fn write(file: &mut OpenFile, buffer: &[u8]) -> Result<usize, Error> {
     let mut registry = REGISTRY.lock();
     let node = registry
@@ -196,10 +209,13 @@ pub fn self_test() -> bool {
     let Ok(mut protected) = open("/etc/motd") else {
         return false;
     };
+    let mut complete = [0; 32];
     inserted
         && duplicate
         && invalid_path
         && round_trip
         && write(&mut protected, b"x") == Err(Error::ReadOnly)
+        && read_all("/etc/motd", &mut complete) == Ok(24)
+        && &complete[..24] == b"Welcome to WovenHat OS.\n"
         && node_count() == 3
 }

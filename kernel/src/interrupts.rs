@@ -115,11 +115,13 @@ pub fn dump_cpu_state() {
 
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
     dump_exception_context("DIVIDE ERROR", &stack_frame, None);
+    recover_user_fault(&stack_frame, 0, -8);
     halt();
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     dump_exception_context("INVALID OPCODE", &stack_frame, None);
+    recover_user_fault(&stack_frame, 6, -4);
     halt();
 }
 
@@ -136,6 +138,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     error_code: u64,
 ) {
     dump_exception_context("GENERAL PROTECTION FAULT", &stack_frame, Some(error_code));
+    recover_user_fault(&stack_frame, 13, -13);
     halt();
 }
 
@@ -158,7 +161,35 @@ extern "x86-interrupt" fn page_fault_handler(
         error_code.contains(PageFaultErrorCode::MALFORMED_TABLE),
         error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
     ));
+    if error_code.contains(PageFaultErrorCode::USER_MODE) {
+        audit_user_fault(14);
+        task::exit_current_process(-11);
+    }
     halt();
+}
+
+fn recover_user_fault(stack_frame: &InterruptStackFrame, vector: u64, exit_code: i32) {
+    if selector_is_user(stack_frame.code_segment.0) {
+        audit_user_fault(vector);
+        task::exit_current_process(exit_code);
+    }
+}
+
+fn audit_user_fault(vector: u64) {
+    crate::audit::record(
+        task::current_process_id(),
+        crate::audit::Action::ProcessFault,
+        vector,
+        false,
+    );
+}
+
+pub fn fault_policy_self_test() -> bool {
+    selector_is_user(0x23) && selector_is_user(0x1b) && !selector_is_user(0x08)
+}
+
+const fn selector_is_user(selector: u16) -> bool {
+    selector & 3 == 3
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {

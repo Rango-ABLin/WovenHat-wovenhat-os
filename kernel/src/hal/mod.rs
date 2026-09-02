@@ -1,3 +1,4 @@
+pub mod acpi;
 pub mod cpu;
 pub mod pci;
 

@@ -10,11 +10,52 @@ global_asm!(
     ".global wovenhat_user_program_start",
     ".global wovenhat_user_program_end",
     "wovenhat_user_program_start:",
+    "mov eax, 16",
+    "int 0x80",
+    "cmp rax, -1",
+    "je wovenhat_user_failure",
+    "test rax, rax",
+    "jz wovenhat_fork_child",
+    "mov r12, rax",
+    "wovenhat_fork_wait:",
+    "mov eax, 5",
+    "mov rdi, r12",
+    "int 0x80",
+    "cmp rax, -2",
+    "jne wovenhat_fork_reaped",
+    "mov eax, 7",
+    "int 0x80",
+    "jmp wovenhat_fork_wait",
+    "wovenhat_fork_reaped:",
+    "cmp rax, 42",
+    "jne wovenhat_user_failure",
+    "jmp wovenhat_fork_parent",
+    "wovenhat_fork_child:",
+    "mov edi, 42",
+    "mov eax, 3",
+    "int 0x80",
+    "wovenhat_fork_parent:",
+    "mov eax, 0",
+    "xor edi, edi",
+    "mov rsi, 0x4000001f0000",
+    "mov edx, 1",
+    "int 0x80",
+    "cmp rax, 1",
+    "jne wovenhat_user_failure",
+    "cmp byte ptr [0x4000001f0000], 97",
+    "jne wovenhat_user_failure",
     "mov eax, 1",
     "mov edi, 1",
     "lea rsi, [rip + wovenhat_user_message]",
     "mov edx, 27",
     "int 0x80",
+    "mov eax, 1",
+    "mov edi, 2",
+    "lea rsi, [rip + wovenhat_user_message]",
+    "xor edx, edx",
+    "int 0x80",
+    "test rax, rax",
+    "jne wovenhat_user_failure",
     "mov eax, 2",
     "lea rdi, [rip + wovenhat_user_path]",
     "mov esi, 9",
@@ -56,6 +97,14 @@ global_asm!(
     "int 0x80",
     "test rax, rax",
     "jne wovenhat_user_failure",
+    "mov eax, 13",
+    "int 0x80",
+    "cmp rax, 1000",
+    "jne wovenhat_user_failure",
+    "mov eax, 14",
+    "int 0x80",
+    "cmp rax, 1000",
+    "jne wovenhat_user_failure",
     "mov eax, 4",
     "int 0x80",
     "xor edi, edi",
@@ -74,9 +123,30 @@ global_asm!(
     "wovenhat_user_program_end:",
 );
 
+global_asm!(
+    ".section .rodata.wovenhat_exec_stub, \"a\"",
+    ".global wovenhat_exec_program_start",
+    ".global wovenhat_exec_program_end",
+    "wovenhat_exec_program_start:",
+    "mov eax, 15",
+    "lea rdi, [rip + wovenhat_exec_path]",
+    "mov esi, 13",
+    "int 0x80",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
+    "1:",
+    "jmp 1b",
+    "wovenhat_exec_path:",
+    ".ascii \"/bin/selftest\"",
+    "wovenhat_exec_program_end:",
+    ".previous",
+);
 unsafe extern "C" {
     static wovenhat_user_program_start: u8;
     static wovenhat_user_program_end: u8;
+    static wovenhat_exec_program_start: u8;
+    static wovenhat_exec_program_end: u8;
 }
 #[derive(Clone, Copy, Debug)]
 pub struct UserImage {
@@ -98,16 +168,19 @@ impl UserImage {
 
 #[derive(Clone, Copy, Debug)]
 pub struct UserStack {
+    pub guard_base: u64,
     pub base: u64,
     pub top: u64,
     pub size: usize,
 }
 
 impl UserStack {
+    pub const GUARD_SIZE: usize = 4096;
     pub const SIZE: usize = 4096 * 2;
 
     pub fn new(base: u64) -> Self {
         Self {
+            guard_base: base - Self::GUARD_SIZE as u64,
             base,
             top: base + Self::SIZE as u64,
             size: Self::SIZE,
@@ -115,7 +188,10 @@ impl UserStack {
     }
 
     pub fn is_aligned(self) -> bool {
-        self.base.is_multiple_of(16) && self.top.is_multiple_of(16)
+        self.guard_base.is_multiple_of(4096)
+            && self.base == self.guard_base + Self::GUARD_SIZE as u64
+            && self.base.is_multiple_of(16)
+            && self.top.is_multiple_of(16)
     }
 }
 
@@ -129,15 +205,23 @@ const USER_MMAP_MAX_SIZE: usize = USER_MMAP_STRIDE as usize;
 pub struct AnonymousMapping {
     pub address: u64,
     pub size: usize,
+    pub writable: bool,
 }
 #[derive(Clone, Copy)]
 struct UserMapping {
     start: u64,
     size: usize,
+    writable: bool,
+    executable: bool,
 }
 
 impl UserMapping {
-    const EMPTY: Self = Self { start: 0, size: 0 };
+    const EMPTY: Self = Self {
+        start: 0,
+        size: 0,
+        writable: false,
+        executable: false,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -192,18 +276,38 @@ pub fn create_stub_process() -> Option<UserProgram> {
     load_elf(&elf)
 }
 
-fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
+pub fn install_stub_executable() -> bool {
+    let stub = unsafe {
+        let start = &wovenhat_user_program_start as *const u8;
+        let end = &wovenhat_user_program_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    build_stub_elf(stub)
+        .is_some_and(|elf| crate::vfs::create_read_only("/bin/selftest", &elf).is_ok())
+}
+
+pub fn create_exec_process() -> Option<UserProgram> {
+    let stub = unsafe {
+        let start = &wovenhat_exec_program_start as *const u8;
+        let end = &wovenhat_exec_program_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    let elf = build_stub_elf(stub)?;
+    load_elf(&elf)
+}
+pub fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
     let image = crate::elf::parse(bytes).ok()?;
     let page_table = paging::create_user_address_space(image.entry)?;
     let mut mappings = [UserMapping::EMPTY; MAX_ELF_SEGMENTS];
     let mut mapping_count = 0;
 
     let stack_base = USER_REGION_START.checked_add(USER_STACK_OFFSET)?;
+    let stack = UserStack::new(stack_base);
     for segment in image.segments() {
         let mapping_end = segment
             .mapping_start
             .checked_add(segment.mapping_size as u64)?;
-        if segment.mapping_start < USER_REGION_START || mapping_end > stack_base {
+        if segment.mapping_start < USER_REGION_START || mapping_end > stack.guard_base {
             release_partial(page_table, &mappings[..mapping_count]);
             return None;
         }
@@ -223,6 +327,8 @@ fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
         mappings[mapping_count] = UserMapping {
             start: segment.mapping_start,
             size: segment.mapping_size,
+            writable: segment.writable,
+            executable: segment.executable,
         };
         mapping_count += 1;
 
@@ -265,7 +371,13 @@ fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
         return None;
     }
 
-    let stack = UserStack::new(stack_base);
+    if !paging::user_range_is_unmapped_in(page_table, stack.guard_base, UserStack::GUARD_SIZE)
+        || !paging::user_range_has_protection_in(page_table, stack.base, stack.size, true, false)
+    {
+        release_with_stack(page_table, stack_base, &mappings[..mapping_count]);
+        return None;
+    }
+
     Some(UserProgram {
         image: UserImage {
             entry: image.entry,
@@ -324,11 +436,26 @@ pub fn map_anonymous(
         let _ = paging::unmap_user_range_in(address_space.paging, address, size);
         return None;
     }
-    Some(AnonymousMapping { address, size })
+    Some(AnonymousMapping {
+        address,
+        size,
+        writable,
+    })
 }
 
 pub fn unmap_anonymous(address_space: AddressSpace, mapping: AnonymousMapping) -> bool {
     paging::unmap_user_range_in(address_space.paging, mapping.address, mapping.size).is_ok()
+}
+pub fn destroy_process_address_space(
+    address_space: AddressSpace,
+    anonymous: [Option<AnonymousMapping>; MAX_ANONYMOUS_MAPPINGS],
+) -> bool {
+    for mapping in anonymous.into_iter().flatten() {
+        if !unmap_anonymous(address_space, mapping) {
+            return false;
+        }
+    }
+    destroy(address_space)
 }
 pub fn destroy(address_space: AddressSpace) -> bool {
     let mut ranges = [(0, 0); MAX_ELF_SEGMENTS + 1];
@@ -346,6 +473,80 @@ pub fn destroy(address_space: AddressSpace) -> bool {
     .is_ok()
 }
 
+pub fn clone_address_space(
+    source: AddressSpace,
+    anonymous: &[Option<AnonymousMapping>; MAX_ANONYMOUS_MAPPINGS],
+) -> Option<AddressSpace> {
+    let destination_paging = paging::create_user_address_space(source.stack_base)?;
+    let destination = AddressSpace {
+        paging: destination_paging,
+        stack_base: source.stack_base,
+        mappings: source.mappings,
+        mapping_count: source.mapping_count,
+    };
+    let mut completed = [(0_u64, 0_usize); MAX_ELF_SEGMENTS + 1 + MAX_ANONYMOUS_MAPPINGS];
+    let mut completed_count = 0;
+
+    for mapping in &source.mappings[..source.mapping_count] {
+        if paging::clone_user_range_in(
+            source.paging,
+            destination.paging,
+            mapping.start,
+            mapping.size,
+            mapping.writable,
+            mapping.executable,
+        )
+        .is_err()
+        {
+            release_clone(destination.paging, &completed[..completed_count]);
+            return None;
+        }
+        completed[completed_count] = (mapping.start, mapping.size);
+        completed_count += 1;
+    }
+    if paging::clone_user_range_in(
+        source.paging,
+        destination.paging,
+        source.stack_base,
+        UserStack::SIZE,
+        true,
+        false,
+    )
+    .is_err()
+    {
+        release_clone(destination.paging, &completed[..completed_count]);
+        return None;
+    }
+    completed[completed_count] = (source.stack_base, UserStack::SIZE);
+    completed_count += 1;
+
+    for mapping in anonymous.iter().flatten() {
+        if paging::clone_user_range_in(
+            source.paging,
+            destination.paging,
+            mapping.address,
+            mapping.size,
+            mapping.writable,
+            false,
+        )
+        .is_err()
+        {
+            release_clone(destination.paging, &completed[..completed_count]);
+            return None;
+        }
+        completed[completed_count] = (mapping.address, mapping.size);
+        completed_count += 1;
+    }
+    Some(destination)
+}
+
+fn release_clone(address_space: paging::AddressSpace, ranges: &[(u64, usize)]) {
+    if ranges.is_empty() {
+        let _ = paging::discard_empty_user_address_space(address_space);
+    } else {
+        let _ = paging::destroy_user_address_space(address_space, ranges);
+    }
+}
 impl AddressSpace {
     pub fn paging(self) -> paging::AddressSpace {
         self.paging

@@ -1,6 +1,6 @@
 use crate::{
-    capability::Capability, console::Console, heap, keyboard::Key, memory, paging, syscall, task,
-    timer, userspace, vfs,
+    benchmark, capability::Capability, console::Console, heap, keyboard::Key, memory, paging,
+    syscall, task, timer, userspace, vfs,
 };
 
 const PROMPT: &str = "WOVENHAT> ";
@@ -65,7 +65,7 @@ impl Shell {
         match command {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP FS CAT SPAWN SYSCALL USER RING3");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP BENCH FS CAT SPAWN SYSCALL USER RING3");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -129,6 +129,9 @@ impl Shell {
                 print_capability(console, Capability::InterruptControl, " INTERRUPT_CONTROL");
                 print_capability(console, Capability::MemoryInspect, " MEMORY_INSPECT");
                 print_capability(console, Capability::FileRead, " FILE_READ");
+                print_capability(console, Capability::FileWrite, " FILE_WRITE");
+                print_capability(console, Capability::Ipc, " IPC");
+                print_capability(console, Capability::ProcessCreate, " PROCESS_CREATE");
                 console.newline();
             }
             "memory" => {
@@ -164,6 +167,34 @@ impl Shell {
                 console.print(" ALLOCATIONS: ");
                 print_u64(console, stats.allocations as u64);
                 console.newline();
+            }
+            "bench" => {
+                if !authorize(Capability::TaskInspect, console)
+                    || !authorize(Capability::MemoryInspect, console)
+                {
+                    self.finish(console);
+                    return;
+                }
+                let delta = benchmark::sample();
+                if !delta.baseline_ready {
+                    console.println("BENCHMARK BASELINE CAPTURED");
+                } else {
+                    console.print("BENCH TICKS: ");
+                    print_u64(console, delta.ticks);
+                    console.print(" SWITCHES: ");
+                    print_u64(console, delta.context_switches);
+                    console.print(" PREEMPTIONS: ");
+                    print_u64(console, delta.preemptions);
+                    console.print(" IDLE: ");
+                    print_u64(console, delta.idle_heartbeats);
+                    console.print(" FRAMES: ");
+                    print_i64(console, delta.frame_change);
+                    console.print(" HEAP_BYTES: ");
+                    print_i64(console, delta.heap_byte_change);
+                    console.print(" ALLOCS: ");
+                    print_u64(console, delta.heap_allocations);
+                    console.newline();
+                }
             }
             "fs" => {
                 if !authorize(Capability::FileRead, console) {
@@ -326,6 +357,15 @@ fn print_u64(console: &mut Console<'_>, mut value: u64) {
 
     for digit in &digits[index..] {
         console.put_char(*digit as char);
+    }
+}
+
+fn print_i64(console: &mut Console<'_>, value: i64) {
+    if value < 0 {
+        console.put_char('-');
+        print_u64(console, value.unsigned_abs());
+    } else {
+        print_u64(console, value as u64);
     }
 }
 
