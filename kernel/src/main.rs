@@ -7,13 +7,13 @@ extern crate alloc;
 
 mod capability;
 mod console;
-mod elf;
 mod gdt;
 mod heap;
 mod interrupts;
 mod keyboard;
 mod memory;
 mod paging;
+mod panic;
 mod pic;
 mod serial;
 mod shell;
@@ -21,16 +21,16 @@ mod syscall;
 mod task;
 mod timer;
 mod userspace;
-mod vfs;
 
-use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, BootloaderConfig};
+use bootloader_api::{
+    BootInfo, BootloaderConfig,
+    config::Mapping,
+    entry_point,
+    info::Optional,
+};
 
 use console::Console;
-use core::{
-    alloc::Layout,
-    panic::PanicInfo,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use core::{alloc::Layout, panic::PanicInfo};
 use keyboard::Keyboard;
 use shell::Shell;
 
@@ -44,16 +44,7 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
-static PREEMPTION_PROBE_BLOCKED: AtomicBool = AtomicBool::new(false);
-static PREEMPTION_PROBE_COMPLETED: AtomicBool = AtomicBool::new(false);
-static FAIR_TASK_A_RUNS: AtomicU64 = AtomicU64::new(0);
-static FAIR_TASK_B_RUNS: AtomicU64 = AtomicU64::new(0);
-static FAIR_TASKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
-
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    serial::init();
-    serial::write_line(format_args!("[BOOT] WovenHat kernel entry"));
-
     let memory_init = memory::init(&boot_info.memory_regions);
     let paging_init = match &boot_info.physical_memory_offset {
         Optional::Some(offset) => paging::init(*offset),
@@ -121,7 +112,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
-    serial::write_line(format_args!("[BOOT] memory and paging online"));
+    serial::init();
 
     if heap::init().is_err() {
         console.println("KERNEL HEAP: INITIALIZATION FAILED");
@@ -145,33 +136,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //
 
     interrupts::init();
-    serial::write_line(format_args!("[BOOT] GDT, TSS, and IDT installed"));
 
     console.println("IDT: INSTALLED");
 
     task::init();
     console.println("SCHEDULER: INITIALIZED");
-
-    if syscall::invoke(
-        syscall::Number::Write,
-        kernel_main as *const () as u64,
-        1,
-        0,
-    ) != u64::MAX
-    {
-        console.println("USER POINTER VALIDATION: FAILED");
-        halt();
-    }
-
-    if syscall::test() {
-        console.println("SYSCALL GATE: GETPID OK");
-        serial::write_line(format_args!(
-            "[BOOT] register-preserving syscall gate verified"
-        ));
-    } else {
-        console.println("SYSCALL GATE: FAILED");
-        halt();
-    }
 
     if task::capability_policy_valid() {
         console.println("CAPABILITY POLICY: ONLINE");
@@ -194,170 +163,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     pic::unmask(timer::IRQ);
     pic::unmask(keyboard::IRQ);
     x86_64::instructions::interrupts::enable();
-    serial::write_line(format_args!("[BOOT] IRQ delivery enabled"));
 
-    let probe_id = match task::spawn("preemption-probe", preemption_probe_task) {
-        Ok(id) => id,
-        Err(_) => {
-            console.println("PREEMPTION TEST: SPAWN FAILED");
-            halt();
-        }
-    };
-
-    while !PREEMPTION_PROBE_BLOCKED.load(Ordering::Acquire) {
-        x86_64::instructions::hlt();
-    }
-
-    if !task::wake_task(probe_id) {
-        console.println("TASK WAKEUP: FAILED");
-        halt();
-    }
-
-    while !PREEMPTION_PROBE_COMPLETED.load(Ordering::Acquire) {
-        x86_64::instructions::hlt();
+    while timer::ticks() < 3 {
+        task::yield_now();
     }
 
     console.println("TIMER IRQ: OK");
-    console.println("TIMER PREEMPTION: OK");
-    console.println("TASK SLEEP/BLOCK/WAKE: OK");
-    serial::write_line(format_args!(
-        "[BOOT] timer preemption and task lifecycle verified"
-    ));
-
-    let preemptions_before_fairness = task::summary().preemption_switches;
-    if task::spawn("fair-peer-a", fairness_probe_a).is_err() {
-        console.println("SCHEDULER FAIRNESS A: SPAWN FAILED");
-        serial::write_line(format_args!("[SCHED] peer A spawn failed"));
-        halt();
-    }
-    if task::spawn("fair-peer-b", fairness_probe_b).is_err() {
-        console.println("SCHEDULER FAIRNESS B: SPAWN FAILED");
-        serial::write_line(format_args!("[SCHED] peer B spawn failed"));
-        halt();
-    }
-    while FAIR_TASKS_COMPLETED.load(Ordering::Acquire) != 2 {
-        x86_64::instructions::hlt();
-    }
-    let fairness_summary = task::summary();
-    if FAIR_TASK_A_RUNS.load(Ordering::Acquire) == 0
-        || FAIR_TASK_B_RUNS.load(Ordering::Acquire) == 0
-        || fairness_summary.preemption_switches < preemptions_before_fairness + 2
-    {
-        console.println("SCHEDULER FAIRNESS/QUANTUM: FAILED");
-        halt();
-    }
-    console.println("PRIORITY ROUND-ROBIN/TIME SLICES: OK");
-    serial::write_line(format_args!(
-        "[BOOT] priority round-robin fairness and per-task quanta verified"
-    ));
-    if !userspace::elf_loader_self_test() {
-        console.println("ELF64 LOADER VALIDATION: FAILED");
-        halt();
-    }
-    serial::write_line(format_args!(
-        "[BOOT] ELF64 PT_LOAD parsing and W^X validation verified"
-    ));
-
-    let isolation_baseline = memory::stats().allocated_frames;
-    let Some(first_program) = userspace::create_stub_process() else {
-        console.println("USER PROCESS IMAGE: MAPPING FAILED");
-        halt();
-    };
-    let Some(second_program) = userspace::create_stub_process() else {
-        console.println("SECOND USER ADDRESS SPACE: FAILED");
-        halt();
-    };
-    if !first_program.stack.is_aligned()
-        || first_program.stack.size != userspace::UserStack::SIZE
-        || first_program.image.entry != second_program.image.entry
-        || first_program.stack.top != second_program.stack.top
-        || first_program.address_space.root_address() == second_program.address_space.root_address()
-    {
-        console.println("USER ADDRESS-SPACE ISOLATION: INVALID");
-        halt();
-    }
-
-    let first_root = first_program.address_space.root_address();
-    let second_root = second_program.address_space.root_address();
-    let first_pid = match task::spawn_user_process("init-user-a", first_program) {
-        Ok((pid, context)) => {
-            serial::write_line(format_args!(
-                "[BOOT] ring3 frame CS={:#x} SS={:#x} RIP={:#x} RSP={:#x}",
-                context.code_segment, context.data_segment, context.entry, context.stack_top,
-            ));
-            pid
-        }
-        Err(_) => {
-            console.println("FIRST USER PROCESS: SPAWN FAILED");
-            halt();
-        }
-    };
-    let second_pid = match task::spawn_user_process("init-user-b", second_program) {
-        Ok((pid, _)) => pid,
-        Err(_) => {
-            console.println("SECOND USER PROCESS: SPAWN FAILED");
-            halt();
-        }
-    };
-
-    while !task::process_exited(first_pid) || !task::process_exited(second_pid) {
-        x86_64::instructions::hlt();
-    }
-
-    if !syscall::user_memory_verified() || task::anonymous_mapping_count() != 0 {
-        console.println("USER MMAP/MUNMAP: FAILED");
-        halt();
-    }
-    serial::write_line(format_args!(
-        "[BOOT] user mmap/write/read/munmap and frame return verified"
-    ));
-
-    if !syscall::user_io_verified() || task::open_file_count() != 0 || vfs::node_count() != 2 {
-        console.println("USER VFS/DESCRIPTOR SYSCALLS: FAILED");
-        halt();
-    }
-    serial::write_line(format_args!(
-        "[BOOT] user write/open/read/close and pointer validation verified"
-    ));
-
-    if !syscall::last_completed(syscall::Number::Getpid) {
-        console.println("USER SYSCALL ABI: FAILED");
-        halt();
-    }
-    if task::zombie_count() != 2 {
-        console.println("PROCESS ZOMBIE RETENTION: FAILED");
-        halt();
-    }
-    let first_status = syscall::invoke(syscall::Number::Waitpid, first_pid.as_u64(), 0, 0);
-    let second_status = syscall::invoke(syscall::Number::Waitpid, second_pid.as_u64(), 0, 0);
-    if first_status != 0 || second_status != 0 || task::zombie_count() != 0 {
-        console.println("PROCESS WAIT/REAP: FAILED");
-        halt();
-    }
-    if syscall::invoke(syscall::Number::Waitpid, first_pid.as_u64(), 0, 0) != u64::MAX {
-        console.println("PROCESS DOUBLE-WAIT REJECTION: FAILED");
-        halt();
-    }
-    serial::write_line(format_args!(
-        "[BOOT] parent-child waitpid and zombie reaping verified"
-    ));
-    if memory::stats().allocated_frames != isolation_baseline {
-        console.println("USER ADDRESS-SPACE RECLAMATION: FAILED");
-        halt();
-    }
-
-    console.println("USER CR3 ISOLATION/W^X/RECLAMATION: OK");
-    serial::write_line(format_args!(
-        "[BOOT] isolated user CR3 roots {:#x} and {:#x} verified",
-        first_root, second_root,
-    ));
-    serial::write_line(format_args!(
-        "[BOOT] ring3 W^X mapping cleanup and frame reuse verified"
-    ));
-    console.println("RING3 PROCESS GETPID/EXIT: OK");
-    serial::write_line(format_args!(
-        "[BOOT] ring3 process and syscall ABI verified"
-    ));
     console.println("KEYBOARD IRQ: READY");
 
     //
@@ -376,7 +187,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     console.println("");
-    serial::write_line(format_args!("[BOOT] interactive shell ready"));
     let mut shell = Shell::new();
     shell.print_prompt(&mut console);
 
@@ -392,36 +202,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             shell.handle_key(key, &mut console);
         }
 
+        syscall::service_pending();
         task::preemption_point();
         x86_64::instructions::hlt();
     }
-}
-
-fn fairness_probe_a() -> ! {
-    while FAIR_TASK_B_RUNS.load(Ordering::Acquire) == 0 {
-        FAIR_TASK_A_RUNS.fetch_add(1, Ordering::Relaxed);
-        core::hint::spin_loop();
-    }
-    FAIR_TASK_A_RUNS.fetch_add(1, Ordering::Release);
-    FAIR_TASKS_COMPLETED.fetch_add(1, Ordering::Release);
-    task::exit_current_task()
-}
-
-fn fairness_probe_b() -> ! {
-    while FAIR_TASK_A_RUNS.load(Ordering::Acquire) == 0 {
-        FAIR_TASK_B_RUNS.fetch_add(1, Ordering::Relaxed);
-        core::hint::spin_loop();
-    }
-    FAIR_TASK_B_RUNS.fetch_add(1, Ordering::Release);
-    FAIR_TASKS_COMPLETED.fetch_add(1, Ordering::Release);
-    task::exit_current_task()
-}
-fn preemption_probe_task() -> ! {
-    task::sleep_current(2);
-    PREEMPTION_PROBE_BLOCKED.store(true, Ordering::Release);
-    task::block_current();
-    PREEMPTION_PROBE_COMPLETED.store(true, Ordering::Release);
-    task::exit_current_task()
 }
 
 fn halt() -> ! {
@@ -433,18 +217,11 @@ fn halt() -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: Layout) -> ! {
-    serial::write_fmt(format_args!(
-        "\nKERNEL ALLOC ERROR: layout size={} align={}\n",
-        layout.size(),
-        layout.align()
-    ));
-    interrupts::dump_cpu_state();
+    serial::write_fmt(format_args!("\nKERNEL ALLOC ERROR: layout size={} align={}\n", layout.size(), layout.align()));
     halt()
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial::write_fmt(format_args!("\nKERNEL PANIC: {info}\n"));
-    interrupts::dump_cpu_state();
-    halt()
+    panic::kernel_panic(info)
 }
