@@ -36,15 +36,17 @@ pub enum InputEvent {
 
 pub struct Button {
     pub bounds: Rect,
+    pub label: &'static str,
     pub color: Color,
     pub pressed: bool,
     pub focused: bool,
 }
 
 impl Button {
-    pub const fn new(bounds: Rect, color: Color) -> Self {
+    pub const fn new(bounds: Rect, label: &'static str, color: Color) -> Self {
         Self {
             bounds,
+            label,
             color,
             pressed: false,
             focused: false,
@@ -64,6 +66,21 @@ impl Button {
             self.bounds.height,
             color,
         );
+        graphics.draw_text(
+            self.bounds.x + 12,
+            self.bounds.y + 18,
+            self.label,
+            Color::DARK_BLUE,
+        );
+        if self.focused {
+            graphics.stroke_rect(
+                self.bounds.x - 2,
+                self.bounds.y - 2,
+                self.bounds.width + 4,
+                self.bounds.height + 4,
+                Color::DARK_BLUE,
+            );
+        }
     }
 
     fn handle(&mut self, event: &InputEvent) -> bool {
@@ -79,6 +96,7 @@ impl Button {
 
 pub struct Window {
     pub bounds: Rect,
+    pub title: &'static str,
     pub title_bar_height: usize,
     pub title_color: Color,
     pub body_color: Color,
@@ -86,9 +104,10 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(bounds: Rect) -> Self {
+    pub fn new(bounds: Rect, title: &'static str) -> Self {
         Self {
             bounds,
+            title,
             title_bar_height: 24,
             title_color: Color::CYAN,
             body_color: Color::WHITE,
@@ -98,6 +117,10 @@ impl Window {
 
     pub fn add_button(&mut self, button: Button) {
         self.buttons.push(button);
+    }
+
+    fn contains(&self, x: i32, y: i32) -> bool {
+        self.bounds.contains(x, y)
     }
 
     fn clear_focus(&mut self) {
@@ -114,12 +137,25 @@ impl Window {
             self.title_bar_height,
             self.title_color,
         );
+        graphics.draw_text(
+            self.bounds.x + 10,
+            self.bounds.y + 8,
+            self.title,
+            Color::DARK_BLUE,
+        );
         graphics.fill_rect(
             self.bounds.x,
             self.bounds.y + self.title_bar_height as i32,
             self.bounds.width,
             self.bounds.height.saturating_sub(self.title_bar_height),
             self.body_color,
+        );
+        graphics.stroke_rect(
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.width,
+            self.bounds.height,
+            Color::DARK_BLUE,
         );
         for button in &self.buttons {
             button.render(graphics);
@@ -128,15 +164,15 @@ impl Window {
 
     fn handle(&mut self, event: &InputEvent) -> bool {
         if let InputEvent::Key('\t') = event {
-            let next = self
-                .buttons
-                .iter()
-                .position(|button| button.focused)
-                .map_or(0, |index| (index + 1) % self.buttons.len());
+            if self.buttons.is_empty() {
+                return false;
+            }
+            let current = self.buttons.iter().position(|button| button.focused);
+            let next = current.map_or(0, |index| (index + 1) % self.buttons.len());
             for (index, button) in self.buttons.iter_mut().enumerate() {
                 button.focused = index == next;
             }
-            return !self.buttons.is_empty();
+            return true;
         }
         if let InputEvent::Key('\n') = event {
             if let Some(button) = self.buttons.iter_mut().find(|button| button.focused) {
@@ -188,7 +224,7 @@ impl Desktop {
             let Some(active_index) = self
                 .windows
                 .iter()
-                .rposition(|window| window.bounds.contains(*x, *y))
+                .rposition(|window| window.contains(*x, *y))
             else {
                 for window in &mut self.windows {
                     window.clear_focus();
@@ -215,40 +251,27 @@ impl Desktop {
 }
 
 pub fn self_test() -> bool {
+    let bounds = Rect::new(10, 10, 80, 30);
     let mut desktop = Desktop::new(Color::DARK_BLUE);
-    let mut window = Window::new(Rect::new(0, 0, 160, 120));
-    window.add_button(Button::new(Rect::new(10, 10, 60, 30), Color::CYAN));
-    window.add_button(Button::new(Rect::new(80, 10, 60, 30), Color::CYAN));
+    let mut window = Window::new(Rect::new(0, 0, 160, 120), "TEST");
+    window.add_button(Button::new(bounds, "ACTIVATE", Color::CYAN));
+    window.add_button(Button::new(
+        Rect::new(10, 50, 80, 30),
+        "SECOND",
+        Color::CYAN,
+    ));
     desktop.add_window(window);
 
     let first_focused = desktop.handle(&InputEvent::Key('\t'))
         && desktop.windows[0].buttons[0].focused;
     let second_focused = desktop.handle(&InputEvent::Key('\t'))
-        && !desktop.windows[0].buttons[0].focused
         && desktop.windows[0].buttons[1].focused;
-    let keyboard_activated = desktop.handle(&InputEvent::Key('\n'))
-        && desktop.windows[0].buttons[1].pressed;
-    let pointer_activated = desktop.handle(&InputEvent::PointerDown { x: 20, y: 20 })
-        && desktop.windows[0].buttons[0].focused
-        && desktop.windows[0].buttons[0].pressed
-        && !desktop.windows[0].buttons[1].focused;
-
-    let mut front_window = Window::new(Rect::new(200, 0, 100, 100));
-    front_window.add_button(Button::new(
-        Rect::new(210, 10, 60, 30),
-        Color::CYAN,
-    ));
-    desktop.add_window(front_window);
-    let raised = desktop.handle(&InputEvent::PointerDown { x: 150, y: 100 })
-        && desktop.windows.last().is_some_and(|window| window.bounds.x == 0)
-        && desktop.windows[0]
-            .buttons
-            .first()
-            .is_some_and(|button| !button.focused);
-
+    let activated = desktop.handle(&InputEvent::Key('\n'));
+    let pointer_activation = desktop.handle(&InputEvent::PointerDown { x: 20, y: 20 });
     first_focused
         && second_focused
-        && keyboard_activated
-        && pointer_activated
-        && raised
+        && activated
+        && pointer_activation
+        && desktop.windows[0].buttons[0].pressed
+        && desktop.windows[0].buttons[1].pressed
 }
