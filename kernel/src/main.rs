@@ -59,10 +59,21 @@ static FAIR_TASKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let memory_init = memory::init(&boot_info.memory_regions);
-    let paging_init = match &boot_info.physical_memory_offset {
-        Optional::Some(offset) => paging::init(*offset),
-        Optional::None => Err(paging::InitError::MissingPhysicalMemoryMapping),
+    let physical_memory_offset = match &boot_info.physical_memory_offset {
+        Optional::Some(offset) => Some(*offset),
+        Optional::None => None,
     };
+    let paging_init = match physical_memory_offset {
+        Some(offset) => paging::init(offset),
+        None => Err(paging::InitError::MissingPhysicalMemoryMapping),
+    };
+    let rsdp_address = match &boot_info.rsdp_addr {
+        Optional::Some(address) => Some(*address),
+        Optional::None => None,
+    };
+    let acpi = physical_memory_offset
+        .ok_or(hal::acpi::Error::OutOfRange)
+        .and_then(|offset| hal::acpi::discover(offset, rsdp_address, &boot_info.memory_regions));
     let boot_info_address = boot_info as *const BootInfo as u64;
 
     let framebuffer = match &mut boot_info.framebuffer {
@@ -128,6 +139,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
 
     let hardware = hal::init();
+    if !hal::acpi::self_test() {
+        console.println("ACPI PARSER: VALIDATION FAILED");
+        halt();
+    }
+    match acpi {
+        Ok(summary) => {
+            console.println("ACPI TABLES: VALIDATED");
+            serial::write_line(format_args!(
+                "[ACPI] revision={} tables={} APIC={} FADT={} HPET={} MCFG={} truncated={}",
+                summary.revision,
+                summary.tables,
+                summary.apic as u8,
+                summary.fadt as u8,
+                summary.hpet as u8,
+                summary.mcfg as u8,
+                summary.truncated as u8,
+            ));
+        }
+        Err(_) => console.println("ACPI TABLES: UNAVAILABLE"),
+    }
     let vendor = match hardware.cpu_vendor {
         hal::CpuVendor::Intel => "INTEL",
         hal::CpuVendor::Amd => "AMD",
