@@ -144,6 +144,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         hardware.cpu_features.has_pae as u8,
         hardware.cpu_features.has_sse4_2 as u8,
     ));
+    if !hal::pci::self_test() {
+        console.println("PCI DISCOVERY: VALIDATION FAILED");
+        halt();
+    }
+    serial::write_line(format_args!(
+        "[PCI] devices={} recorded={} storage={} network={} display={} bridges={} truncated={}",
+        hardware.pci.discovered,
+        hardware.pci.recorded,
+        hardware.pci.storage,
+        hardware.pci.network,
+        hardware.pci.display,
+        hardware.pci.bridges,
+        hardware.pci.truncated as u8,
+    ));
+    console.println("PCI CONFIGURATION: ENUMERATED");
 
     if heap::init().is_err() {
         console.println("KERNEL HEAP: INITIALIZATION FAILED");

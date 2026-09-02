@@ -1,10 +1,12 @@
 pub mod cpu;
+pub mod pci;
 
 #[derive(Clone, Copy)]
 pub struct HardwareInfo {
     pub cpu_vendor: CpuVendor,
     pub cpu_features: CpuFeatures,
     pub logical_cpus: u32,
+    pub pci: pci::Summary,
 }
 
 #[derive(Clone, Copy)]
@@ -29,5 +31,6 @@ pub fn init() -> HardwareInfo {
         cpu_vendor: cpu::detect_vendor(),
         cpu_features: cpu::detect_features(),
         logical_cpus: cpu::count_logical_cpus(),
+        pci: pci::discover(),
     }
 }

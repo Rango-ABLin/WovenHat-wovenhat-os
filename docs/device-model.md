@@ -13,6 +13,14 @@ unmasked.
 | `pit` | Timer | 0 |
 | `ps2-keyboard` | Keyboard | 1 |
 
+## PCI inventory
+
+The HAL scans PCI configuration mechanism 1 across all 256 buses, 32 device slots,
+and advertised multifunction functions. It records up to 64 functions and reports
+total storage, network, display, and bridge classes over serial. Inventory truncation
+is explicit. Enumeration is read-only and completes before interrupts are enabled.
+A detected legacy primary-master disk is registered separately as ata0.
+
 ## Invariants
 
 - The registry has a fixed capacity and does not allocate.
@@ -23,6 +31,7 @@ unmasked.
 
 ## Extension path
 
-ACPI and PCI discovery should register discovered controllers through this API. Driver
-binding should extend `Device` with bus identity and lifecycle state while preserving
+PCI functions are inventoried but are only added to the device registry after a driver
+binds them. ACPI discovery should supply interrupt routing and board topology. Driver
+binding should extend Device with bus identity and lifecycle state while preserving
 the name and IRQ uniqueness checks.
