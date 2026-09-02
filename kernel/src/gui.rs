@@ -66,6 +66,10 @@ impl Button {
                 self.pressed = !self.pressed;
                 true
             }
+            InputEvent::Key('\n') => {
+                self.pressed = !self.pressed;
+                true
+            }
             _ => false,
         }
     }
@@ -151,4 +155,15 @@ impl Desktop {
         }
         false
     }
+}
+
+pub fn self_test() -> bool {
+    let bounds = Rect::new(10, 10, 80, 30);
+    let mut desktop = Desktop::new(Color::DARK_BLUE);
+    let mut window = Window::new(Rect::new(0, 0, 160, 120));
+    window.add_button(Button::new(bounds, Color::CYAN));
+    desktop.add_window(window);
+
+    let handled = desktop.handle(&InputEvent::PointerDown { x: 20, y: 20 });
+    handled && desktop.windows[0].buttons[0].pressed
 }

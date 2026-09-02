@@ -8,7 +8,7 @@ struct Node {
     length: usize,
 }
 
-static NODES: Mutex<[Node; 2]> = Mutex::new([
+static NODES: Mutex<[Node; 3]> = Mutex::new([
     Node {
         path: "/etc/motd",
         data: padded(b"Welcome to WovenHat OS.\n"),

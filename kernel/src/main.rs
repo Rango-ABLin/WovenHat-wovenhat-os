@@ -36,7 +36,6 @@ use bootloader_api::{
 use console::Console;
 use core::{alloc::Layout, panic::PanicInfo};
 use keyboard::Keyboard;
-use shell::Shell;
 
 use x86_64::instructions::interrupts::int3;
 
@@ -155,6 +154,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
+    if gui::self_test() {
+        console.println("GUI INPUT: OK");
+    } else {
+        console.println("GUI INPUT: FAILED");
+        halt();
+    }
+
     gdt::init();
     let _user_segments = gdt::user_segments();
     console.println("GDT/TSS: INSTALLED");
@@ -216,8 +222,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     console.println("");
-    let mut shell = Shell::new();
-    shell.print_prompt(&mut console);
+    let mut desktop = gui::Desktop::new(graphics::Color::DARK_BLUE);
+    let mut window = gui::Window::new(gui::Rect::new(80, 80, 480, 280));
+    window.add_button(gui::Button::new(
+        gui::Rect::new(120, 180, 180, 48),
+        graphics::Color::CYAN,
+    ));
+    desktop.add_window(window);
+    console.render_desktop(&desktop);
 
     //
     // Interrupt-driven keyboard input. The IRQ handler only queues raw
@@ -228,7 +240,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     loop {
         if let Some(key) = keyboard.poll() {
-            shell.handle_key(key, &mut console);
+            let event = match key {
+                keyboard::Key::Char(character) => gui::InputEvent::Key(character),
+                keyboard::Key::Enter => gui::InputEvent::Key('\n'),
+                keyboard::Key::Backspace => gui::InputEvent::Key('\u{8}'),
+            };
+            desktop.handle(&event);
+            console.render_desktop(&desktop);
         }
 
         syscall::service_pending();

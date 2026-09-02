@@ -1,5 +1,7 @@
 use bootloader_api::info::{FrameBufferInfo, PixelFormat};
 
+use crate::{graphics::Graphics, gui::Desktop};
+
 const BG_R: u8 = 4;
 const BG_G: u8 = 12;
 const BG_B: u8 = 28;
@@ -96,6 +98,11 @@ impl<'a> Console<'a> {
                 self.pixel(x, y, BG_R, BG_G, BG_B);
             }
         }
+    }
+
+    pub fn render_desktop(&mut self, desktop: &Desktop) {
+        let mut graphics = Graphics::new(self.buffer, self.info);
+        desktop.render(&mut graphics);
     }
 
     fn draw_char(&mut self, x: usize, y: usize, character: char) {
