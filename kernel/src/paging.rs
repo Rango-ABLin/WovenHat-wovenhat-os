@@ -277,21 +277,101 @@ pub fn map_user_range_in(
     let mut mapper = mapper_for(&paging, address_space)?;
     let mut allocator = memory::allocator();
     let flags = user_flags(writable, executable);
+    let mut mapped_pages = 0;
 
     for page in Page::range_inclusive(start_page, end_page) {
-        if mapper.translate_addr(page.start_address()).is_some() {
-            return Err(MapRangeError::AlreadyMapped);
+        let failure = if mapper.translate_addr(page.start_address()).is_some() {
+            Some(MapRangeError::AlreadyMapped)
+        } else if let Some(frame) = allocator.allocate_frame() {
+            match unsafe { mapper.map_to(page, frame, flags, &mut *allocator) } {
+                Ok(flush) => {
+                    flush.ignore();
+                    mapped_pages += 1;
+                    None
+                }
+                Err(_) => {
+                    let _ = allocator.deallocate_frame(frame);
+                    Some(MapRangeError::MappingFailed)
+                }
+            }
+        } else {
+            Some(MapRangeError::OutOfFrames)
+        };
+
+        if let Some(error) = failure {
+            for rollback_page in Page::range_inclusive(start_page, end_page).take(mapped_pages) {
+                if let Ok((frame, flush)) = mapper.unmap(rollback_page) {
+                    flush.ignore();
+                    let _ = allocator.deallocate_frame(frame);
+                }
+            }
+            return Err(error);
         }
-        let frame = allocator
-            .allocate_frame()
-            .ok_or(MapRangeError::OutOfFrames)?;
-        unsafe { mapper.map_to(page, frame, flags, &mut *allocator) }
-            .map_err(|_| MapRangeError::MappingFailed)?
-            .ignore();
     }
     Ok(())
 }
-
+pub fn clone_user_range_in(
+    source: AddressSpace,
+    destination: AddressSpace,
+    start: u64,
+    size: usize,
+    writable: bool,
+    executable: bool,
+) -> Result<(), MapRangeError> {
+    if source == destination {
+        return Err(MapRangeError::InvalidRange);
+    }
+    map_user_range_in(destination, start, size, writable, executable)?;
+    let copy_result = (|| {
+        let (start_page, end_page) = page_range(start, size)?;
+        let paging = PAGING.lock();
+        let source_mapper = mapper_for(&paging, source)?;
+        let destination_mapper = mapper_for(&paging, destination)?;
+        for page in Page::range_inclusive(start_page, end_page) {
+            let TranslateResult::Mapped {
+                frame,
+                offset,
+                flags,
+            } = source_mapper.translate(page.start_address())
+            else {
+                return Err(MapRangeError::NotMapped);
+            };
+            if offset != 0
+                || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                || flags.contains(PageTableFlags::WRITABLE) != writable
+                || flags.contains(PageTableFlags::NO_EXECUTE) == executable
+            {
+                return Err(MapRangeError::MappingFailed);
+            }
+            let source_physical = frame.start_address().as_u64();
+            let destination_physical = destination_mapper
+                .translate_addr(page.start_address())
+                .ok_or(MapRangeError::NotMapped)?
+                .as_u64();
+            let source_pointer = paging
+                .physical_memory_offset
+                .checked_add(source_physical)
+                .ok_or(MapRangeError::InvalidRange)? as *const u8;
+            let destination_pointer = paging
+                .physical_memory_offset
+                .checked_add(destination_physical)
+                .ok_or(MapRangeError::InvalidRange)?
+                as *mut u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source_pointer,
+                    destination_pointer,
+                    Size4KiB::SIZE as usize,
+                );
+            }
+        }
+        Ok(())
+    })();
+    if copy_result.is_err() {
+        let _ = unmap_user_range_in(destination, start, size);
+    }
+    copy_result
+}
 pub fn protect_user_range_in(
     address_space: AddressSpace,
     start: u64,

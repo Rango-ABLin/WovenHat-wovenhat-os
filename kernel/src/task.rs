@@ -286,6 +286,40 @@ impl TaskControlBlock {
 
         self.context.stack_pointer = cursor as u64;
     }
+    fn initialize_fork(
+        &mut self,
+        slot: usize,
+        id: TaskId,
+        frame: crate::syscall::UserForkFrame,
+        address_space: paging::AddressSpace,
+        capabilities: CapabilitySet,
+    ) {
+        self.id = id;
+        self.name = "fork-child";
+        self.state = TaskState::Ready;
+        self.priority = TaskPriority::NORMAL;
+        self.entry = None;
+        self.wake_tick = 0;
+        self.user_context = None;
+        self.address_space = Some(address_space);
+        self.remaining_ticks = TaskPriority::NORMAL.quantum();
+        self.capabilities = capabilities;
+
+        let stack_start = TASK_STACKS[slot].0.get().cast::<u8>() as usize;
+        let stack_top = (stack_start + TASK_STACK_SIZE) & !0xf;
+        let frame_start = stack_top - core::mem::size_of::<crate::syscall::UserForkFrame>();
+        unsafe {
+            (frame_start as *mut crate::syscall::UserForkFrame).write(frame.child_return());
+        }
+        let mut cursor = frame_start;
+        unsafe {
+            push_stack_value(&mut cursor, crate::syscall::resume_address());
+            for _ in 0..6 {
+                push_stack_value(&mut cursor, 0);
+            }
+        }
+        self.context.stack_pointer = cursor as u64;
+    }
 }
 
 fn task_bootstrap() -> ! {
@@ -635,6 +669,74 @@ pub fn credential_policy_valid() -> bool {
 
 fn credentials_may_ipc(sender: Credentials, receiver: Credentials) -> bool {
     sender.is_root() || sender.uid == receiver.uid || sender.gid == receiver.gid
+}
+pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, ProcessError> {
+    let task_id = current_task_id();
+    let (parent, capabilities) = {
+        let scheduler = SCHEDULER.lock();
+        let capabilities = scheduler.tasks[scheduler.current_slot].capabilities;
+        let processes = PROCESS_TABLE.lock();
+        let parent = processes
+            .iter()
+            .flatten()
+            .find(|process| process.task_id == task_id)
+            .copied()
+            .ok_or(ProcessError::Full)?;
+        (parent, capabilities)
+    };
+    let source_address_space = parent.address_space.ok_or(ProcessError::Full)?;
+    let cloned_address_space =
+        userspace::clone_address_space(source_address_space, &parent.memory_mappings)
+            .ok_or(ProcessError::Full)?;
+
+    let mut scheduler = SCHEDULER.lock();
+    scheduler.reap_dead();
+    let Some(task_slot) = scheduler
+        .tasks
+        .iter()
+        .position(|task| task.state == TaskState::Empty)
+    else {
+        let _ =
+            userspace::destroy_process_address_space(cloned_address_space, parent.memory_mappings);
+        return Err(ProcessError::Full);
+    };
+    let mut processes = PROCESS_TABLE.lock();
+    let Some(process_slot) = processes.iter().position(Option::is_none) else {
+        drop(processes);
+        drop(scheduler);
+        let _ =
+            userspace::destroy_process_address_space(cloned_address_space, parent.memory_mappings);
+        return Err(ProcessError::Full);
+    };
+    let child_task_id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    let child_id = ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed));
+    if ipc::register(child_id.as_u64()).is_err() {
+        drop(processes);
+        drop(scheduler);
+        let _ =
+            userspace::destroy_process_address_space(cloned_address_space, parent.memory_mappings);
+        return Err(ProcessError::Full);
+    }
+    scheduler.tasks[task_slot].initialize_fork(
+        task_slot,
+        child_task_id,
+        frame,
+        cloned_address_space.paging(),
+        capabilities,
+    );
+    scheduler.task_count += 1;
+    processes[process_slot] = Some(Process {
+        id: child_id,
+        task_id: child_task_id,
+        state: ProcessState::Ready,
+        parent: parent.id,
+        credentials: parent.credentials,
+        exit_code: 0,
+        address_space: Some(cloned_address_space),
+        files: parent.files,
+        memory_mappings: parent.memory_mappings,
+    });
+    Ok(child_id)
 }
 pub fn exec_current(program: userspace::UserProgram) -> ! {
     assert!(program.image.is_valid(), "exec received an invalid image");

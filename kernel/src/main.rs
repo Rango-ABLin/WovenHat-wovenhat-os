@@ -557,6 +557,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
     console.println("USER EXEC ATOMIC REPLACEMENT: OK");
+    if !syscall::user_fork_verified() {
+        console.println("USER FORK SYSCALL: FAILED");
+        halt();
+    }
+    console.println("USER FORK ADDRESS-SPACE CLONE: OK");
     console.println("USER UID/GID SYSCALLS: OK");
     serial::write_line(format_args!(
         "[BOOT] user mmap/write/read/munmap and frame return verified"

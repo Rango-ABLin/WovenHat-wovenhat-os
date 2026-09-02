@@ -22,12 +22,13 @@ sentinel. The assembly entry preserves general registers and returns with iretq.
 | 13 | getuid | none |
 | 14 | getgid | none |
 | 15 | exec | user path, path length |
+| 16 | fork | none |
 
 All paths and I/O payloads have fixed upper bounds. Pointer-bearing calls translate and
 validate each user page before copying. File and IPC calls additionally pass capability,
 credential, descriptor, and VFS/queue checks.
 
-The embedded ring-3 validation program exercises exec, write, open, read, close, mmap,
+The embedded ring-3 validation program exercises fork, exec, write, open, read, close, mmap,
 munmap, yield, getpid, getuid, getgid, and exit. Boot also validates waitpid and process
 reclamation from the kernel parent.
 
@@ -38,9 +39,19 @@ mappings, preserves the process ID, credentials, capabilities, and open descript
 enters the new image directly. A failed load returns the error sentinel without changing
 the caller.
 
+`fork` requires ProcessCreate. It deep-copies the executable segments, user stack, and
+anonymous mappings into a distinct CR3 root before publishing the child. The child
+inherits the parent's credentials, capabilities, and descriptor snapshots. The syscall
+returns the child PID to the parent and zero to the child by resuming the copied register
+frame through the common interrupt-return epilogue. If cloning or table publication
+fails, no child is exposed and the parent receives the error sentinel.
+
+The boot fixture checks both return paths, child exit status 42, parent wait/reap, and
+subsequent process-image cleanup. Fork and exec use bounded process, mapping, ELF, and
+descriptor tables and do not overcommit memory.
+
 ## Current boundary
 
-Fork is not yet implemented. Process creation currently occurs through the validated
-kernel ELF-loading path, and every new userspace process receives the default
-unprivileged credentials and capability set. Adding fork requires copy-on-write or a
-bounded address-space and saved-register clone.
+Fork currently performs eager deep copies rather than copy-on-write, and descriptor
+positions are copied by value rather than shared through reference-counted open-file
+descriptions. There is no `argv`/environment transfer yet.

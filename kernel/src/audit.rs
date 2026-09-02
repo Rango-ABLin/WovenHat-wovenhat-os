@@ -10,6 +10,7 @@ pub enum Action {
     FileWrite,
     ProcessFault,
     ProcessExec,
+    ProcessFork,
 }
 
 #[derive(Clone, Copy)]

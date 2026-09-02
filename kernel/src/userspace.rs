@@ -11,6 +11,31 @@ global_asm!(
     ".global wovenhat_user_program_start",
     ".global wovenhat_user_program_end",
     "wovenhat_user_program_start:",
+    "mov eax, 16",
+    "int 0x80",
+    "cmp rax, -1",
+    "je wovenhat_user_failure",
+    "test rax, rax",
+    "jz wovenhat_fork_child",
+    "mov r12, rax",
+    "wovenhat_fork_wait:",
+    "mov eax, 5",
+    "mov rdi, r12",
+    "int 0x80",
+    "cmp rax, -2",
+    "jne wovenhat_fork_reaped",
+    "mov eax, 7",
+    "int 0x80",
+    "jmp wovenhat_fork_wait",
+    "wovenhat_fork_reaped:",
+    "cmp rax, 42",
+    "jne wovenhat_user_failure",
+    "jmp wovenhat_fork_parent",
+    "wovenhat_fork_child:",
+    "mov edi, 42",
+    "mov eax, 3",
+    "int 0x80",
+    "wovenhat_fork_parent:",
     "mov eax, 1",
     "mov edi, 1",
     "lea rsi, [rip + wovenhat_user_message]",
@@ -159,15 +184,23 @@ const USER_MMAP_MAX_SIZE: usize = USER_MMAP_STRIDE as usize;
 pub struct AnonymousMapping {
     pub address: u64,
     pub size: usize,
+    pub writable: bool,
 }
 #[derive(Clone, Copy)]
 struct UserMapping {
     start: u64,
     size: usize,
+    writable: bool,
+    executable: bool,
 }
 
 impl UserMapping {
-    const EMPTY: Self = Self { start: 0, size: 0 };
+    const EMPTY: Self = Self {
+        start: 0,
+        size: 0,
+        writable: false,
+        executable: false,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -273,6 +306,8 @@ pub fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
         mappings[mapping_count] = UserMapping {
             start: segment.mapping_start,
             size: segment.mapping_size,
+            writable: segment.writable,
+            executable: segment.executable,
         };
         mapping_count += 1;
 
@@ -380,11 +415,26 @@ pub fn map_anonymous(
         let _ = paging::unmap_user_range_in(address_space.paging, address, size);
         return None;
     }
-    Some(AnonymousMapping { address, size })
+    Some(AnonymousMapping {
+        address,
+        size,
+        writable,
+    })
 }
 
 pub fn unmap_anonymous(address_space: AddressSpace, mapping: AnonymousMapping) -> bool {
     paging::unmap_user_range_in(address_space.paging, mapping.address, mapping.size).is_ok()
+}
+pub fn destroy_process_address_space(
+    address_space: AddressSpace,
+    anonymous: [Option<AnonymousMapping>; MAX_ANONYMOUS_MAPPINGS],
+) -> bool {
+    for mapping in anonymous.into_iter().flatten() {
+        if !unmap_anonymous(address_space, mapping) {
+            return false;
+        }
+    }
+    destroy(address_space)
 }
 pub fn destroy(address_space: AddressSpace) -> bool {
     let mut ranges = [(0, 0); MAX_ELF_SEGMENTS + 1];
@@ -402,6 +452,80 @@ pub fn destroy(address_space: AddressSpace) -> bool {
     .is_ok()
 }
 
+pub fn clone_address_space(
+    source: AddressSpace,
+    anonymous: &[Option<AnonymousMapping>; MAX_ANONYMOUS_MAPPINGS],
+) -> Option<AddressSpace> {
+    let destination_paging = paging::create_user_address_space(source.stack_base)?;
+    let destination = AddressSpace {
+        paging: destination_paging,
+        stack_base: source.stack_base,
+        mappings: source.mappings,
+        mapping_count: source.mapping_count,
+    };
+    let mut completed = [(0_u64, 0_usize); MAX_ELF_SEGMENTS + 1 + MAX_ANONYMOUS_MAPPINGS];
+    let mut completed_count = 0;
+
+    for mapping in &source.mappings[..source.mapping_count] {
+        if paging::clone_user_range_in(
+            source.paging,
+            destination.paging,
+            mapping.start,
+            mapping.size,
+            mapping.writable,
+            mapping.executable,
+        )
+        .is_err()
+        {
+            release_clone(destination.paging, &completed[..completed_count]);
+            return None;
+        }
+        completed[completed_count] = (mapping.start, mapping.size);
+        completed_count += 1;
+    }
+    if paging::clone_user_range_in(
+        source.paging,
+        destination.paging,
+        source.stack_base,
+        UserStack::SIZE,
+        true,
+        false,
+    )
+    .is_err()
+    {
+        release_clone(destination.paging, &completed[..completed_count]);
+        return None;
+    }
+    completed[completed_count] = (source.stack_base, UserStack::SIZE);
+    completed_count += 1;
+
+    for mapping in anonymous.iter().flatten() {
+        if paging::clone_user_range_in(
+            source.paging,
+            destination.paging,
+            mapping.address,
+            mapping.size,
+            mapping.writable,
+            false,
+        )
+        .is_err()
+        {
+            release_clone(destination.paging, &completed[..completed_count]);
+            return None;
+        }
+        completed[completed_count] = (mapping.address, mapping.size);
+        completed_count += 1;
+    }
+    Some(destination)
+}
+
+fn release_clone(address_space: paging::AddressSpace, ranges: &[(u64, usize)]) {
+    if ranges.is_empty() {
+        let _ = paging::discard_empty_user_address_space(address_space);
+    } else {
+        let _ = paging::destroy_user_address_space(address_space, ranges);
+    }
+}
 impl AddressSpace {
     pub fn paging(self) -> paging::AddressSpace {
         self.paging

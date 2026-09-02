@@ -14,6 +14,7 @@ implicitly inheriting root identity.
 - IPC send requires the Ipc capability and either root identity, a matching UID, or a
   matching GID.
 - File writes require FileWrite and are also constrained by the VFS node write policy.
+- Fork and exec require ProcessCreate; exec also requires FileRead.
 - Syscall user pointers are translated page by page and rejected when unmapped or when
   the requested access conflicts with page permissions.
 
@@ -24,7 +25,7 @@ capability grant/revoke behavior, and the credentials of two real ring-3 process
 
 A bounded 64-record kernel audit ring stores a monotonic sequence number, timer tick,
 actor process ID, action, target, and allow/deny result. Capability grant/revoke, IPC
-send, file-write, process-fault, and exec outcomes are recorded. When full, the ring overwrites its oldest
+send, file-write, process-fault, fork, and exec outcomes are recorded. When full, the ring overwrites its oldest
 record instead of allocating or blocking. Boot verifies wraparound and confirms the
 capability delegation test produced ordered audit evidence.
 

@@ -125,7 +125,7 @@ impl PhysicalFrameAllocator {
             .any(|range| address >= range.start && address < range.end)
     }
 
-    fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) -> bool {
+    pub(crate) fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) -> bool {
         let address = frame.start_address().as_u64();
         if !self.contains(frame)
             || self.allocated_frames == 0

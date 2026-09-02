@@ -10,6 +10,7 @@ rebuilt from validated ELF segments, anonymous mappings, and a private stack.
 - ELF segment permissions are applied after loading; writable-executable segments are
   rejected by the ELF parser.
 - Anonymous mappings are writable only when requested and are always non-executable.
+- Fork eagerly clones every user page into independently owned physical frames while preserving its writable/executable policy.
 - Each two-page user stack is writable and non-executable.
 - One page immediately below every user stack is reserved and remains unmapped.
 - Syscall copies reject unmapped pages and enforce user/write permissions per translated
