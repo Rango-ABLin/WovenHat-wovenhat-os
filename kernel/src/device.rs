@@ -8,6 +8,7 @@ pub enum DeviceKind {
     Serial,
     Timer,
     Keyboard,
+    Block,
 }
 
 #[derive(Clone, Copy)]
@@ -107,7 +108,7 @@ pub fn self_test() -> bool {
     };
     let duplicate_irq = Device {
         name: "test-keyboard",
-        kind: DeviceKind::Keyboard,
+        kind: DeviceKind::Block,
         irq: Some(9),
     };
     let uniqueness_valid = scratch.register(first).is_ok()
@@ -120,6 +121,7 @@ pub fn self_test() -> bool {
         && count_kind(DeviceKind::Serial) == 1
         && count_kind(DeviceKind::Timer) == 1
         && count_kind(DeviceKind::Keyboard) == 1
+        && count_kind(DeviceKind::Block) == 0
         && find("pit").is_some_and(|device| device.irq == Some(crate::timer::IRQ))
         && find("ps2-keyboard").is_some_and(|device| device.irq == Some(crate::keyboard::IRQ))
 }

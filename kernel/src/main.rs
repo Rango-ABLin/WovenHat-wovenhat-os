@@ -5,10 +5,12 @@
 
 extern crate alloc;
 
+mod block;
 mod capability;
 mod console;
 mod device;
 mod elf;
+mod fat32;
 mod gdt;
 mod graphics;
 mod gui;
@@ -150,6 +152,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("KERNEL HEAP: 256 KIB OK");
     } else {
         console.println("KERNEL HEAP: SELF TEST FAILED");
+        halt();
+    }
+    if block::self_test() {
+        console.println("BLOCK DEVICE I/O: OK");
+    } else {
+        console.println("BLOCK DEVICE I/O: FAILED");
+        halt();
+    }
+
+    if fat32::self_test() {
+        console.println("FAT32 VOLUME/ROOT: OK");
+    } else {
+        console.println("FAT32 VALIDATION: FAILED");
         halt();
     }
 
