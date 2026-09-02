@@ -36,15 +36,17 @@ pub enum InputEvent {
 
 pub struct Button {
     pub bounds: Rect,
+    pub label: &'static str,
     pub color: Color,
     pub pressed: bool,
     pub focused: bool,
 }
 
 impl Button {
-    pub const fn new(bounds: Rect, color: Color) -> Self {
+    pub const fn new(bounds: Rect, label: &'static str, color: Color) -> Self {
         Self {
             bounds,
+            label,
             color,
             pressed: false,
             focused: false,
@@ -64,6 +66,12 @@ impl Button {
             self.bounds.height,
             color,
         );
+        graphics.draw_text(
+            self.bounds.x + 12,
+            self.bounds.y + 18,
+            self.label,
+            Color::DARK_BLUE,
+        );
     }
 
     fn handle(&mut self, event: &InputEvent) -> bool {
@@ -79,6 +87,7 @@ impl Button {
 
 pub struct Window {
     pub bounds: Rect,
+    pub title: &'static str,
     pub title_bar_height: usize,
     pub title_color: Color,
     pub body_color: Color,
@@ -86,9 +95,10 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(bounds: Rect) -> Self {
+    pub fn new(bounds: Rect, title: &'static str) -> Self {
         Self {
             bounds,
+            title,
             title_bar_height: 24,
             title_color: Color::CYAN,
             body_color: Color::WHITE,
@@ -107,6 +117,12 @@ impl Window {
             self.bounds.width,
             self.title_bar_height,
             self.title_color,
+        );
+        graphics.draw_text(
+            self.bounds.x + 10,
+            self.bounds.y + 8,
+            self.title,
+            Color::DARK_BLUE,
         );
         graphics.fill_rect(
             self.bounds.x,
@@ -175,7 +191,7 @@ pub fn self_test() -> bool {
     let bounds = Rect::new(10, 10, 80, 30);
     let mut desktop = Desktop::new(Color::DARK_BLUE);
     let mut window = Window::new(Rect::new(0, 0, 160, 120));
-    window.add_button(Button::new(bounds, Color::CYAN));
+    window.add_button(Button::new(bounds, "ACTIVATE", Color::CYAN));
     desktop.add_window(window);
 
     let focused = desktop.handle(&InputEvent::Key('\t'));

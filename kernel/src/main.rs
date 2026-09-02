@@ -223,9 +223,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     console.println("");
     let mut desktop = gui::Desktop::new(graphics::Color::DARK_BLUE);
-    let mut window = gui::Window::new(gui::Rect::new(80, 80, 480, 280));
+    let mut window = gui::Window::new(gui::Rect::new(80, 80, 480, 280), "WOVENHAT DESKTOP");
     window.add_button(gui::Button::new(
         gui::Rect::new(120, 180, 180, 48),
+        "ACTIVATE",
         graphics::Color::CYAN,
     ));
     desktop.add_window(window);
