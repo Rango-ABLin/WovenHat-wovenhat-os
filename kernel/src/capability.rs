@@ -10,6 +10,7 @@ pub enum Capability {
     MemoryInspect = 6,
     FileRead = 7,
     FileWrite = 8,
+    Ipc = 9,
 }
 
 #[derive(Clone, Copy)]
@@ -33,12 +34,14 @@ impl CapabilitySet {
             .with(Capability::MemoryInspect)
             .with(Capability::FileRead)
             .with(Capability::FileWrite)
+            .with(Capability::Ipc)
     }
 
     pub const fn userspace() -> Self {
         Self::empty()
             .with(Capability::Console)
             .with(Capability::FileRead)
+            .with(Capability::Ipc)
     }
 
     pub const fn with(self, capability: Capability) -> Self {

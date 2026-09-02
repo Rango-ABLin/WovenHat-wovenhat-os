@@ -15,6 +15,7 @@ mod gui;
 mod hal;
 mod heap;
 mod interrupts;
+mod ipc;
 mod keyboard;
 mod memory;
 mod paging;
@@ -169,6 +170,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("GUI INPUT: OK");
     } else {
         console.println("GUI INPUT: FAILED");
+        halt();
+    }
+    if ipc::self_test() && ipc::endpoint_count() == 0 {
+        console.println("IPC QUEUES: VALIDATED");
+    } else {
+        console.println("IPC QUEUES: VALIDATION FAILED");
         halt();
     }
 
@@ -394,7 +401,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::write_line(format_args!(
         "[BOOT] parent-child waitpid and zombie reaping verified"
     ));
-    if memory::stats().allocated_frames != isolation_baseline {
+    if memory::stats().allocated_frames != isolation_baseline || ipc::endpoint_count() != 0 {
         console.println("USER ADDRESS-SPACE RECLAMATION: FAILED");
         halt();
     }

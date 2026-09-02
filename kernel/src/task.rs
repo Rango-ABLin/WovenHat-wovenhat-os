@@ -8,7 +8,7 @@ use spin::Mutex;
 
 use crate::{
     capability::{Capability, CapabilitySet},
-    gdt, paging, timer, userspace, vfs,
+    gdt, ipc, paging, timer, userspace, vfs,
 };
 
 const MAX_TASKS: usize = 8;
@@ -530,6 +530,10 @@ pub fn spawn_user_process(
     let task_id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let process = create_process(task_id, parent, program.address_space);
     let process_id = process.id;
+    if ipc::register(process_id.as_u64()).is_err() {
+        let _ = userspace::destroy(program.address_space);
+        return Err(ProcessError::Full);
+    }
     scheduler.tasks[task_slot].initialize_user(
         task_slot,
         task_id,
@@ -627,6 +631,10 @@ pub fn wait_process(child_id: u64) -> Result<i32, WaitError> {
     if process.state != ProcessState::Exited {
         return Err(WaitError::StillRunning);
     }
+    assert!(
+        ipc::unregister(child.as_u64()).is_ok(),
+        "reaped process has no IPC endpoint"
+    );
     processes[slot] = None;
     Ok(process.exit_code)
 }

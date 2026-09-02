@@ -74,6 +74,8 @@ pub enum Number {
     Mmap = 8,
     Munmap = 9,
     FileWrite = 10,
+    MessageSend = 11,
+    MessageReceive = 12,
 }
 
 pub fn entry_address() -> u64 {
@@ -241,6 +243,50 @@ fn sys_file_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
     }
 }
 
+fn sys_message_send(receiver: u64, user_buffer: u64, length: u64) -> u64 {
+    if !crate::task::current_has(crate::capability::Capability::Ipc) {
+        return SYSCALL_ERROR;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length > crate::ipc::MAX_MESSAGE_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut buffer = [0_u8; crate::ipc::MAX_MESSAGE_SIZE];
+    if crate::paging::copy_from_current_user(user_buffer, &mut buffer[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let sender = crate::task::current_process_id();
+    match crate::ipc::send(sender, receiver, &buffer[..length]) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_message_receive(user_buffer: u64, capacity: u64, user_sender: u64) -> u64 {
+    if !crate::task::current_has(crate::capability::Capability::Ipc) {
+        return SYSCALL_ERROR;
+    }
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return SYSCALL_ERROR;
+    };
+    let receiver = crate::task::current_process_id();
+    let Ok(message) = crate::ipc::peek(receiver) else {
+        return SYSCALL_ERROR;
+    };
+    if message.payload().len() > capacity
+        || crate::paging::copy_to_current_user(user_buffer, message.payload()).is_err()
+        || crate::paging::copy_to_current_user(user_sender, &message.sender.to_le_bytes()).is_err()
+    {
+        return SYSCALL_ERROR;
+    }
+    if crate::ipc::receive(receiver).is_err() {
+        return SYSCALL_ERROR;
+    }
+    message.payload().len() as u64
+}
+
 fn sys_close(descriptor: u64) -> u64 {
     match crate::task::close_current(descriptor) {
         Ok(()) => {
@@ -260,6 +306,10 @@ pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, a
         value if value == Number::Write as u64 => sys_write(arg0, arg1, arg2),
         value if value == Number::Open as u64 => sys_open(arg0, arg1),
         value if value == Number::Close as u64 => sys_close(arg0),
+        value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),
+        value if value == Number::MessageReceive as u64 => {
+            sys_message_receive(arg0, arg1, arg2)
+        }
         value if value == Number::Yield as u64 => {
             YIELD_PENDING.store(true, Ordering::Release);
             0
