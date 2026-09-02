@@ -85,7 +85,7 @@ impl UserImage {
     pub fn is_valid(self) -> bool {
         self.entry >= USER_REGION_START
             && self.stack_top != 0
-            && self.stack_top % 16 == 0
+            && self.stack_top.is_multiple_of(16)
             && self.image_size != 0
             && self.load_segments != 0
     }
@@ -110,7 +110,7 @@ impl UserStack {
     }
 
     pub fn is_aligned(self) -> bool {
-        self.base % 16 == 0 && self.top % 16 == 0
+        self.base.is_multiple_of(16) && self.top.is_multiple_of(16)
     }
 }
 
@@ -304,7 +304,10 @@ pub fn map_anonymous(
     size: usize,
     writable: bool,
 ) -> Option<AnonymousMapping> {
-    if slot >= MAX_ANONYMOUS_MAPPINGS || size == 0 || size > USER_MMAP_MAX_SIZE || size % 4096 != 0
+    if slot >= MAX_ANONYMOUS_MAPPINGS
+        || size == 0
+        || size > USER_MMAP_MAX_SIZE
+        || !size.is_multiple_of(4096)
     {
         return None;
     }

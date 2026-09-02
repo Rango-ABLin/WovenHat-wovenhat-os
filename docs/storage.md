@@ -15,6 +15,12 @@ filesystem parsers.
 The interface is intentionally allocation-free and can be implemented by ATA, AHCI,
 NVMe, virtio-blk, or USB mass-storage drivers.
 
+The ATA module implements polling-mode discovery and read-only sector transport for
+the legacy primary-master channel. IDENTIFY and every transfer use bounded status
+polling, reject device faults, and expose at most the LBA28 address range. A detected
+disk is registered as ata0; systems without legacy ATA continue booting without a block
+device. Boot validates an actual LBA 0 transfer when present.
+
 ## FAT32 validation
 
 `kernel/src/fat32.rs` provides strict mount metadata validation, short-name lookup
@@ -40,13 +46,14 @@ The parser reports corrupt and unsupported media without indexing outside a sect
 
 File reads follow at most 64 clusters and may span multiple sectors and clusters.
 Root lookup is still limited to the first root-directory sector, directory mutation is
-not implemented, and physical media is not connected yet. The next storage increments
-are:
+not implemented, and FAT32 is not yet mounted from the detected physical disk. The
+next storage increments are:
 
-1. ATA PIO discovery and sector transport.
-2. Root-directory chain traversal and subdirectory lookup.
-3. Mounting a FAT32 volume into the VFS namespace.
-4. Crash-safe file and directory updates.
+1. Root-directory chain traversal and subdirectory lookup.
+2. Mounting a FAT32 volume into the VFS namespace.
+3. ATA writes plus secondary-channel and slave-device discovery.
+4. AHCI, NVMe, or virtio-blk transport.
+5. Crash-safe file and directory updates.
 
 Boot-time self-tests validate block bounds, read-only protection, FAT32 geometry,
 root lookup, missing entries, invalid signatures, multi-cluster reads, end-of-chain

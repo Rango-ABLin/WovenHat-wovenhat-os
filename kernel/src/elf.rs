@@ -185,7 +185,5 @@ const fn align_down(value: u64) -> u64 {
 }
 
 fn align_up(value: u64) -> Option<u64> {
-    value
-        .checked_add(PAGE_SIZE - 1)
-        .map(|value| align_down(value))
+    value.checked_add(PAGE_SIZE - 1).map(align_down)
 }

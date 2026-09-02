@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+mod ata;
 mod block;
 mod capability;
 mod console;
@@ -34,8 +35,8 @@ mod vfs;
 use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, BootloaderConfig};
 
 use console::Console;
-use core::{alloc::Layout, panic::PanicInfo};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::{alloc::Layout, panic::PanicInfo};
 use keyboard::Keyboard;
 use shell::Shell;
 
@@ -161,6 +162,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
+    if ata::self_test() {
+        console.println("ATA IDENTIFY PARSER: OK");
+    } else {
+        console.println("ATA IDENTIFY PARSER: FAILED");
+        halt();
+    }
+
     if fat32::self_test() {
         console.println("FAT32 VOLUME/ROOT: OK");
     } else {
@@ -234,6 +242,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("PIC: INITIALIZED (ALL IRQS MASKED)");
 
     timer::init();
+    let ata_sectors = ata::init();
+    if ata_sectors.is_some()
+        && !ata::with_primary_master(|disk| {
+            let mut sector = [0_u8; block::SECTOR_SIZE];
+            block::BlockDevice::read_sector(disk, 0, &mut sector).is_ok()
+        })
+        .unwrap_or(false)
+    {
+        console.println("ATA LBA0 READ: FAILED");
+        halt();
+    }
     let boot_devices = [
         device::Device {
             name: "framebuffer-console",
@@ -262,8 +281,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             halt();
         }
     }
-    if device::self_test() {
-        console.println("DEVICE REGISTRY: 4 DEVICES ONLINE");
+    if ata_sectors.is_some()
+        && device::register(device::Device {
+            name: "ata0",
+            kind: device::DeviceKind::Block,
+            irq: None,
+        })
+        .is_err()
+    {
+        console.println("ATA DEVICE REGISTRATION: FAILED");
+        halt();
+    }
+    if device::self_test(ata_sectors.is_some()) {
+        if let Some(sectors) = ata_sectors {
+            console.println("DEVICE REGISTRY: 5 DEVICES ONLINE");
+            serial::write_line(format_args!("[ATA] primary master: {} sectors", sectors));
+        } else {
+            console.println("DEVICE REGISTRY: 4 DEVICES ONLINE (NO ATA)");
+        }
     } else {
         console.println("DEVICE REGISTRY: VALIDATION FAILED");
         halt();

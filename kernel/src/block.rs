@@ -5,6 +5,7 @@ pub enum Error {
     OutOfBounds,
     InvalidBuffer,
     ReadOnly,
+    DeviceFault,
 }
 
 pub trait BlockDevice {

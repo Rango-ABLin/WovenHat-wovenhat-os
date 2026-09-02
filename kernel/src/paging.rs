@@ -192,7 +192,10 @@ fn user_flags(writable: bool, executable: bool) -> PageTableFlags {
 }
 
 fn page_range(start: u64, size: usize) -> Result<(Page<Size4KiB>, Page<Size4KiB>), MapRangeError> {
-    if size == 0 || start % Size4KiB::SIZE != 0 || size % Size4KiB::SIZE as usize != 0 {
+    if size == 0
+        || !start.is_multiple_of(Size4KiB::SIZE)
+        || !size.is_multiple_of(Size4KiB::SIZE as usize)
+    {
         return Err(MapRangeError::InvalidRange);
     }
     let size = u64::try_from(size).map_err(|_| MapRangeError::InvalidRange)?;
@@ -239,9 +242,7 @@ fn map_range_with_flags(
 
 pub fn kernel_address_space() -> Option<AddressSpace> {
     let paging = PAGING.lock();
-    if paging.mapper.is_none() {
-        return None;
-    }
+    paging.mapper.as_ref()?;
     PhysFrame::from_start_address(x86_64::PhysAddr::new(paging.level_4_frame))
         .ok()
         .map(|level_4_frame| AddressSpace { level_4_frame })
@@ -249,9 +250,7 @@ pub fn kernel_address_space() -> Option<AddressSpace> {
 
 pub fn create_user_address_space(user_address: u64) -> Option<AddressSpace> {
     let paging = PAGING.lock();
-    if paging.mapper.is_none() {
-        return None;
-    }
+    paging.mapper.as_ref()?;
     let root_frame = memory::allocate_frame()?;
     let kernel_table = page_table_at(paging.physical_memory_offset, paging.level_4_frame)?;
     let new_table = page_table_at_mut(

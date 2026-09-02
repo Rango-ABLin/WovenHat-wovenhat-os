@@ -94,7 +94,7 @@ pub fn count_kind(kind: DeviceKind) -> usize {
         .count()
 }
 
-pub fn self_test() -> bool {
+pub fn self_test(block_present: bool) -> bool {
     let mut scratch = Registry::new();
     let first = Device {
         name: "test-timer",
@@ -115,13 +115,15 @@ pub fn self_test() -> bool {
         && scratch.register(duplicate_name) == Err(RegisterError::DuplicateName)
         && scratch.register(duplicate_irq) == Err(RegisterError::DuplicateIrq);
 
+    let expected_count = if block_present { 5 } else { 4 };
     uniqueness_valid
-        && count() == 4
+        && count() == expected_count
         && count_kind(DeviceKind::Console) == 1
         && count_kind(DeviceKind::Serial) == 1
         && count_kind(DeviceKind::Timer) == 1
         && count_kind(DeviceKind::Keyboard) == 1
-        && count_kind(DeviceKind::Block) == 0
+        && count_kind(DeviceKind::Block) == usize::from(block_present)
+        && (block_present == find("ata0").is_some())
         && find("pit").is_some_and(|device| device.irq == Some(crate::timer::IRQ))
         && find("ps2-keyboard").is_some_and(|device| device.irq == Some(crate::keyboard::IRQ))
 }
