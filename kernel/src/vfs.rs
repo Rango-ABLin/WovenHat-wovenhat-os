@@ -1,19 +1,25 @@
-#[derive(Clone, Copy)]
+use spin::Mutex;
+
+const NODE_CAPACITY: usize = 256;
+
 struct Node {
     path: &'static str,
-    data: &'static [u8],
+    data: [u8; NODE_CAPACITY],
+    length: usize,
 }
 
-const NODES: &[Node] = &[
+static NODES: Mutex<[Node; 2]> = Mutex::new([
     Node {
         path: "/etc/motd",
-        data: b"Welcome to WovenHat OS.\n",
+        data: padded(b"Welcome to WovenHat OS.\n"),
+        length: 24,
     },
     Node {
         path: "/etc/version",
-        data: b"WovenHat kernel 0.0.7\n",
+        data: padded(b"WovenHat kernel 0.0.7\n"),
+        length: 22,
     },
-];
+]);
 
 #[derive(Clone, Copy)]
 pub struct OpenFile {
@@ -25,10 +31,12 @@ pub struct OpenFile {
 pub enum Error {
     NotFound,
     InvalidDescriptor,
+    Full,
 }
 
 pub fn open(path: &str) -> Result<OpenFile, Error> {
-    NODES
+    let nodes = NODES.lock();
+    nodes
         .iter()
         .position(|node| node.path == path)
         .map(|node| OpenFile { node, offset: 0 })
@@ -36,17 +44,43 @@ pub fn open(path: &str) -> Result<OpenFile, Error> {
 }
 
 pub fn read(file: &mut OpenFile, buffer: &mut [u8]) -> Result<usize, Error> {
-    let node = NODES.get(file.node).ok_or(Error::InvalidDescriptor)?;
-    let remaining = node
-        .data
-        .get(file.offset..)
-        .ok_or(Error::InvalidDescriptor)?;
-    let count = core::cmp::min(remaining.len(), buffer.len());
-    buffer[..count].copy_from_slice(&remaining[..count]);
+    let nodes = NODES.lock();
+    let node = nodes.get(file.node).ok_or(Error::InvalidDescriptor)?;
+    if file.offset > node.length {
+        return Err(Error::InvalidDescriptor);
+    }
+    let count = core::cmp::min(node.length - file.offset, buffer.len());
+    buffer[..count].copy_from_slice(&node.data[file.offset..file.offset + count]);
     file.offset += count;
     Ok(count)
 }
 
+pub fn write(file: &mut OpenFile, buffer: &[u8]) -> Result<usize, Error> {
+    let mut nodes = NODES.lock();
+    let node = nodes.get_mut(file.node).ok_or(Error::InvalidDescriptor)?;
+    if file.offset > node.length {
+        return Err(Error::InvalidDescriptor);
+    }
+    let count = core::cmp::min(buffer.len(), NODE_CAPACITY - file.offset);
+    node.data[file.offset..file.offset + count].copy_from_slice(&buffer[..count]);
+    file.offset += count;
+    node.length = core::cmp::max(node.length, file.offset);
+    if count < buffer.len() {
+        return Err(Error::Full);
+    }
+    Ok(count)
+}
+
 pub const fn node_count() -> usize {
-    NODES.len()
+    2
+}
+
+const fn padded(bytes: &[u8]) -> [u8; NODE_CAPACITY] {
+    let mut data = [0; NODE_CAPACITY];
+    let mut index = 0;
+    while index < bytes.len() {
+        data[index] = bytes[index];
+        index += 1;
+    }
+    data
 }

@@ -1,7 +1,7 @@
 use core::arch::asm;
 use core::fmt;
 
-use x86_64::registers::{control::Cr2, read_rip};
+use x86_64::registers::control::Cr2;
 
 use crate::serial;
 
@@ -94,7 +94,9 @@ impl PanicContext {
         }
         ctx.rsp = rsp;
 
-        ctx.rip = read_rip().as_u64();
+        unsafe {
+            asm!("lea {0}, [rip]", out(reg) ctx.rip, options(nomem, nostack, preserves_flags));
+        }
         ctx.rflags = x86_64::registers::rflags::read().bits();
         ctx.cr2 = Cr2::read().as_u64();
 

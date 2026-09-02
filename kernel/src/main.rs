@@ -8,6 +8,7 @@ extern crate alloc;
 mod capability;
 mod console;
 mod gdt;
+mod hal;
 mod heap;
 mod interrupts;
 mod keyboard;
@@ -21,6 +22,7 @@ mod syscall;
 mod task;
 mod timer;
 mod userspace;
+mod vfs;
 
 use bootloader_api::{
     BootInfo, BootloaderConfig,
@@ -113,6 +115,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     serial::init();
+
+    let hardware = hal::init();
+    let vendor = match hardware.cpu_vendor {
+        hal::CpuVendor::Intel => "INTEL",
+        hal::CpuVendor::Amd => "AMD",
+        hal::CpuVendor::Unknown => "UNKNOWN",
+    };
+    serial::write_fmt(format_args!(
+        "HARDWARE: CPU={} LOGICAL_CPUS={} TSC={} RDRAND={} AES_NI={} AVX={} PAE={} SSE4.2={}\n",
+        vendor,
+        hardware.logical_cpus,
+        hardware.cpu_features.has_tsc as u8,
+        hardware.cpu_features.has_rdrand as u8,
+        hardware.cpu_features.has_aes_ni as u8,
+        hardware.cpu_features.has_avx as u8,
+        hardware.cpu_features.has_pae as u8,
+        hardware.cpu_features.has_sse4_2 as u8,
+    ));
 
     if heap::init().is_err() {
         console.println("KERNEL HEAP: INITIALIZATION FAILED");

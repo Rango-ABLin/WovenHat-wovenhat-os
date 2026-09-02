@@ -756,6 +756,26 @@ pub fn read_current(descriptor: u64, buffer: &mut [u8]) -> Result<usize, FileErr
     vfs::read(file, buffer).map_err(|_| FileError::BadDescriptor)
 }
 
+pub fn write_current(descriptor: u64, buffer: &[u8]) -> Result<usize, FileError> {
+    if !current_has(Capability::FileWrite) {
+        return Err(FileError::PermissionDenied);
+    }
+    let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    let file = process
+        .files
+        .get_mut(descriptor)
+        .and_then(Option::as_mut)
+        .ok_or(FileError::BadDescriptor)?;
+    vfs::write(file, buffer).map_err(|_| FileError::BadDescriptor)
+}
+
 pub fn close_current(descriptor: u64) -> Result<(), FileError> {
     let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
     let task_id = current_task_id();

@@ -9,6 +9,7 @@ pub enum Capability {
     InterruptControl = 5,
     MemoryInspect = 6,
     FileRead = 7,
+    FileWrite = 8,
 }
 
 #[derive(Clone, Copy)]
@@ -31,6 +32,7 @@ impl CapabilitySet {
             .with(Capability::InterruptControl)
             .with(Capability::MemoryInspect)
             .with(Capability::FileRead)
+            .with(Capability::FileWrite)
     }
 
     pub const fn userspace() -> Self {

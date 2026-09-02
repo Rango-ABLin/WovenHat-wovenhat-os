@@ -58,6 +58,7 @@ const IO_READ: u64 = 1 << 2;
 const IO_CLOSE: u64 = 1 << 3;
 const IO_MMAP: u64 = 1 << 4;
 const IO_MUNMAP: u64 = 1 << 5;
+const IO_FILE_WRITE: u64 = 1 << 6;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Number {
@@ -71,6 +72,7 @@ pub enum Number {
     Yield = 7,
     Mmap = 8,
     Munmap = 9,
+    FileWrite = 10,
 }
 
 pub fn entry_address() -> u64 {
@@ -212,6 +214,26 @@ fn sys_read(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
     count as u64
 }
 
+fn sys_file_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length > MAX_IO_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut buffer = [0_u8; MAX_IO_SIZE];
+    if crate::paging::copy_from_current_user(user_buffer, &mut buffer[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    match crate::task::write_current(descriptor, &buffer[..length]) {
+        Ok(count) => {
+            IO_COMPLETIONS.fetch_or(IO_FILE_WRITE, Ordering::Release);
+            count as u64
+        }
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
 fn sys_close(descriptor: u64) -> u64 {
     match crate::task::close_current(descriptor) {
         Ok(()) => {
@@ -227,6 +249,7 @@ pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, a
         value if value == Number::Mmap as u64 => sys_mmap(arg0, arg1),
         value if value == Number::Munmap as u64 => sys_munmap(arg0, arg1),
         value if value == Number::Read as u64 => sys_read(arg0, arg1, arg2),
+        value if value == Number::FileWrite as u64 => sys_file_write(arg0, arg1, arg2),
         value if value == Number::Write as u64 => sys_write(arg0, arg1, arg2),
         value if value == Number::Open as u64 => sys_open(arg0, arg1),
         value if value == Number::Close as u64 => sys_close(arg0),
