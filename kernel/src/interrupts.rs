@@ -1,10 +1,14 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use spin::Once;
 
 use x86_64::{
     registers::control::Cr2,
     structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
+    PrivilegeLevel, VirtAddr,
 };
 
 use crate::{gdt, keyboard, pic, serial, syscall, task, timer};
@@ -30,7 +34,13 @@ pub fn init() {
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
-        idt[0x80].set_handler_fn(syscall_handler);
+        // SAFETY: The assembly entry preserves all GPRs, calls the Rust
+        // dispatcher with a SysV-aligned stack, and returns through iretq.
+        unsafe {
+            idt[0x80]
+                .set_handler_addr(VirtAddr::new(syscall::entry_address()))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
         idt[pic::MASTER_OFFSET + timer::IRQ].set_handler_fn(timer_interrupt_handler);
         idt[pic::MASTER_OFFSET + keyboard::IRQ].set_handler_fn(keyboard_interrupt_handler);
 
@@ -61,6 +71,45 @@ fn dump_exception_context(label: &str, stack_frame: &InterruptStackFrame, error_
         stack_frame.cpu_flags,
         stack_frame.stack_pointer.as_u64(),
         stack_frame.stack_segment.0,
+    ));
+    dump_cpu_state();
+}
+
+pub fn dump_cpu_state() {
+    let cr0: u64;
+    let cr2: u64;
+    let cr3: u64;
+    let cr4: u64;
+    let rsp: u64;
+    let rbp: u64;
+    let rflags: u64;
+
+    // SAFETY: Reading control registers and the current stack/frame pointers
+    // has no side effects and is valid while executing in ring 0.
+    unsafe {
+        asm!(
+            "mov {cr0}, cr0",
+            "mov {cr2}, cr2",
+            "mov {cr3}, cr3",
+            "mov {cr4}, cr4",
+            "mov {rsp}, rsp",
+            "mov {rbp}, rbp",
+            "pushfq",
+            "pop {rflags}",
+            cr0 = out(reg) cr0,
+            cr2 = out(reg) cr2,
+            cr3 = out(reg) cr3,
+            cr4 = out(reg) cr4,
+            rsp = out(reg) rsp,
+            rbp = out(reg) rbp,
+            rflags = out(reg) rflags,
+            options(preserves_flags),
+        );
+    }
+
+    serial::write_fmt(format_args!(
+        "CPU: CR0={cr0:#x} CR2={cr2:#x} CR3={cr3:#x} CR4={cr4:#x}\nSTACK: RSP={rsp:#x} RBP={rbp:#x} RFLAGS={rflags:#x}\nTICKS: {}\n",
+        timer::ticks(),
     ));
 }
 
@@ -101,7 +150,14 @@ extern "x86-interrupt" fn page_fault_handler(
     } else {
         serial::write_fmt(format_args!("FAULT ADDRESS: UNAVAILABLE\n"));
     }
-    serial::write_fmt(format_args!("PAGE FAULT DETAILS: {error_code:?}\n"));
+    serial::write_fmt(format_args!(
+        "PAGE FAULT DETAILS: PRESENT={} WRITE={} USER={} RESERVED={} INSTRUCTION_FETCH={}\n",
+        error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
+        error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+        error_code.contains(PageFaultErrorCode::USER_MODE),
+        error_code.contains(PageFaultErrorCode::MALFORMED_TABLE),
+        error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
+    ));
     halt();
 }
 
@@ -109,10 +165,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     timer::record_tick();
     task::tick();
     pic::notify_end_of_interrupt(timer::IRQ);
-}
-
-extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame) {
-    syscall::handle_interrupt();
+    task::preempt_from_interrupt();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

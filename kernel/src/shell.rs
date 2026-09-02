@@ -96,6 +96,8 @@ impl Shell {
                 let summary = task::summary();
                 console.print("TASKS: ");
                 print_u64(console, summary.task_count as u64);
+                console.print(" PROCESSES: ");
+                print_u64(console, task::process_count() as u64);
                 console.print(" READY: ");
                 print_u64(console, summary.ready_tasks as u64);
                 console.print(" BLOCKED: ");
@@ -110,6 +112,8 @@ impl Shell {
                 print_u64(console, summary.current_priority as u64);
                 console.print(" SWITCHES: ");
                 print_u64(console, summary.context_switches);
+                console.print(" PREEMPTIONS: ");
+                print_u64(console, summary.preemption_switches);
                 console.print(" IDLE: ");
                 print_u64(console, summary.idle_heartbeats);
                 console.newline();
@@ -165,14 +169,10 @@ impl Shell {
                     self.finish(console);
                     return;
                 }
-
-                let stats = vfs::stats();
                 console.print("VFS NODES: ");
-                print_u64(console, stats.nodes as u64);
-                console.print(" OPEN: ");
-                print_u64(console, stats.open_files as u64);
-                console.print(" CAPACITY: ");
-                print_u64(console, stats.capacity as u64);
+                print_u64(console, vfs::node_count() as u64);
+                console.print(" PROCESS OPEN FILES: ");
+                print_u64(console, task::open_file_count() as u64);
                 console.newline();
             }
             "cat" => {
@@ -180,21 +180,19 @@ impl Shell {
                     self.finish(console);
                     return;
                 }
-
-                let Ok(file) = vfs::open("/etc/motd") else {
+                let Ok(mut file) = vfs::open("/etc/motd") else {
                     console.println("VFS OPEN FAILED");
                     self.finish(console);
                     return;
                 };
                 let mut buffer = [0_u8; 64];
-                match vfs::read(file, &mut buffer) {
-                    Ok(length) => {
-                        let text = core::str::from_utf8(&buffer[..length]).unwrap_or("INVALID UTF-8");
-                        console.print(text);
-                    }
+                match vfs::read(&mut file, &mut buffer) {
+                    Ok(length) => match core::str::from_utf8(&buffer[..length]) {
+                        Ok(text) => console.print(text),
+                        Err(_) => console.println("VFS DATA IS NOT UTF-8"),
+                    },
                     Err(_) => console.println("VFS READ FAILED"),
                 }
-                let _ = vfs::close(file);
             }
             "spawn" => {
                 if !authorize(Capability::TaskControl, console) {
@@ -226,58 +224,29 @@ impl Shell {
                     console.println("SYSCALL HANDLER: FAILED");
                 }
             }
-            "user" => {
+            "user" | "ring3" => {
                 if !authorize(Capability::TaskControl, console) {
                     self.finish(console);
                     return;
                 }
 
-                let entry = task::user_stub_entry as *const () as usize;
-                let stack_top = 0x2000000usize;
-                match task::register_user_launch("usermode", entry, stack_top) {
+                let Some(program) = userspace::create_stub_process() else {
+                    console.println("USER IMAGE MAPPING FAILED");
+                    self.finish(console);
+                    return;
+                };
+
+                match task::spawn_user_process("usermode", program) {
                     Ok((id, context)) => {
-                        console.print("USER TASK REGISTERED: ");
+                        console.print("USER PROCESS SCHEDULED: PID=");
                         print_u64(console, id.as_u64());
-                        console.print(" ENTRY: ");
+                        console.print(" ENTRY=");
                         print_hex_u64(console, context.entry);
-                        console.print(" STACK: ");
+                        console.print(" STACK=");
                         print_hex_u64(console, context.stack_top);
-                        console.print(" CS: ");
-                        print_hex_u64(console, context.code_segment as u64);
-                        console.print(" SS: ");
-                        print_hex_u64(console, context.data_segment as u64);
                         console.newline();
                     }
-                    Err(_) => {
-                        console.println("USER TASK REGISTRATION FAILED: PROCESS TABLE FULL");
-                    }
-                }
-            }
-            "ring3" => {
-                if !authorize(Capability::TaskControl, console) {
-                    self.finish(console);
-                    return;
-                }
-
-                console.println("ALLOCATING USER STACK...");
-                if let Some(user_stack) = userspace::allocate_user_stack() {
-                    console.print("USER STACK ALLOCATED: BASE=");
-                    print_hex_u64(console, user_stack.base);
-                    console.print(" TOP=");
-                    print_hex_u64(console, user_stack.top);
-                    console.newline();
-                    
-                    unsafe {
-                        let entry = userspace::wovenhat_user_stub as *const () as usize;
-                        console.print("USER ENTRY POINT: ");
-                        print_hex_u64(console, entry as u64);
-                        console.newline();
-                        
-                        console.println("INITIATING RING-3 TRANSITION...");
-                        task::enter_user_mode(entry, user_stack.top as usize);
-                    }
-                } else {
-                    console.println("USER STACK ALLOCATION FAILED: HEAP FULL");
+                    Err(_) => console.println("USER PROCESS SPAWN FAILED: CAPACITY EXHAUSTED"),
                 }
             }
             "paging" => {
@@ -320,7 +289,7 @@ impl Shell {
 
 fn demo_task() -> ! {
     loop {
-        task::yield_now();
+        core::hint::spin_loop();
     }
 }
 

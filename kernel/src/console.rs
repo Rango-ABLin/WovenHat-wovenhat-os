@@ -48,12 +48,6 @@ impl<'a> Console<'a> {
         self.cursor_y = 40;
     }
 
-    pub fn set_cursor(&mut self, x: usize, y: usize) {
-        self.cursor_x = x;
-        self.cursor_y = y;
-        self.start_x = x;
-    }
-
     pub fn print(&mut self, text: &str) {
         for c in text.chars() {
             self.put_char(c);
@@ -71,11 +65,7 @@ impl<'a> Console<'a> {
             return;
         }
 
-        self.draw_char(
-            self.cursor_x,
-            self.cursor_y,
-            character,
-        );
+        self.draw_char(self.cursor_x, self.cursor_y, character);
 
         self.cursor_x += 6 * self.scale;
 
@@ -108,12 +98,7 @@ impl<'a> Console<'a> {
         }
     }
 
-    fn draw_char(
-        &mut self,
-        x: usize,
-        y: usize,
-        character: char,
-    ) {
+    fn draw_char(&mut self, x: usize, y: usize, character: char) {
         let glyph = glyph(character);
 
         for (row, bits) in glyph.iter().enumerate() {
@@ -135,20 +120,12 @@ impl<'a> Console<'a> {
         }
     }
 
-    fn pixel(
-        &mut self,
-        x: usize,
-        y: usize,
-        r: u8,
-        g: u8,
-        b: u8,
-    ) {
+    fn pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
         if x >= self.info.width || y >= self.info.height {
             return;
         }
 
-        let offset =
-            (y * self.info.stride + x) * self.info.bytes_per_pixel;
+        let offset = (y * self.info.stride + x) * self.info.bytes_per_pixel;
 
         if offset + self.info.bytes_per_pixel > self.buffer.len() {
             return;

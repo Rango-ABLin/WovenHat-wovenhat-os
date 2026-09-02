@@ -8,6 +8,7 @@ pub enum Capability {
     DeviceIo = 4,
     InterruptControl = 5,
     MemoryInspect = 6,
+    FileRead = 7,
 }
 
 #[derive(Clone, Copy)]
@@ -29,6 +30,13 @@ impl CapabilitySet {
             .with(Capability::DeviceIo)
             .with(Capability::InterruptControl)
             .with(Capability::MemoryInspect)
+            .with(Capability::FileRead)
+    }
+
+    pub const fn userspace() -> Self {
+        Self::empty()
+            .with(Capability::Console)
+            .with(Capability::FileRead)
     }
 
     pub const fn with(self, capability: Capability) -> Self {

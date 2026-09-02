@@ -1,31 +1,93 @@
+use core::arch::global_asm;
+
+use crate::paging;
+
+const USER_REGION_START: u64 = 0x0000_4000_0000_0000;
+const USER_STACK_OFFSET: u64 = 0x1f_0000;
+const USER_CODE_SIZE: usize = 4096;
+
+global_asm!(
+    ".section .rodata.wovenhat_user_stub, \"a\"",
+    ".global wovenhat_user_program_start",
+    ".global wovenhat_user_program_end",
+    "wovenhat_user_program_start:",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + wovenhat_user_message]",
+    "mov edx, 27",
+    "int 0x80",
+    "mov eax, 2",
+    "lea rdi, [rip + wovenhat_user_path]",
+    "mov esi, 9",
+    "int 0x80",
+    "mov r12, rax",
+    "mov eax, 0",
+    "mov rdi, r12",
+    "mov rsi, 0x4000001f0000",
+    "mov edx, 64",
+    "int 0x80",
+    "mov r13, rax",
+    "mov eax, 1",
+    "mov edi, 1",
+    "mov rsi, 0x4000001f0000",
+    "mov rdx, r13",
+    "int 0x80",
+    "mov eax, 6",
+    "mov rdi, r12",
+    "int 0x80",
+    "mov eax, 8",
+    "mov edi, 4096",
+    "mov esi, 1",
+    "int 0x80",
+    "mov r14, rax",
+    "mov r15, 0x574f56454e484154",
+    "mov [r14], r15",
+    "cmp [r14], r15",
+    "jne wovenhat_user_failure",
+    "mov eax, 9",
+    "mov rdi, r14",
+    "mov esi, 4096",
+    "int 0x80",
+    "test rax, rax",
+    "jne wovenhat_user_failure",
+    "mov eax, 4",
+    "int 0x80",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "wovenhat_user_failure:",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
+    "2:",
+    "jmp 2b",
+    "wovenhat_user_message:",
+    ".ascii \"[USER] syscall I/O online!\\n\"",
+    "wovenhat_user_path:",
+    ".ascii \"/etc/motd\"",
+    "wovenhat_user_program_end:",
+    ".previous",
+);
+
+unsafe extern "C" {
+    static wovenhat_user_program_start: u8;
+    static wovenhat_user_program_end: u8;
+}
 #[derive(Clone, Copy, Debug)]
 pub struct UserImage {
-    pub magic: [u8; 4],
-    pub class: u8,
-    pub endian: u8,
-    pub version: u8,
     pub entry: u64,
     pub stack_top: u64,
     pub image_size: u64,
+    pub load_segments: usize,
 }
 
 impl UserImage {
-    pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-
-    pub const fn new(entry: u64, stack_top: u64) -> Self {
-        Self {
-            magic: Self::ELF_MAGIC,
-            class: 2,
-            endian: 1,
-            version: 1,
-            entry,
-            stack_top,
-            image_size: 4096,
-        }
-    }
-
     pub fn is_valid(self) -> bool {
-        self.magic == Self::ELF_MAGIC && self.class == 2 && self.endian == 1 && self.version == 1
+        self.entry >= USER_REGION_START
+            && self.stack_top != 0
+            && self.stack_top % 16 == 0
+            && self.image_size != 0
+            && self.load_segments != 0
     }
 }
 
@@ -52,29 +114,290 @@ impl UserStack {
     }
 }
 
-pub fn allocate_user_stack() -> Option<UserStack> {
-    let layout = core::alloc::Layout::from_size_align(UserStack::SIZE, 16).ok()?;
-    let ptr = unsafe { alloc::alloc::alloc(layout) };
-    if ptr.is_null() {
+const MAX_ELF_SEGMENTS: usize = 4;
+pub const MAX_ANONYMOUS_MAPPINGS: usize = 8;
+const USER_MMAP_START: u64 = USER_REGION_START + 0x10_0000;
+const USER_MMAP_STRIDE: u64 = 0x10_000;
+const USER_MMAP_MAX_SIZE: usize = USER_MMAP_STRIDE as usize;
+
+#[derive(Clone, Copy)]
+pub struct AnonymousMapping {
+    pub address: u64,
+    pub size: usize,
+}
+#[derive(Clone, Copy)]
+struct UserMapping {
+    start: u64,
+    size: usize,
+}
+
+impl UserMapping {
+    const EMPTY: Self = Self { start: 0, size: 0 };
+}
+
+#[derive(Clone, Copy)]
+pub struct AddressSpace {
+    paging: paging::AddressSpace,
+    stack_base: u64,
+    mappings: [UserMapping; MAX_ELF_SEGMENTS],
+    mapping_count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct UserProgram {
+    pub image: UserImage,
+    pub stack: UserStack,
+    pub address_space: AddressSpace,
+}
+
+pub fn elf_loader_self_test() -> bool {
+    let stub = unsafe {
+        let start = &wovenhat_user_program_start as *const u8;
+        let end = &wovenhat_user_program_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    let Some(valid) = build_stub_elf(stub) else {
+        return false;
+    };
+    let Ok(image) = crate::elf::parse(&valid) else {
+        return false;
+    };
+    let valid_segment = image.segment_count() == 1
+        && image.entry == USER_REGION_START
+        && image
+            .segments()
+            .next()
+            .is_some_and(|segment| segment.memory_size == USER_CODE_SIZE && segment.executable);
+
+    let mut bad_magic = valid.clone();
+    bad_magic[0] = 0;
+    let mut writable_executable = valid;
+    writable_executable[68] = 7;
+    valid_segment
+        && crate::elf::parse(&bad_magic).is_err()
+        && crate::elf::parse(&writable_executable).is_err()
+}
+pub fn create_stub_process() -> Option<UserProgram> {
+    let stub = unsafe {
+        let start = &wovenhat_user_program_start as *const u8;
+        let end = &wovenhat_user_program_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    let elf = build_stub_elf(stub)?;
+    load_elf(&elf)
+}
+
+fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
+    let image = crate::elf::parse(bytes).ok()?;
+    let page_table = paging::create_user_address_space(image.entry)?;
+    let mut mappings = [UserMapping::EMPTY; MAX_ELF_SEGMENTS];
+    let mut mapping_count = 0;
+
+    let stack_base = USER_REGION_START.checked_add(USER_STACK_OFFSET)?;
+    for segment in image.segments() {
+        let mapping_end = segment
+            .mapping_start
+            .checked_add(segment.mapping_size as u64)?;
+        if segment.mapping_start < USER_REGION_START || mapping_end > stack_base {
+            release_partial(page_table, &mappings[..mapping_count]);
+            return None;
+        }
+        if mapping_count == mappings.len()
+            || paging::map_user_range_in(
+                page_table,
+                segment.mapping_start,
+                segment.mapping_size,
+                true,
+                false,
+            )
+            .is_err()
+        {
+            release_partial(page_table, &mappings[..mapping_count]);
+            return None;
+        }
+        mappings[mapping_count] = UserMapping {
+            start: segment.mapping_start,
+            size: segment.mapping_size,
+        };
+        mapping_count += 1;
+
+        let file_end = segment.file_offset.checked_add(segment.file_size)?;
+        let memory_end = segment
+            .virtual_address
+            .checked_add(segment.memory_size as u64)?;
+        if memory_end
+            > segment
+                .mapping_start
+                .checked_add(segment.mapping_size as u64)?
+            || paging::zero_user_range_in(page_table, segment.mapping_start, segment.mapping_size)
+                .is_err()
+            || paging::write_user_bytes(
+                page_table,
+                segment.virtual_address,
+                bytes.get(segment.file_offset..file_end)?,
+            )
+            .is_err()
+            || paging::protect_user_range_in(
+                page_table,
+                segment.mapping_start,
+                segment.mapping_size,
+                segment.writable,
+                segment.executable,
+            )
+            .is_err()
+        {
+            release_partial(page_table, &mappings[..mapping_count]);
+            return None;
+        }
+    }
+
+    if paging::map_user_range_in(page_table, stack_base, UserStack::SIZE, true, false).is_err() {
+        release_partial(page_table, &mappings[..mapping_count]);
         return None;
     }
-    let base = ptr as u64;
-    Some(UserStack::new(base))
+    if paging::zero_user_range_in(page_table, stack_base, UserStack::SIZE).is_err() {
+        release_with_stack(page_table, stack_base, &mappings[..mapping_count]);
+        return None;
+    }
+
+    let stack = UserStack::new(stack_base);
+    Some(UserProgram {
+        image: UserImage {
+            entry: image.entry,
+            stack_top: stack.top,
+            image_size: bytes.len() as u64,
+            load_segments: image.segment_count(),
+        },
+        stack,
+        address_space: AddressSpace {
+            paging: page_table,
+            stack_base,
+            mappings,
+            mapping_count,
+        },
+    })
 }
 
-pub fn stub_program(entry: usize, stack_top: usize) -> UserImage {
-    UserImage::new(entry as u64, stack_top as u64)
+fn release_with_stack(page_table: paging::AddressSpace, stack_base: u64, mappings: &[UserMapping]) {
+    let mut ranges = [(0, 0); MAX_ELF_SEGMENTS + 1];
+    ranges[0] = (stack_base, UserStack::SIZE);
+    for (range, mapping) in ranges[1..].iter_mut().zip(mappings) {
+        *range = (mapping.start, mapping.size);
+    }
+    let _ = paging::destroy_user_address_space(page_table, &ranges[..mappings.len() + 1]);
+}
+fn release_partial(page_table: paging::AddressSpace, mappings: &[UserMapping]) {
+    if mappings.is_empty() {
+        let _ = paging::discard_empty_user_address_space(page_table);
+        return;
+    }
+    let mut ranges = [(0, 0); MAX_ELF_SEGMENTS];
+    for (range, mapping) in ranges.iter_mut().zip(mappings) {
+        *range = (mapping.start, mapping.size);
+    }
+    let _ = paging::destroy_user_address_space(page_table, &ranges[..mappings.len()]);
 }
 
-pub fn validate_stub(entry: usize, stack_top: usize) -> bool {
-    stub_program(entry, stack_top).is_valid()
+pub fn map_anonymous(
+    address_space: AddressSpace,
+    slot: usize,
+    size: usize,
+    writable: bool,
+) -> Option<AnonymousMapping> {
+    if slot >= MAX_ANONYMOUS_MAPPINGS || size == 0 || size > USER_MMAP_MAX_SIZE || size % 4096 != 0
+    {
+        return None;
+    }
+    let address = USER_MMAP_START.checked_add((slot as u64).checked_mul(USER_MMAP_STRIDE)?)?;
+    if paging::map_user_range_in(address_space.paging, address, size, writable, false).is_err() {
+        return None;
+    }
+    if paging::zero_user_range_in(address_space.paging, address, size).is_err() {
+        let _ = paging::unmap_user_range_in(address_space.paging, address, size);
+        return None;
+    }
+    Some(AnonymousMapping { address, size })
 }
 
-pub fn describe(entry: usize, stack_top: usize) -> (u64, u64, u64) {
-    let image = stub_program(entry, stack_top);
-    (image.entry, image.stack_top, image.image_size)
+pub fn unmap_anonymous(address_space: AddressSpace, mapping: AnonymousMapping) -> bool {
+    paging::unmap_user_range_in(address_space.paging, mapping.address, mapping.size).is_ok()
+}
+pub fn destroy(address_space: AddressSpace) -> bool {
+    let mut ranges = [(0, 0); MAX_ELF_SEGMENTS + 1];
+    ranges[0] = (address_space.stack_base, UserStack::SIZE);
+    for (range, mapping) in ranges[1..]
+        .iter_mut()
+        .zip(&address_space.mappings[..address_space.mapping_count])
+    {
+        *range = (mapping.start, mapping.size);
+    }
+    paging::destroy_user_address_space(
+        address_space.paging,
+        &ranges[..address_space.mapping_count + 1],
+    )
+    .is_ok()
 }
 
-unsafe extern "C" {
-    pub fn wovenhat_user_stub() -> !;
+impl AddressSpace {
+    pub fn paging(self) -> paging::AddressSpace {
+        self.paging
+    }
+
+    pub fn root_address(self) -> u64 {
+        self.paging.root_address()
+    }
+}
+
+fn build_stub_elf(stub: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    const PAYLOAD_OFFSET: usize = 4096;
+    const PROGRAM_HEADER_OFFSET: usize = 64;
+    let total_size = PAYLOAD_OFFSET.checked_add(stub.len())?;
+    let mut bytes = alloc::vec![0_u8; total_size];
+    bytes[..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    write_u16(&mut bytes, 16, 2)?;
+    write_u16(&mut bytes, 18, 0x3e)?;
+    write_u32(&mut bytes, 20, 1)?;
+    write_u64(&mut bytes, 24, USER_REGION_START)?;
+    write_u64(&mut bytes, 32, PROGRAM_HEADER_OFFSET as u64)?;
+    write_u16(&mut bytes, 52, 64)?;
+    write_u16(&mut bytes, 54, 56)?;
+    write_u16(&mut bytes, 56, 1)?;
+
+    write_u32(&mut bytes, PROGRAM_HEADER_OFFSET, 1)?;
+    write_u32(&mut bytes, PROGRAM_HEADER_OFFSET + 4, 5)?;
+    write_u64(&mut bytes, PROGRAM_HEADER_OFFSET + 8, PAYLOAD_OFFSET as u64)?;
+    write_u64(&mut bytes, PROGRAM_HEADER_OFFSET + 16, USER_REGION_START)?;
+    write_u64(&mut bytes, PROGRAM_HEADER_OFFSET + 32, stub.len() as u64)?;
+    write_u64(
+        &mut bytes,
+        PROGRAM_HEADER_OFFSET + 40,
+        USER_CODE_SIZE as u64,
+    )?;
+    write_u64(&mut bytes, PROGRAM_HEADER_OFFSET + 48, 4096)?;
+    bytes[PAYLOAD_OFFSET..].copy_from_slice(stub);
+    Some(bytes)
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Option<()> {
+    bytes
+        .get_mut(offset..offset + 2)?
+        .copy_from_slice(&value.to_le_bytes());
+    Some(())
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Option<()> {
+    bytes
+        .get_mut(offset..offset + 4)?
+        .copy_from_slice(&value.to_le_bytes());
+    Some(())
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> Option<()> {
+    bytes
+        .get_mut(offset..offset + 8)?
+        .copy_from_slice(&value.to_le_bytes());
+    Some(())
 }

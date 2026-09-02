@@ -2,20 +2,21 @@ use core::cell::UnsafeCell;
 
 use spin::Once;
 use x86_64::{
-    VirtAddr,
     instructions::{
-        segmentation::{CS, DS, ES, SS, Segment},
+        segmentation::{Segment, CS, DS, ES, SS},
         tables::load_tss,
     },
     structures::{
         gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector},
         tss::TaskStateSegment,
     },
+    VirtAddr,
 };
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
+const PRIVILEGE_STACK_SIZE: usize = 4096 * 8;
 
 #[repr(align(16))]
 struct KernelStack(UnsafeCell<[u8; DOUBLE_FAULT_STACK_SIZE]>);
@@ -25,6 +26,15 @@ struct KernelStack(UnsafeCell<[u8; DOUBLE_FAULT_STACK_SIZE]>);
 unsafe impl Sync for KernelStack {}
 
 static DOUBLE_FAULT_STACK: KernelStack = KernelStack(UnsafeCell::new([0; DOUBLE_FAULT_STACK_SIZE]));
+
+#[repr(align(16))]
+struct PrivilegeStack(UnsafeCell<[u8; PRIVILEGE_STACK_SIZE]>);
+
+// SAFETY: The bootstrap kernel is single-core, and this stack is exclusively
+// selected by the CPU for privilege transitions through the TSS.
+unsafe impl Sync for PrivilegeStack {}
+
+static PRIVILEGE_STACK: PrivilegeStack = PrivilegeStack(UnsafeCell::new([0; PRIVILEGE_STACK_SIZE]));
 static TSS: Once<TaskStateSegment> = Once::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
@@ -42,6 +52,9 @@ pub fn init() {
         let stack_start = VirtAddr::from_ptr(DOUBLE_FAULT_STACK.0.get());
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             stack_start + DOUBLE_FAULT_STACK_SIZE as u64;
+
+        let privilege_stack_start = VirtAddr::from_ptr(PRIVILEGE_STACK.0.get());
+        tss.privilege_stack_table[0] = privilege_stack_start + PRIVILEGE_STACK_SIZE as u64;
         tss
     });
 

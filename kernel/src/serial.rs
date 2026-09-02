@@ -22,6 +22,20 @@ pub fn write_fmt(arguments: fmt::Arguments<'_>) {
     let _ = SerialPort.write_fmt(arguments);
 }
 
+pub fn write_line(arguments: fmt::Arguments<'_>) {
+    let _ = SerialPort.write_fmt(arguments);
+    let _ = SerialPort.write_str("\n");
+}
+
+pub fn write_bytes(bytes: &[u8]) {
+    let mut port = SerialPort;
+    for &byte in bytes {
+        if byte == b'\n' {
+            port.write_byte(b'\r');
+        }
+        port.write_byte(byte);
+    }
+}
 struct SerialPort;
 
 impl Write for SerialPort {

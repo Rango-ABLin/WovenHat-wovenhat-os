@@ -7,8 +7,7 @@ fn main() {
             .expect("WovenHat kernel artifact not found"),
     );
 
-    let out_dir =
-        PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
 
     let uefi_path = out_dir.join("wovenhat-os-uefi.img");
 

@@ -1,12 +1,13 @@
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use spin::{Mutex, MutexGuard};
 use x86_64::{
-    PhysAddr,
     structures::paging::{FrameAllocator, PageSize, PhysFrame, Size4KiB},
+    PhysAddr,
 };
 
 const FRAME_SIZE: u64 = Size4KiB::SIZE;
 const MAX_USABLE_REGIONS: usize = 128;
+const MAX_RECLAIMED_FRAMES: usize = 1024;
 
 static ALLOCATOR: Mutex<PhysicalFrameAllocator> = Mutex::new(PhysicalFrameAllocator::empty());
 
@@ -48,6 +49,8 @@ pub(crate) struct PhysicalFrameAllocator {
     current_range: usize,
     total_frames: u64,
     allocated_frames: u64,
+    reclaimed_frames: [u64; MAX_RECLAIMED_FRAMES],
+    reclaimed_count: usize,
     initialized: bool,
 }
 
@@ -59,6 +62,8 @@ impl PhysicalFrameAllocator {
             current_range: 0,
             total_frames: 0,
             allocated_frames: 0,
+            reclaimed_frames: [0; MAX_RECLAIMED_FRAMES],
+            reclaimed_count: 0,
             initialized: false,
         }
     }
@@ -119,6 +124,22 @@ impl PhysicalFrameAllocator {
             .iter()
             .any(|range| address >= range.start && address < range.end)
     }
+
+    fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) -> bool {
+        let address = frame.start_address().as_u64();
+        if !self.contains(frame)
+            || self.allocated_frames == 0
+            || self.reclaimed_count == self.reclaimed_frames.len()
+            || self.reclaimed_frames[..self.reclaimed_count].contains(&address)
+        {
+            return false;
+        }
+
+        self.reclaimed_frames[self.reclaimed_count] = address;
+        self.reclaimed_count += 1;
+        self.allocated_frames -= 1;
+        true
+    }
 }
 
 // SAFETY: The allocator returns each fully usable 4 KiB frame at most once.
@@ -128,6 +149,13 @@ unsafe impl FrameAllocator<Size4KiB> for PhysicalFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         if !self.initialized {
             return None;
+        }
+
+        if self.reclaimed_count != 0 {
+            self.reclaimed_count -= 1;
+            let address = self.reclaimed_frames[self.reclaimed_count];
+            self.allocated_frames += 1;
+            return PhysFrame::from_start_address(PhysAddr::new(address)).ok();
         }
 
         while self.current_range < self.range_count {
@@ -152,6 +180,10 @@ pub fn init(regions: &[MemoryRegion]) -> Result<(), InitError> {
 
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
     ALLOCATOR.lock().allocate_frame()
+}
+
+pub fn deallocate_frame(frame: PhysFrame<Size4KiB>) -> bool {
+    ALLOCATOR.lock().deallocate_frame(frame)
 }
 
 pub(crate) fn allocator() -> MutexGuard<'static, PhysicalFrameAllocator> {

@@ -8,23 +8,24 @@ use spin::Mutex;
 
 use crate::{
     capability::{Capability, CapabilitySet},
-    gdt,
-    userspace,
+    gdt, paging, timer, userspace, vfs,
 };
 
-const MAX_TASKS: usize = 4;
+const MAX_TASKS: usize = 8;
 const MAX_PROCESSES: usize = 8;
+const MAX_FILE_DESCRIPTORS: usize = 8;
 const TASK_STACK_SIZE: usize = 4096 * 2;
 const KERNEL_TASK_ID: TaskId = TaskId(0);
 const IDLE_TASK_ID: TaskId = TaskId(1);
 
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::empty());
-static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([const { None }; MAX_PROCESSES]);
+static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> =
+    Mutex::new([const { None }; MAX_PROCESSES]);
 static IDLE_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(2);
 static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
-static PREEMPTION_TICKS: AtomicU64 = AtomicU64::new(0);
 static PREEMPTION_REQUESTED: AtomicBool = AtomicBool::new(false);
+static PREEMPTION_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static TASK_STACKS: [TaskStack; MAX_TASKS] = [const { TaskStack::new() }; MAX_TASKS];
 
 global_asm!(
@@ -51,13 +52,8 @@ global_asm!(
     ".global wovenhat_enter_user_mode",
     "wovenhat_enter_user_mode:",
     "cli",
-    "mov ax, cx",
-    "mov ds, ax",
-    "mov es, ax",
-    "mov fs, ax",
-    "mov gs, ax",
-    "mov ss, ax",
-    "mov rsp, rsi",
+    "movzx ecx, cx",
+    "movzx edx, dx",
     "push rcx",
     "push rsi",
     "pushfq",
@@ -70,8 +66,8 @@ global_asm!(
 global_asm!(
     ".global wovenhat_user_stub",
     "wovenhat_user_stub:",
-    "cli",
-    "mov rax, 0xDEADBEEF",
+    "mov rax, 3",
+    "int 0x80",
     "2:",
     "jmp 2b",
 );
@@ -79,7 +75,6 @@ global_asm!(
 unsafe extern "C" {
     fn wovenhat_context_switch(previous_rsp: *mut u64, next_rsp: u64);
     fn wovenhat_enter_user_mode(entry: u64, stack_top: u64, user_cs: u16, user_ss: u16) -> !;
-    fn wovenhat_user_stub() -> !;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,23 +97,8 @@ impl ProcessId {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
-    New,
     Ready,
-    Running,
-    Blocked,
     Exited,
-}
-
-impl ProcessState {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::New => "new",
-            Self::Ready => "ready",
-            Self::Running => "running",
-            Self::Blocked => "blocked",
-            Self::Exited => "exited",
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -131,6 +111,19 @@ impl TaskPriority {
 
     pub const fn as_u8(self) -> u8 {
         self.0
+    }
+
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    const fn quantum(self) -> u8 {
+        match self {
+            Self::LOW => 1,
+            Self::NORMAL => 2,
+            Self::HIGH => 4,
+            _ => 1,
+        }
     }
 }
 
@@ -182,6 +175,11 @@ struct TaskControlBlock {
     priority: TaskPriority,
     context: Context,
     capabilities: CapabilitySet,
+    entry: Option<fn() -> !>,
+    wake_tick: u64,
+    user_context: Option<UserTaskContext>,
+    address_space: Option<paging::AddressSpace>,
+    remaining_ticks: u8,
 }
 
 impl TaskControlBlock {
@@ -193,14 +191,31 @@ impl TaskControlBlock {
             priority: TaskPriority::NORMAL,
             context: Context { stack_pointer: 0 },
             capabilities: CapabilitySet::empty(),
+            entry: None,
+            wake_tick: 0,
+            user_context: None,
+            address_space: None,
+            remaining_ticks: 0,
         }
     }
 
-    fn initialize(&mut self, slot: usize, id: TaskId, name: &'static str, entry: fn() -> !, priority: TaskPriority) {
+    fn initialize(
+        &mut self,
+        slot: usize,
+        id: TaskId,
+        name: &'static str,
+        entry: fn() -> !,
+        priority: TaskPriority,
+    ) {
         self.id = id;
         self.name = name;
         self.state = TaskState::Ready;
         self.priority = priority;
+        self.entry = Some(entry);
+        self.wake_tick = 0;
+        self.user_context = None;
+        self.address_space = paging::kernel_address_space();
+        self.remaining_ticks = priority.quantum();
 
         let stack_start = TASK_STACKS[slot].0.get().cast::<u8>() as usize;
         let stack_top = stack_start + TASK_STACK_SIZE;
@@ -210,7 +225,42 @@ impl TaskControlBlock {
         // callee-saved registers followed by the entry address consumed by
         // `ret`. The reserved eight bytes preserve the SysV entry alignment.
         unsafe {
-            push_stack_value(&mut cursor, entry as usize as u64);
+            push_stack_value(&mut cursor, (task_bootstrap as fn() -> !) as usize as u64);
+            for _ in 0..6 {
+                push_stack_value(&mut cursor, 0);
+            }
+        }
+
+        self.context.stack_pointer = cursor as u64;
+    }
+
+    fn initialize_user(
+        &mut self,
+        slot: usize,
+        id: TaskId,
+        name: &'static str,
+        context: UserTaskContext,
+        address_space: paging::AddressSpace,
+    ) {
+        self.id = id;
+        self.name = name;
+        self.state = TaskState::Ready;
+        self.priority = TaskPriority::NORMAL;
+        self.entry = None;
+        self.wake_tick = 0;
+        self.user_context = Some(context);
+        self.address_space = Some(address_space);
+        self.remaining_ticks = TaskPriority::NORMAL.quantum();
+        self.capabilities = CapabilitySet::userspace();
+
+        let stack_start = TASK_STACKS[slot].0.get().cast::<u8>() as usize;
+        let stack_top = stack_start + TASK_STACK_SIZE;
+        let mut cursor = (stack_top & !0xf) - 8;
+
+        // The first kernel-side dispatch enters through the common bootstrap;
+        // it then installs the saved user context with iretq.
+        unsafe {
+            push_stack_value(&mut cursor, (task_bootstrap as fn() -> !) as usize as u64);
             for _ in 0..6 {
                 push_stack_value(&mut cursor, 0);
             }
@@ -220,22 +270,60 @@ impl TaskControlBlock {
     }
 }
 
+fn task_bootstrap() -> ! {
+    let (entry, user_context) = {
+        let scheduler = SCHEDULER.lock();
+        let task = &scheduler.tasks[scheduler.current_slot];
+        (task.entry, task.user_context)
+    };
+
+    x86_64::instructions::interrupts::enable();
+    if let Some(context) = user_context {
+        enter_user_context(context)
+    }
+
+    entry.expect("scheduled task is missing its entry point")()
+}
+
 #[derive(Clone, Copy)]
 pub struct Process {
     pub id: ProcessId,
-    pub parent: Option<ProcessId>,
     pub task_id: TaskId,
-    pub name: &'static str,
     pub state: ProcessState,
-    pub ring: u8,
-    pub entry: u64,
-    pub stack_top: u64,
-    pub stack_size: u64,
+    pub parent: ProcessId,
+    pub exit_code: i32,
+    address_space: Option<userspace::AddressSpace>,
+    files: [Option<vfs::OpenFile>; MAX_FILE_DESCRIPTORS],
+    memory_mappings: [Option<userspace::AnonymousMapping>; userspace::MAX_ANONYMOUS_MAPPINGS],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProcessError {
     Full,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WaitError {
+    NoSuchChild,
+    StillRunning,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FileError {
+    PermissionDenied,
+    NoProcess,
+    NotFound,
+    TooManyFiles,
+    BadDescriptor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemoryError {
+    NoProcess,
+    InvalidLength,
+    Full,
+    NotFound,
+    MappingFailed,
 }
 
 pub struct Summary {
@@ -247,6 +335,7 @@ pub struct Summary {
     pub current_state: &'static str,
     pub current_priority: u8,
     pub context_switches: u64,
+    pub preemption_switches: u64,
     pub idle_heartbeats: u64,
 }
 
@@ -261,11 +350,17 @@ pub enum SpawnError {
     Full,
 }
 
+struct ContextSwitch {
+    previous_rsp: *mut u64,
+    next_rsp: u64,
+    next_address_space: paging::AddressSpace,
+}
 struct Scheduler {
     tasks: [TaskControlBlock; MAX_TASKS],
     current_slot: usize,
     task_count: usize,
     context_switches: u64,
+    last_selected: [usize; 3],
 }
 
 impl Scheduler {
@@ -275,6 +370,7 @@ impl Scheduler {
             current_slot: 0,
             task_count: 0,
             context_switches: 0,
+            last_selected: [0; 3],
         }
     }
 
@@ -286,45 +382,80 @@ impl Scheduler {
         self.tasks[0].state = TaskState::Running;
         self.tasks[0].priority = TaskPriority::HIGH;
         self.tasks[0].capabilities = CapabilitySet::kernel_bootstrap();
+        self.tasks[0].address_space = paging::kernel_address_space();
+        self.tasks[0].remaining_ticks = TaskPriority::HIGH.quantum();
         self.tasks[1].initialize(1, IDLE_TASK_ID, "idle", idle_task, TaskPriority::LOW);
         self.task_count = 2;
     }
 
-    fn prepare_switch(&mut self) -> Option<(*mut u64, u64)> {
-        let mut best_slot = None;
-        let mut best_priority = TaskPriority::LOW;
+    fn prepare_switch(&mut self) -> Option<ContextSwitch> {
+        self.reap_dead();
 
-        for offset in 0..MAX_TASKS {
-            let slot = (self.current_slot + offset) % MAX_TASKS;
-            let task = &self.tasks[slot];
-            if task.state != TaskState::Ready {
-                continue;
-            }
+        let best_priority = self
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Ready)
+            .map(|task| task.priority)
+            .max()?;
+        let priority_index = best_priority.index();
+        let start = self.last_selected[priority_index];
+        let next_slot = (1..=MAX_TASKS)
+            .map(|offset| (start + offset) % MAX_TASKS)
+            .find(|slot| {
+                let task = &self.tasks[*slot];
+                task.state == TaskState::Ready && task.priority == best_priority
+            })?;
+        self.last_selected[priority_index] = next_slot;
 
-            if task.priority >= best_priority {
-                best_priority = task.priority;
-                best_slot = Some(slot);
-            }
-        }
-
-        let next_slot = best_slot?;
         let previous_slot = self.current_slot;
-        self.tasks[previous_slot].state = TaskState::Ready;
+        if self.tasks[previous_slot].state == TaskState::Running {
+            self.tasks[previous_slot].state = TaskState::Ready;
+        }
         self.tasks[next_slot].state = TaskState::Running;
+        self.tasks[next_slot].remaining_ticks = self.tasks[next_slot].priority.quantum();
         self.current_slot = next_slot;
         self.context_switches += 1;
 
         let previous_rsp = &mut self.tasks[previous_slot].context.stack_pointer as *mut u64;
         let next_rsp = self.tasks[next_slot].context.stack_pointer;
-        Some((previous_rsp, next_rsp))
+        let next_address_space = self.tasks[next_slot].address_space?;
+        Some(ContextSwitch {
+            previous_rsp,
+            next_rsp,
+            next_address_space,
+        })
+    }
+    fn reap_dead(&mut self) {
+        for (slot, task) in self.tasks.iter_mut().enumerate() {
+            if slot != self.current_slot && task.state == TaskState::Dead {
+                *task = TaskControlBlock::empty();
+            }
+        }
+    }
+
+    fn wake_sleeping(&mut self, now: u64) {
+        for task in &mut self.tasks {
+            if task.state == TaskState::Sleeping && task.wake_tick <= now {
+                task.state = TaskState::Ready;
+                task.wake_tick = 0;
+            }
+        }
     }
 
     fn summary(&self) -> Summary {
         let task = &self.tasks[self.current_slot];
         assert!(task.state == TaskState::Running);
 
-        let ready_tasks = self.tasks.iter().filter(|task| task.state == TaskState::Ready).count();
-        let blocked_tasks = self.tasks.iter().filter(|task| task.state == TaskState::Blocked).count();
+        let ready_tasks = self
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Ready)
+            .count();
+        let blocked_tasks = self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.state, TaskState::Blocked | TaskState::Sleeping))
+            .count();
 
         Summary {
             task_count: self.task_count,
@@ -335,144 +466,330 @@ impl Scheduler {
             current_state: task.state.name(),
             current_priority: task.priority.as_u8(),
             context_switches: self.context_switches,
+            preemption_switches: PREEMPTION_SWITCHES.load(Ordering::Relaxed),
             idle_heartbeats: IDLE_HEARTBEATS.load(Ordering::Relaxed),
         }
     }
-
 }
 
+unsafe fn switch_stacks(context_switch: ContextSwitch) {
+    paging::switch_to(context_switch.next_address_space);
+    unsafe {
+        wovenhat_context_switch(context_switch.previous_rsp, context_switch.next_rsp);
+    }
+}
 pub fn init() {
     SCHEDULER.lock().initialize();
 }
 
-pub fn create_process(name: &'static str, entry: usize, stack_top: usize, ring: u8) -> Process {
-    let id = ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed));
-    let task_id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+fn create_process(
+    task_id: TaskId,
+    parent: ProcessId,
+    address_space: userspace::AddressSpace,
+) -> Process {
     Process {
-        id,
-        parent: None,
+        id: ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed)),
         task_id,
-        name,
-        state: ProcessState::New,
-        ring,
-        entry: entry as u64,
-        stack_top: stack_top as u64,
-        stack_size: 4096,
+        state: ProcessState::Ready,
+        parent,
+        exit_code: 0,
+        address_space: Some(address_space),
+        files: [None; MAX_FILE_DESCRIPTORS],
+        memory_mappings: [None; userspace::MAX_ANONYMOUS_MAPPINGS],
     }
 }
 
-pub fn register_process(process: Process) -> Result<ProcessId, ProcessError> {
-    let id = process.id;
-    let mut table = PROCESS_TABLE.lock();
-    let slot = table.iter().position(|entry| entry.is_none()).ok_or(ProcessError::Full)?;
-    table[slot] = Some(process);
-    Ok(id)
-}
-
-pub fn update_process_state(id: ProcessId, state: ProcessState) -> bool {
-    let mut table = PROCESS_TABLE.lock();
-    let Some(slot) = table.iter_mut().position(|entry| matches!(entry, Some(process) if process.id == id)) else {
-        return false;
-    };
-
-    if let Some(process) = table[slot].as_mut() {
-        process.state = state;
-        return true;
-    }
-
-    false
-}
-
-pub extern "C" fn user_stub_entry() -> ! {
-    loop {
-        x86_64::instructions::hlt();
-    }
-}
-
-pub fn launch_user_task(name: &'static str, entry: usize, stack_top: usize) -> Result<ProcessId, ProcessError> {
-    let (mut process, context) = prepare_user_launch(name, entry, stack_top)?;
-    process.state = ProcessState::Ready;
-    let id = process.id;
-    let _ = register_process(process)?;
-    let _ = context;
-    Ok(id)
-}
-
-pub fn prepare_user_launch(name: &'static str, entry: usize, stack_top: usize) -> Result<(Process, UserTaskContext), ProcessError> {
-    let image = userspace::stub_program(entry, stack_top);
-    if !image.is_valid() {
+pub fn spawn_user_process(
+    name: &'static str,
+    program: userspace::UserProgram,
+) -> Result<(ProcessId, UserTaskContext), ProcessError> {
+    if !program.image.is_valid() {
+        let _ = userspace::destroy(program.address_space);
         return Err(ProcessError::Full);
     }
 
-    let mut process = create_process(name, entry, stack_top, 3);
-    process.state = ProcessState::Ready;
-    let context = prepare_user_context(entry, stack_top);
-    Ok((process, context))
-}
-
-pub fn register_user_launch(name: &'static str, entry: usize, stack_top: usize) -> Result<(ProcessId, UserTaskContext), ProcessError> {
-    let (process, context) = prepare_user_launch(name, entry, stack_top)?;
-    let id = process.id;
-    register_process(process)?;
-    Ok((id, context))
-}
-
-pub fn validate_user_task(entry: usize, stack_top: usize) -> bool {
-    userspace::validate_stub(entry, stack_top)
-}
-
-pub fn exit_current_process() {
+    let parent = ProcessId(current_process_id());
+    let context = prepare_user_context(program.image.entry as usize, program.stack.top as usize);
     let mut scheduler = SCHEDULER.lock();
-    let slot = scheduler.current_slot;
-    let current = &mut scheduler.tasks[slot];
-
-    if current.state == TaskState::Empty || current.id == KERNEL_TASK_ID {
-        return;
-    }
-
-    current.state = TaskState::Dead;
-    current.name = "exited";
-    scheduler.task_count = scheduler.task_count.saturating_sub(1);
-
-    if let Some(process) = current_process() {
-        let _ = update_process_state(process.id, ProcessState::Exited);
-    }
-
-    let _ = scheduler.prepare_switch();
-}
-
-pub fn process_count() -> usize {
-    PROCESS_TABLE
-        .lock()
+    scheduler.reap_dead();
+    let Some(task_slot) = scheduler
+        .tasks
         .iter()
-        .filter(|entry| entry.is_some())
-        .count()
+        .position(|task| task.state == TaskState::Empty)
+    else {
+        let _ = userspace::destroy(program.address_space);
+        return Err(ProcessError::Full);
+    };
+
+    let mut processes = PROCESS_TABLE.lock();
+    let Some(process_slot) = processes.iter().position(|entry| entry.is_none()) else {
+        let _ = userspace::destroy(program.address_space);
+        return Err(ProcessError::Full);
+    };
+
+    let task_id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    let process = create_process(task_id, parent, program.address_space);
+    let process_id = process.id;
+    scheduler.tasks[task_slot].initialize_user(
+        task_slot,
+        task_id,
+        name,
+        context,
+        program.address_space.paging(),
+    );
+    scheduler.task_count += 1;
+    processes[process_slot] = Some(process);
+    Ok((process_id, context))
 }
-
-pub fn current_process() -> Option<Process> {
-    let scheduler = SCHEDULER.lock();
-    let task = &scheduler.tasks[scheduler.current_slot];
-    if task.state == TaskState::Empty {
-        return None;
-    }
-
+pub fn process_exited(id: ProcessId) -> bool {
     PROCESS_TABLE
         .lock()
         .iter()
         .flatten()
-        .find(|process| process.task_id == task.id)
-        .copied()
-        .or(Some(Process {
-            id: ProcessId(0),
-            parent: None,
-            task_id: task.id,
-            name: task.name,
-            state: ProcessState::Running,
-            ring: 0,
-            entry: 0,
-            stack_top: task.context.stack_pointer,
-            stack_size: TASK_STACK_SIZE as u64,
-        }))
+        .find(|process| process.id == id)
+        .is_some_and(|process| process.state == ProcessState::Exited)
+}
+
+pub fn current_process_id() -> u64 {
+    let task_id = current_task_id();
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .map_or(task_id.as_u64(), |process| process.id.as_u64())
+}
+
+pub fn exit_current_process(exit_code: i32) -> ! {
+    x86_64::instructions::interrupts::disable();
+    let (context_switch, address_space, memory_mappings) = {
+        let mut scheduler = SCHEDULER.lock();
+        let slot = scheduler.current_slot;
+        let task_id = scheduler.tasks[slot].id;
+        assert!(
+            task_id != KERNEL_TASK_ID,
+            "kernel task cannot exit as a process"
+        );
+
+        let (address_space, memory_mappings) = PROCESS_TABLE
+            .lock()
+            .iter_mut()
+            .flatten()
+            .find(|process| process.task_id == task_id)
+            .and_then(|process| {
+                process.state = ProcessState::Exited;
+                process.exit_code = exit_code;
+                process.address_space.take().map(|address_space| {
+                    let memory_mappings = core::mem::replace(
+                        &mut process.memory_mappings,
+                        [None; userspace::MAX_ANONYMOUS_MAPPINGS],
+                    );
+                    (address_space, memory_mappings)
+                })
+            })
+            .expect("exiting process has no owned address space");
+
+        scheduler.tasks[slot].state = TaskState::Dead;
+        scheduler.tasks[slot].name = "exited";
+        scheduler.task_count = scheduler.task_count.saturating_sub(1);
+        (scheduler.prepare_switch(), address_space, memory_mappings)
+    };
+
+    if let Some(context_switch) = context_switch {
+        paging::switch_to(context_switch.next_address_space);
+        for mapping in memory_mappings.into_iter().flatten() {
+            assert!(
+                userspace::unmap_anonymous(address_space, mapping),
+                "failed to release anonymous process mapping"
+            );
+        }
+        assert!(
+            userspace::destroy(address_space),
+            "failed to release exiting process address space"
+        );
+        unsafe { switch_stacks(context_switch) };
+    }
+
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+pub fn wait_process(child_id: u64) -> Result<i32, WaitError> {
+    let parent = ProcessId(current_process_id());
+    let child = ProcessId(child_id);
+    let mut processes = PROCESS_TABLE.lock();
+    let Some(slot) = processes.iter().position(
+        |entry| matches!(entry, Some(process) if process.id == child && process.parent == parent),
+    ) else {
+        return Err(WaitError::NoSuchChild);
+    };
+    let process = processes[slot].ok_or(WaitError::NoSuchChild)?;
+    if process.state != ProcessState::Exited {
+        return Err(WaitError::StillRunning);
+    }
+    processes[slot] = None;
+    Ok(process.exit_code)
+}
+
+pub fn zombie_count() -> usize {
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .filter(|process| process.state == ProcessState::Exited)
+        .count()
+}
+pub fn mmap_current(length: u64, writable: bool) -> Result<u64, MemoryError> {
+    let length = usize::try_from(length).map_err(|_| MemoryError::InvalidLength)?;
+    let size = length
+        .checked_add(4095)
+        .map(|size| size & !4095)
+        .filter(|size| *size != 0)
+        .ok_or(MemoryError::InvalidLength)?;
+    let task_id = current_task_id();
+    let (process_index, slot, address_space) = {
+        let processes = PROCESS_TABLE.lock();
+        let process_index = processes
+            .iter()
+            .position(|process| process.is_some_and(|process| process.task_id == task_id))
+            .ok_or(MemoryError::NoProcess)?;
+        let process = processes[process_index].ok_or(MemoryError::NoProcess)?;
+        let slot = process
+            .memory_mappings
+            .iter()
+            .position(Option::is_none)
+            .ok_or(MemoryError::Full)?;
+        let address_space = process.address_space.ok_or(MemoryError::NoProcess)?;
+        (process_index, slot, address_space)
+    };
+    let mapping = userspace::map_anonymous(address_space, slot, size, writable)
+        .ok_or(MemoryError::MappingFailed)?;
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes[process_index]
+        .as_mut()
+        .ok_or(MemoryError::NoProcess)?;
+    if process.memory_mappings[slot].is_some() {
+        let _ = userspace::unmap_anonymous(address_space, mapping);
+        return Err(MemoryError::Full);
+    }
+    process.memory_mappings[slot] = Some(mapping);
+    Ok(mapping.address)
+}
+
+pub fn munmap_current(address: u64, length: u64) -> Result<(), MemoryError> {
+    let length = usize::try_from(length).map_err(|_| MemoryError::InvalidLength)?;
+    let size = length
+        .checked_add(4095)
+        .map(|size| size & !4095)
+        .filter(|size| *size != 0)
+        .ok_or(MemoryError::InvalidLength)?;
+    let task_id = current_task_id();
+    let (process_index, slot, address_space, mapping) = {
+        let processes = PROCESS_TABLE.lock();
+        let process_index = processes
+            .iter()
+            .position(|process| process.is_some_and(|process| process.task_id == task_id))
+            .ok_or(MemoryError::NoProcess)?;
+        let process = processes[process_index].ok_or(MemoryError::NoProcess)?;
+        let slot = process
+            .memory_mappings
+            .iter()
+            .position(|mapping| {
+                mapping.is_some_and(|mapping| mapping.address == address && mapping.size == size)
+            })
+            .ok_or(MemoryError::NotFound)?;
+        let mapping = process.memory_mappings[slot].ok_or(MemoryError::NotFound)?;
+        let address_space = process.address_space.ok_or(MemoryError::NoProcess)?;
+        (process_index, slot, address_space, mapping)
+    };
+    if !userspace::unmap_anonymous(address_space, mapping) {
+        return Err(MemoryError::MappingFailed);
+    }
+    PROCESS_TABLE.lock()[process_index]
+        .as_mut()
+        .ok_or(MemoryError::NoProcess)?
+        .memory_mappings[slot] = None;
+    Ok(())
+}
+
+pub fn anonymous_mapping_count() -> usize {
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .map(|process| process.memory_mappings.iter().flatten().count())
+        .sum()
+}
+pub fn open_current(path: &str) -> Result<u64, FileError> {
+    if !current_has(Capability::FileRead) {
+        return Err(FileError::PermissionDenied);
+    }
+    let task_id = current_task_id();
+    let file = vfs::open(path).map_err(|_| FileError::NotFound)?;
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    let descriptor = (3..MAX_FILE_DESCRIPTORS)
+        .find(|descriptor| process.files[*descriptor].is_none())
+        .ok_or(FileError::TooManyFiles)?;
+    process.files[descriptor] = Some(file);
+    Ok(descriptor as u64)
+}
+
+pub fn read_current(descriptor: u64, buffer: &mut [u8]) -> Result<usize, FileError> {
+    let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    let file = process
+        .files
+        .get_mut(descriptor)
+        .and_then(Option::as_mut)
+        .ok_or(FileError::BadDescriptor)?;
+    vfs::read(file, buffer).map_err(|_| FileError::BadDescriptor)
+}
+
+pub fn close_current(descriptor: u64) -> Result<(), FileError> {
+    let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    let file = process
+        .files
+        .get_mut(descriptor)
+        .ok_or(FileError::BadDescriptor)?;
+    if file.take().is_none() {
+        return Err(FileError::BadDescriptor);
+    }
+    Ok(())
+}
+
+pub fn open_file_count() -> usize {
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .map(|process| process.files.iter().flatten().count())
+        .sum()
+}
+pub fn process_count() -> usize {
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .filter(|process| process.state != ProcessState::Exited)
+        .count()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -493,17 +810,7 @@ pub fn prepare_user_context(entry: usize, stack_top: usize) -> UserTaskContext {
     }
 }
 
-pub fn build_ring3_frame(entry: usize, stack_top: usize) -> UserTaskContext {
-    let context = prepare_user_context(entry, stack_top);
-    let mut frame = context;
-    frame.stack_top = stack_top as u64;
-    frame.entry = entry as u64;
-    frame.data_segment = context.data_segment;
-    frame
-}
-
-pub fn enter_user_mode(entry: usize, stack_top: usize) -> ! {
-    let context = build_ring3_frame(entry, stack_top);
+fn enter_user_context(context: UserTaskContext) -> ! {
     unsafe {
         wovenhat_enter_user_mode(
             context.entry,
@@ -539,32 +846,163 @@ pub fn spawn_with_priority(
 }
 
 pub fn yield_now() {
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
     let switch = {
         let mut scheduler = SCHEDULER.lock();
         assert!(scheduler.task_count != 0, "scheduler not initialized");
         scheduler.prepare_switch()
     };
 
-    let Some((previous_rsp, next_rsp)) = switch else {
-        return;
-    };
+    if let Some(context_switch) = switch {
+        // SAFETY: Interrupts stay disabled between publishing scheduler state
+        // and switching stacks, so an IRQ cannot save a context into the wrong
+        // task control block.
+        unsafe { switch_stacks(context_switch) };
+    }
 
-    // SAFETY: Both stack pointers belong to live, statically stored task
-    // control blocks. The scheduler lock was released before switching, and
-    // only cooperative calls to this function can change the running task.
-    unsafe { wovenhat_context_switch(previous_rsp, next_rsp) };
+    if interrupts_were_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
 }
 
 pub fn tick() {
-    if PREEMPTION_TICKS.fetch_add(1, Ordering::Relaxed) + 1 >= 2 {
-        PREEMPTION_TICKS.store(0, Ordering::Relaxed);
+    let Some(mut scheduler) = SCHEDULER.try_lock() else {
         PREEMPTION_REQUESTED.store(true, Ordering::Release);
+        return;
+    };
+    scheduler.wake_sleeping(timer::ticks());
+    let slot = scheduler.current_slot;
+    let task = &mut scheduler.tasks[slot];
+    if task.state != TaskState::Running {
+        return;
+    }
+    if task.remaining_ticks > 1 {
+        task.remaining_ticks -= 1;
+    } else {
+        task.remaining_ticks = 0;
+        PREEMPTION_REQUESTED.store(true, Ordering::Release);
+    }
+}
+pub fn preempt_from_interrupt() {
+    if !PREEMPTION_REQUESTED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+
+    let switch = {
+        let Some(mut scheduler) = SCHEDULER.try_lock() else {
+            PREEMPTION_REQUESTED.store(true, Ordering::Release);
+            return;
+        };
+        scheduler.wake_sleeping(timer::ticks());
+        scheduler.prepare_switch()
+    };
+
+    if let Some(context_switch) = switch {
+        PREEMPTION_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: Hardware interrupts are disabled by the interrupt gate. The
+        // scheduler lock is released, and both contexts belong to live tasks.
+        unsafe { switch_stacks(context_switch) };
     }
 }
 
 pub fn preemption_point() {
-    if PREEMPTION_REQUESTED.swap(false, Ordering::AcqRel) {
+    if PREEMPTION_REQUESTED.load(Ordering::Acquire) {
         yield_now();
+        PREEMPTION_REQUESTED.store(false, Ordering::Release);
+    }
+}
+
+pub fn block_current() {
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
+    let switch = {
+        let mut scheduler = SCHEDULER.lock();
+        let slot = scheduler.current_slot;
+        assert!(
+            scheduler.tasks[slot].id != KERNEL_TASK_ID,
+            "kernel task cannot block"
+        );
+        scheduler.tasks[slot].state = TaskState::Blocked;
+        scheduler.prepare_switch()
+    };
+
+    if let Some(context_switch) = switch {
+        // SAFETY: The blocked task remains allocated and can only run again
+        // after an explicit wakeup changes its state back to ready.
+        unsafe { switch_stacks(context_switch) };
+    }
+
+    if interrupts_were_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+}
+
+pub fn wake_task(id: TaskId) -> bool {
+    let mut scheduler = SCHEDULER.lock();
+    let Some(task) = scheduler
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == id && task.state == TaskState::Blocked)
+    else {
+        return false;
+    };
+
+    task.state = TaskState::Ready;
+    true
+}
+
+pub fn sleep_current(ticks: u64) {
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
+    let switch = {
+        let mut scheduler = SCHEDULER.lock();
+        let slot = scheduler.current_slot;
+        assert!(
+            scheduler.tasks[slot].id != KERNEL_TASK_ID,
+            "kernel task cannot sleep"
+        );
+        scheduler.tasks[slot].wake_tick = timer::ticks().saturating_add(ticks.max(1));
+        scheduler.tasks[slot].state = TaskState::Sleeping;
+        scheduler.prepare_switch()
+    };
+
+    if let Some(context_switch) = switch {
+        // SAFETY: The sleeping task remains allocated and will only become
+        // ready after its wake deadline is observed by the timer path.
+        unsafe { switch_stacks(context_switch) };
+    }
+
+    if interrupts_were_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+}
+
+pub fn exit_current_task() -> ! {
+    x86_64::instructions::interrupts::disable();
+    let switch = {
+        let mut scheduler = SCHEDULER.lock();
+        let slot = scheduler.current_slot;
+        assert!(
+            scheduler.tasks[slot].id != KERNEL_TASK_ID,
+            "kernel task cannot exit"
+        );
+        scheduler.tasks[slot].state = TaskState::Dead;
+        scheduler.task_count = scheduler.task_count.saturating_sub(1);
+        scheduler.prepare_switch()
+    };
+
+    if let Some(context_switch) = switch {
+        // SAFETY: The exiting task will never be selected again, and the next
+        // context belongs to a live task selected by the scheduler.
+        unsafe { switch_stacks(context_switch) };
+    }
+
+    loop {
+        x86_64::instructions::hlt();
     }
 }
 
@@ -572,6 +1010,12 @@ pub fn summary() -> Summary {
     let scheduler = SCHEDULER.lock();
     assert!(scheduler.task_count != 0, "scheduler not initialized");
     scheduler.summary()
+}
+
+pub fn current_task_id() -> TaskId {
+    let scheduler = SCHEDULER.lock();
+    assert!(scheduler.task_count != 0, "scheduler not initialized");
+    scheduler.tasks[scheduler.current_slot].id
 }
 
 pub fn current_has(capability: Capability) -> bool {
@@ -641,7 +1085,6 @@ pub fn capability_policy_valid() -> bool {
         Capability::DeviceIo,
         Capability::InterruptControl,
         Capability::MemoryInspect,
-        Capability::FileRead,
     ];
 
     required
