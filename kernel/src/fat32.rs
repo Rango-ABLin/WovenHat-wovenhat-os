@@ -3,6 +3,10 @@ use crate::block::{BlockDevice, Error as BlockError, SECTOR_SIZE};
 const FAT32_MIN_CLUSTERS: u32 = 65_525;
 const DIRECTORY_ENTRY_SIZE: usize = 32;
 const DIRECTORY_ENTRIES_PER_SECTOR: usize = SECTOR_SIZE / DIRECTORY_ENTRY_SIZE;
+const FAT32_ENTRY_MASK: u32 = 0x0fff_ffff;
+const FAT32_BAD_CLUSTER: u32 = 0x0fff_fff7;
+const FAT32_END_MIN: u32 = 0x0fff_fff8;
+const MAX_READ_CLUSTERS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -10,6 +14,10 @@ pub enum Error {
     InvalidBootSector,
     UnsupportedGeometry,
     CorruptDirectory,
+    CorruptChain,
+    ChainLoop,
+    ChainTooLong,
+    TruncatedFile,
     NotFound,
 }
 
@@ -20,6 +28,7 @@ pub struct Volume {
     pub fat_count: u8,
     pub fat_size: u32,
     pub root_cluster: u32,
+    pub first_fat_sector: u64,
     pub first_data_sector: u64,
     cluster_count: u32,
 }
@@ -27,7 +36,7 @@ pub struct Volume {
 impl Volume {
     pub fn cluster_lba(&self, cluster: u32) -> Result<u64, Error> {
         if cluster < 2 || cluster >= self.cluster_count.saturating_add(2) {
-            return Err(Error::CorruptDirectory);
+            return Err(Error::CorruptChain);
         }
         self.first_data_sector
             .checked_add((cluster - 2) as u64 * self.sectors_per_cluster as u64)
@@ -41,6 +50,12 @@ pub struct DirectoryEntry {
     pub first_cluster: u32,
     pub size: u32,
     pub attributes: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClusterLink {
+    Next(u32),
+    End,
 }
 
 pub fn mount(device: &mut impl BlockDevice) -> Result<Volume, Error> {
@@ -100,6 +115,7 @@ pub fn mount(device: &mut impl BlockDevice) -> Result<Volume, Error> {
         fat_count,
         fat_size,
         root_cluster,
+        first_fat_sector: reserved_sectors as u64,
         first_data_sector: first_data as u64,
         cluster_count,
     })
@@ -148,6 +164,89 @@ pub fn find_root(
     Err(Error::NotFound)
 }
 
+pub fn next_cluster(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    cluster: u32,
+) -> Result<ClusterLink, Error> {
+    volume.cluster_lba(cluster)?;
+    let fat_offset = (cluster as u64).checked_mul(4).ok_or(Error::CorruptChain)?;
+    let fat_sector = volume
+        .first_fat_sector
+        .checked_add(fat_offset / SECTOR_SIZE as u64)
+        .ok_or(Error::CorruptChain)?;
+    if fat_sector >= volume.first_data_sector {
+        return Err(Error::CorruptChain);
+    }
+
+    let mut sector = [0_u8; SECTOR_SIZE];
+    device
+        .read_sector(fat_sector, &mut sector)
+        .map_err(Error::Block)?;
+    let offset = (fat_offset % SECTOR_SIZE as u64) as usize;
+    let value = read_u32(&sector, offset) & FAT32_ENTRY_MASK;
+    if value >= FAT32_END_MIN {
+        return Ok(ClusterLink::End);
+    }
+    if value < 2 || value == FAT32_BAD_CLUSTER {
+        return Err(Error::CorruptChain);
+    }
+    volume.cluster_lba(value)?;
+    Ok(ClusterLink::Next(value))
+}
+
+pub fn read_file(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    entry: DirectoryEntry,
+    buffer: &mut [u8],
+) -> Result<usize, Error> {
+    let file_size = entry.size as usize;
+    let target = core::cmp::min(file_size, buffer.len());
+    if target == 0 {
+        return Ok(0);
+    }
+
+    let mut cluster = entry.first_cluster;
+    let mut visited = [0_u32; MAX_READ_CLUSTERS];
+    let mut visited_count = 0;
+    let mut copied = 0;
+    let mut sector = [0_u8; SECTOR_SIZE];
+
+    while copied < target {
+        if visited_count == visited.len() {
+            return Err(Error::ChainTooLong);
+        }
+        if visited[..visited_count].contains(&cluster) {
+            return Err(Error::ChainLoop);
+        }
+        visited[visited_count] = cluster;
+        visited_count += 1;
+
+        let cluster_lba = volume.cluster_lba(cluster)?;
+        for sector_index in 0..volume.sectors_per_cluster as u64 {
+            if copied == target {
+                break;
+            }
+            device
+                .read_sector(cluster_lba + sector_index, &mut sector)
+                .map_err(Error::Block)?;
+            let count = core::cmp::min(SECTOR_SIZE, target - copied);
+            buffer[copied..copied + count].copy_from_slice(&sector[..count]);
+            copied += count;
+        }
+        if copied == target {
+            return Ok(copied);
+        }
+
+        cluster = match next_cluster(device, volume, cluster)? {
+            ClusterLink::Next(next) => next,
+            ClusterLink::End => return Err(Error::TruncatedFile),
+        };
+    }
+    Ok(copied)
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
@@ -163,11 +262,14 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 struct TestDisk {
     valid_signature: bool,
+    cyclic_chain: bool,
 }
 
 impl TestDisk {
     const TOTAL_SECTORS: u64 = 70_000;
+    const FAT_LBA: u64 = 32;
     const ROOT_LBA: u64 = 1_232;
+    const FILE_LBA: u64 = 1_233;
 }
 
 impl BlockDevice for TestDisk {
@@ -192,11 +294,23 @@ impl BlockDevice for TestDisk {
                 sector[510] = 0x55;
                 sector[511] = 0xaa;
             }
+        } else if lba == Self::FAT_LBA {
+            if self.cyclic_chain {
+                sector[12..16].copy_from_slice(&3_u32.to_le_bytes());
+            } else {
+                sector[12..16].copy_from_slice(&4_u32.to_le_bytes());
+                sector[16..20].copy_from_slice(&FAT32_END_MIN.to_le_bytes());
+            }
         } else if lba == Self::ROOT_LBA {
             sector[..11].copy_from_slice(b"KERNEL  BIN");
             sector[11] = 0x20;
             sector[26..28].copy_from_slice(&3_u16.to_le_bytes());
-            sector[28..32].copy_from_slice(&4096_u32.to_le_bytes());
+            let size = if self.cyclic_chain { 1024_u32 } else { 600_u32 };
+            sector[28..32].copy_from_slice(&size.to_le_bytes());
+        } else if lba == Self::FILE_LBA {
+            sector.fill(b'A');
+        } else if lba == Self::FILE_LBA + 1 {
+            sector.fill(b'B');
         }
         Ok(())
     }
@@ -209,6 +323,7 @@ impl BlockDevice for TestDisk {
 pub fn self_test() -> bool {
     let mut disk = TestDisk {
         valid_signature: true,
+        cyclic_chain: false,
     };
     let Ok(volume) = mount(&mut disk) else {
         return false;
@@ -216,18 +331,41 @@ pub fn self_test() -> bool {
     let Ok(entry) = find_root(&mut disk, volume, b"KERNEL  BIN") else {
         return false;
     };
+    let mut payload = [0_u8; 600];
     let valid = volume.total_sectors == TestDisk::TOTAL_SECTORS as u32
         && volume.fat_count == 2
         && volume.fat_size == 600
         && volume.cluster_lba(volume.root_cluster) == Ok(TestDisk::ROOT_LBA)
         && entry.short_name == *b"KERNEL  BIN"
         && entry.first_cluster == 3
-        && entry.size == 4096
+        && entry.size == 600
         && entry.attributes == 0x20
+        && next_cluster(&mut disk, volume, 3) == Ok(ClusterLink::Next(4))
+        && next_cluster(&mut disk, volume, 4) == Ok(ClusterLink::End)
+        && read_file(&mut disk, volume, entry, &mut payload) == Ok(payload.len())
+        && payload[..SECTOR_SIZE].iter().all(|byte| *byte == b'A')
+        && payload[SECTOR_SIZE..].iter().all(|byte| *byte == b'B')
         && find_root(&mut disk, volume, b"MISSING TXT") == Err(Error::NotFound);
 
     let mut invalid = TestDisk {
         valid_signature: false,
+        cyclic_chain: false,
     };
-    valid && mount(&mut invalid) == Err(Error::InvalidBootSector)
+    let invalid_rejected = mount(&mut invalid) == Err(Error::InvalidBootSector);
+
+    let mut cyclic = TestDisk {
+        valid_signature: true,
+        cyclic_chain: true,
+    };
+    let Ok(cyclic_volume) = mount(&mut cyclic) else {
+        return false;
+    };
+    let Ok(cyclic_entry) = find_root(&mut cyclic, cyclic_volume, b"KERNEL  BIN") else {
+        return false;
+    };
+    let mut oversized = [0_u8; 1024];
+    let cycle_rejected = read_file(&mut cyclic, cyclic_volume, cyclic_entry, &mut oversized)
+        == Err(Error::ChainLoop);
+
+    valid && invalid_rejected && cycle_rejected
 }

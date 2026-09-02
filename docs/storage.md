@@ -17,8 +17,9 @@ NVMe, virtio-blk, or USB mass-storage drivers.
 
 ## FAT32 validation
 
-`kernel/src/fat32.rs` currently provides strict mount metadata validation and
-short-name lookup in the first root-directory sector. It validates:
+`kernel/src/fat32.rs` provides strict mount metadata validation, short-name lookup
+in the first root-directory sector, FAT-chain decoding, and bounded file reads. It
+validates:
 
 - the 0x55AA boot signature;
 - 512-byte sectors;
@@ -29,19 +30,24 @@ short-name lookup in the first root-directory sector. It validates:
 - FAT/data-region overflow;
 - the FAT32 minimum cluster count;
 - root-cluster bounds;
-- deleted, long-name, and volume-label directory entries.
+- deleted, long-name, and volume-label directory entries;
+- free, bad, end-of-chain, and out-of-range FAT entries;
+- cyclic, overlong, and prematurely terminated file chains.
 
 The parser reports corrupt and unsupported media without indexing outside a sector.
 
 ## Current boundary
 
-The parser does not yet follow FAT chains or write directory entries. Physical media is
-also not connected yet. The next storage increments are:
+File reads follow at most 64 clusters and may span multiple sectors and clusters.
+Root lookup is still limited to the first root-directory sector, directory mutation is
+not implemented, and physical media is not connected yet. The next storage increments
+are:
 
 1. ATA PIO discovery and sector transport.
-2. FAT-chain traversal with loop detection.
+2. Root-directory chain traversal and subdirectory lookup.
 3. Mounting a FAT32 volume into the VFS namespace.
-4. Read support followed by crash-safe file updates.
+4. Crash-safe file and directory updates.
 
 Boot-time self-tests validate block bounds, read-only protection, FAT32 geometry,
-root lookup, missing entries, and invalid signatures.
+root lookup, missing entries, invalid signatures, multi-cluster reads, end-of-chain
+handling, and cycle rejection.
