@@ -149,6 +149,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("VFS READ/WRITE: FAILED");
         halt();
     }
+    if userspace::elf_loader_self_test() {
+        console.println("ELF64 LOADER W^X: OK");
+    } else {
+        console.println("ELF64 LOADER VALIDATION: FAILED");
+        halt();
+    }
 
     if gui::self_test() {
         console.println("GUI INPUT: OK");
@@ -172,6 +178,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     task::init();
     console.println("SCHEDULER: INITIALIZED");
+    if syscall::test() {
+        console.println("SYSCALL GATE: GETPID OK");
+    } else {
+        console.println("SYSCALL GATE: FAILED");
+        halt();
+    }
 
     if task::capability_policy_valid() {
         console.println("CAPABILITY POLICY: ONLINE");
