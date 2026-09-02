@@ -14,6 +14,7 @@ pub enum Error {
     InvalidBootSector,
     UnsupportedGeometry,
     CorruptDirectory,
+    DirectoryFull,
     CorruptChain,
     ChainLoop,
     ChainTooLong,
@@ -156,6 +157,67 @@ pub fn find_root(
         cluster = match next_cluster(device, volume, cluster)? {
             ClusterLink::Next(next) => next,
             ClusterLink::End => return Err(Error::NotFound),
+        };
+    }
+}
+
+pub fn list_root(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    output: &mut [Option<DirectoryEntry>],
+) -> Result<usize, Error> {
+    let mut cluster = volume.root_cluster;
+    let mut visited = [0_u32; MAX_READ_CLUSTERS];
+    let mut visited_count = 0;
+    let mut count = 0;
+    let mut sector = [0_u8; SECTOR_SIZE];
+
+    loop {
+        if visited_count == visited.len() {
+            return Err(Error::ChainTooLong);
+        }
+        if visited[..visited_count].contains(&cluster) {
+            return Err(Error::ChainLoop);
+        }
+        visited[visited_count] = cluster;
+        visited_count += 1;
+
+        let cluster_lba = volume.cluster_lba(cluster)?;
+        for sector_index in 0..volume.sectors_per_cluster as u64 {
+            device
+                .read_sector(cluster_lba + sector_index, &mut sector)
+                .map_err(Error::Block)?;
+            for index in 0..DIRECTORY_ENTRIES_PER_SECTOR {
+                let offset = index * DIRECTORY_ENTRY_SIZE;
+                let first = sector[offset];
+                if first == 0 {
+                    return Ok(count);
+                }
+                let attributes = sector[offset + 11];
+                if first == 0xe5 || attributes == 0x0f || attributes & 0x08 != 0 {
+                    continue;
+                }
+                let slot = output.get_mut(count).ok_or(Error::DirectoryFull)?;
+                let mut short_name = [0_u8; 11];
+                short_name.copy_from_slice(&sector[offset..offset + 11]);
+                let first_cluster = ((read_u16(&sector, offset + 20) as u32) << 16)
+                    | read_u16(&sector, offset + 26) as u32;
+                let size = read_u32(&sector, offset + 28);
+                if first_cluster < 2 && size != 0 {
+                    return Err(Error::CorruptDirectory);
+                }
+                *slot = Some(DirectoryEntry {
+                    short_name,
+                    first_cluster,
+                    size,
+                    attributes,
+                });
+                count += 1;
+            }
+        }
+        cluster = match next_cluster(device, volume, cluster)? {
+            ClusterLink::Next(next) => next,
+            ClusterLink::End => return Ok(count),
         };
     }
 }
@@ -394,8 +456,15 @@ pub fn self_test() -> bool {
     let Ok(entry) = find_root(&mut disk, volume, b"KERNEL  BIN") else {
         return false;
     };
+    let mut entries = [None; 2];
+    let listed = list_root(&mut disk, volume, &mut entries) == Ok(1)
+        && entries[0].is_some_and(|listed| listed.short_name == entry.short_name);
+    let listing_capacity_enforced =
+        list_root(&mut disk, volume, &mut []) == Err(Error::DirectoryFull);
     let mut payload = [0_u8; 600];
-    let valid = volume.total_sectors == TestDisk::TOTAL_SECTORS as u32
+    let valid = listed
+        && listing_capacity_enforced
+        && volume.total_sectors == TestDisk::TOTAL_SECTORS as u32
         && volume.fat_count == 2
         && volume.fat_size == 600
         && volume.cluster_lba(volume.root_cluster) == Ok(TestDisk::ROOT_LBA)

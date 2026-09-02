@@ -42,14 +42,22 @@ validates:
 
 The parser reports corrupt and unsupported media without indexing outside a sector.
 
+## VFS mount
+
+The VFS uses a bounded 16-node registry with 64-byte paths and 4 KiB file payloads.
+Built-in files retain explicit write permissions. When ata0 contains a FAT32 volume
+starting at LBA 0, boot imports up to eight regular root files as read-only lowercase
+8.3 paths below /mnt and records the resulting node count for later lifecycle checks.
+No-disk and non-FAT media are non-fatal boot outcomes.
+
 ## Current boundary
 
 File reads follow at most 64 clusters and may span multiple sectors and clusters.
-Subdirectory lookup and directory mutation are not implemented, and FAT32 is not yet
-mounted from the detected physical disk. The next storage increments are:
+Subdirectory lookup, partition-table discovery, and directory mutation are not yet
+implemented. The next storage increments are:
 
 1. Subdirectory lookup and path traversal.
-2. Mounting a FAT32 volume into the VFS namespace.
+2. MBR/GPT partition discovery and partition-relative block devices.
 3. ATA writes plus secondary-channel and slave-device discovery.
 4. AHCI, NVMe, or virtio-blk transport.
 5. Crash-safe file and directory updates.

@@ -26,6 +26,7 @@ mod panic;
 mod pic;
 mod serial;
 mod shell;
+mod storage;
 mod syscall;
 mod task;
 mod timer;
@@ -182,6 +183,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("VFS READ/WRITE: FAILED");
         halt();
     }
+    if storage::self_test() {
+        console.println("STORAGE MOUNT PATHS: OK");
+    } else {
+        console.println("STORAGE MOUNT PATHS: FAILED");
+        halt();
+    }
     if userspace::elf_loader_self_test() {
         console.println("ELF64 LOADER W^X: OK");
     } else {
@@ -253,6 +260,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("ATA LBA0 READ: FAILED");
         halt();
     }
+    let storage_status = storage::mount_ata_root();
+    match storage_status {
+        storage::MountStatus::Mounted(files) => {
+            console.println("FAT32 ROOT MOUNTED READ-ONLY");
+            serial::write_line(format_args!("[VFS] mounted {} FAT32 root files", files));
+        }
+        storage::MountStatus::NoDevice => console.println("FAT32 MOUNT: NO BLOCK DEVICE"),
+        storage::MountStatus::NotFat32 => console.println("FAT32 MOUNT: NO VOLUME"),
+        storage::MountStatus::Failed => console.println("FAT32 MOUNT: FAILED"),
+    }
+    let vfs_nodes_before_userspace = vfs::node_count();
     let boot_devices = [
         device::Device {
             name: "framebuffer-console",
@@ -422,7 +440,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "[BOOT] user mmap/write/read/munmap and frame return verified"
     ));
 
-    if !syscall::user_io_verified() || task::open_file_count() != 0 || vfs::node_count() != 3 {
+    if !syscall::user_io_verified()
+        || task::open_file_count() != 0
+        || vfs::node_count() != vfs_nodes_before_userspace
+    {
         console.println("USER VFS/DESCRIPTOR SYSCALLS: FAILED");
         halt();
     }
