@@ -60,6 +60,8 @@ const IO_CLOSE: u64 = 1 << 3;
 const IO_MMAP: u64 = 1 << 4;
 const IO_MUNMAP: u64 = 1 << 5;
 const IO_FILE_WRITE: u64 = 1 << 6;
+const IO_GETUID: u64 = 1 << 7;
+const IO_GETGID: u64 = 1 << 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Number {
@@ -76,6 +78,8 @@ pub enum Number {
     FileWrite = 10,
     MessageSend = 11,
     MessageReceive = 12,
+    Getuid = 13,
+    Getgid = 14,
 }
 
 pub fn entry_address() -> u64 {
@@ -123,6 +127,10 @@ pub fn user_io_verified() -> bool {
 
 pub fn user_memory_verified() -> bool {
     IO_COMPLETIONS.load(Ordering::Acquire) & (IO_MMAP | IO_MUNMAP) == IO_MMAP | IO_MUNMAP
+}
+
+pub fn user_identity_verified() -> bool {
+    IO_COMPLETIONS.load(Ordering::Acquire) & (IO_GETUID | IO_GETGID) == IO_GETUID | IO_GETGID
 }
 
 pub fn last_completed(number: Number) -> bool {
@@ -322,6 +330,14 @@ pub extern "C" fn wovenhat_syscall_dispatch(number: u64, arg0: u64, arg1: u64, a
         value if value == Number::Close as u64 => sys_close(arg0),
         value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),
         value if value == Number::MessageReceive as u64 => sys_message_receive(arg0, arg1, arg2),
+        value if value == Number::Getuid as u64 => {
+            IO_COMPLETIONS.fetch_or(IO_GETUID, Ordering::Release);
+            u64::from(crate::task::current_credentials().uid)
+        }
+        value if value == Number::Getgid as u64 => {
+            IO_COMPLETIONS.fetch_or(IO_GETGID, Ordering::Release);
+            u64::from(crate::task::current_credentials().gid)
+        }
         value if value == Number::Yield as u64 => {
             YIELD_PENDING.store(true, Ordering::Release);
             0

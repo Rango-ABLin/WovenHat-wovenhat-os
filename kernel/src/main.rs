@@ -536,6 +536,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("USER MMAP/MUNMAP: FAILED");
         halt();
     }
+    if !syscall::user_identity_verified() {
+        console.println("USER UID/GID SYSCALLS: FAILED");
+        halt();
+    }
+    console.println("USER UID/GID SYSCALLS: OK");
     serial::write_line(format_args!(
         "[BOOT] user mmap/write/read/munmap and frame return verified"
     ));
