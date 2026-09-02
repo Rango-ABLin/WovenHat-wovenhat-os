@@ -15,6 +15,7 @@ mod device;
 mod elf;
 mod fat32;
 mod gdt;
+mod gpt;
 mod graphics;
 mod gui;
 mod hal;
@@ -206,6 +207,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("KERNEL HEAP: 256 KIB OK");
     } else {
         console.println("KERNEL HEAP: SELF TEST FAILED");
+        halt();
+    }
+    if gpt::self_test() {
+        console.println("GPT PARTITIONS: VALIDATED");
+    } else {
+        console.println("GPT PARTITIONS: VALIDATION FAILED");
         halt();
     }
     if partition::self_test() {

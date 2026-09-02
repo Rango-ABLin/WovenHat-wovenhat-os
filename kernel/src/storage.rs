@@ -1,4 +1,4 @@
-use crate::{ata, fat32, partition, vfs};
+use crate::{ata, fat32, gpt, partition, vfs};
 
 const MAX_ROOT_FILES: usize = 8;
 const DIRECTORY_ATTRIBUTE: u8 = 0x10;
@@ -18,17 +18,25 @@ pub fn mount_ata_root() -> MountStatus {
             return direct;
         }
         match partition::find_fat32(disk) {
-            Ok(Some(partition)) => {
-                let Ok(mut view) = partition::PartitionDevice::new(disk, partition) else {
-                    return MountStatus::Failed;
-                };
-                mount_device(&mut view)
-            }
-            Ok(None) => MountStatus::NotFat32,
+            Ok(Some(partition)) => mount_partition(disk, partition),
+            Ok(None) => match gpt::find_fat_partition(disk) {
+                Ok(Some(partition)) => mount_partition(disk, partition),
+                Ok(None) | Err(gpt::Error::MissingProtectiveMbr) => MountStatus::NotFat32,
+                Err(_) => MountStatus::Failed,
+            },
             Err(_) => MountStatus::Failed,
         }
     })
     .unwrap_or(MountStatus::NoDevice)
+}
+fn mount_partition(
+    device: &mut impl crate::block::BlockDevice,
+    partition: partition::Partition,
+) -> MountStatus {
+    let Ok(mut view) = partition::PartitionDevice::new(device, partition) else {
+        return MountStatus::Failed;
+    };
+    mount_device(&mut view)
 }
 fn mount_device(device: &mut impl crate::block::BlockDevice) -> MountStatus {
     let volume = match fat32::mount(device) {

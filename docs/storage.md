@@ -46,24 +46,27 @@ The parser reports corrupt and unsupported media without indexing outside a sect
 
 The VFS uses a bounded 16-node registry with 64-byte paths and 8 KiB file payloads.
 Built-in files retain explicit write permissions. When ata0 contains a FAT32 volume,
-boot first checks for a superfloppy filesystem at LBA 0 and then checks the four primary
-MBR entries for FAT32 types 0x0B and 0x0C. Partition-relative reads are bounds checked
-against both the selected partition and the underlying device. Boot imports up to eight
+boot first checks for a superfloppy filesystem at LBA 0, then the four primary MBR
+entries for FAT32 types 0x0B and 0x0C, and finally a CRC-validated GPT behind a
+protective MBR. EFI System and Microsoft Basic Data GUIDs are candidates; FAT32 BPB
+validation determines the actual format. Partition-relative reads are bounds checked
+against both the selected partition and underlying device. See
+[partition-table discovery](partition-tables.md). Boot imports up to eight
 regular root files as read-only lowercase 8.3 paths below /mnt and records the resulting
 node count for later lifecycle checks. No-disk and non-FAT media are non-fatal outcomes.
 
 ## Current boundary
 
 File reads follow at most 64 clusters and may span multiple sectors and clusters.
-Subdirectory lookup, GPT discovery, and directory mutation are not yet
+Subdirectory lookup and directory mutation are not yet
 implemented. The next storage increments are:
 
 1. Subdirectory lookup and path traversal.
-2. GPT partition discovery with protective-MBR handling.
+2. Backup-GPT validation and extended/logical MBR partitions.
 3. ATA writes plus secondary-channel and slave-device discovery.
 4. AHCI, NVMe, or virtio-blk transport.
 5. Crash-safe file and directory updates.
 
 Boot-time self-tests validate block bounds, read-only protection, FAT32 geometry,
-root-chain lookup, missing entries, invalid signatures, MBR bounds and partition-relative I/O, multi-cluster reads,
+root-chain lookup, missing entries, invalid signatures, MBR/GPT bounds, GPT CRC corruption, partition-relative I/O, multi-cluster reads,
 end-of-chain handling, and file/directory cycle rejection.
