@@ -40,7 +40,6 @@ use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, Boo
 use console::Console;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{alloc::Layout, panic::PanicInfo};
-use keyboard::Keyboard;
 use shell::Shell;
 
 use x86_64::instructions::interrupts::int3;
@@ -244,6 +243,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
+    if keyboard::self_test() {
+        console.println("KEYBOARD DECODER: OK");
+    } else {
+        console.println("KEYBOARD DECODER: FAILED");
+        halt();
+    }
     if gui::self_test() {
         console.println("GUI INPUT: OK");
     } else {
@@ -467,6 +472,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     console.println("TIMER IRQ: OK");
 
+    keyboard::inject_validation_input(2);
     let isolation_baseline = memory::stats().allocated_frames;
     let Some(first_program) = userspace::create_exec_process() else {
         console.println("USER PROCESS IMAGE: MAPPING FAILED");
@@ -562,6 +568,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
     console.println("USER FORK ADDRESS-SPACE CLONE: OK");
+    if !syscall::user_standard_streams_verified() {
+        console.println("USER STDIN SYSCALL: FAILED");
+        halt();
+    }
+    console.println("USER STANDARD STREAMS: OK");
     console.println("USER UID/GID SYSCALLS: OK");
     serial::write_line(format_args!(
         "[BOOT] user mmap/write/read/munmap and frame return verified"
@@ -663,10 +674,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // scancodes; decoding and rendering remain in the main loop.
     //
 
-    let mut keyboard = Keyboard::new();
-
     loop {
-        if let Some(key) = keyboard.poll() {
+        if let Some(key) = keyboard::poll() {
             if matches!(key, keyboard::Key::F1) {
                 desktop_active = !desktop_active;
                 if desktop_active {

@@ -13,6 +13,10 @@ unmasked.
 | `pit` | Timer | 0 |
 | `ps2-keyboard` | Keyboard | 1 |
 
+The PS/2 interrupt path queues raw set-1 scancodes. A shared decoder supplies both the
+kernel UI and the nonblocking userspace standard-input endpoint without allocating in
+the IRQ handler.
+
 ## PCI inventory
 
 The HAL scans PCI configuration mechanism 1 across all 256 buses, 32 device slots,

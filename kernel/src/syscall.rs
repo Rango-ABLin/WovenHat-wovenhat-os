@@ -105,6 +105,8 @@ const IO_GETUID: u64 = 1 << 7;
 const IO_GETGID: u64 = 1 << 8;
 const IO_EXEC: u64 = 1 << 9;
 const IO_FORK: u64 = 1 << 10;
+const IO_STDIN: u64 = 1 << 11;
+const IO_STDERR: u64 = 1 << 12;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Number {
@@ -184,6 +186,9 @@ pub fn user_io_verified() -> bool {
         == IO_WRITE | IO_OPEN | IO_READ | IO_CLOSE
 }
 
+pub fn user_standard_streams_verified() -> bool {
+    IO_COMPLETIONS.load(Ordering::Acquire) & (IO_STDIN | IO_STDERR) == IO_STDIN | IO_STDERR
+}
 pub fn user_memory_verified() -> bool {
     IO_COMPLETIONS.load(Ordering::Acquire) & (IO_MMAP | IO_MUNMAP) == IO_MMAP | IO_MUNMAP
 }
@@ -252,6 +257,9 @@ fn sys_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
     }
     crate::serial::write_bytes(&buffer[..length]);
     IO_COMPLETIONS.fetch_or(IO_WRITE, Ordering::Release);
+    if descriptor == 2 {
+        IO_COMPLETIONS.fetch_or(IO_STDERR, Ordering::Release);
+    }
     length as u64
 }
 
@@ -286,6 +294,17 @@ fn sys_read(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     let mut buffer = [0_u8; MAX_IO_SIZE];
+    if descriptor == 0 {
+        if !crate::task::current_has(crate::capability::Capability::Console) {
+            return SYSCALL_ERROR;
+        }
+        let count = crate::keyboard::read_bytes(&mut buffer[..length]);
+        if crate::paging::copy_to_current_user(user_buffer, &buffer[..count]).is_err() {
+            return SYSCALL_ERROR;
+        }
+        IO_COMPLETIONS.fetch_or(IO_STDIN, Ordering::Release);
+        return count as u64;
+    }
     let Ok(count) = crate::task::read_current(descriptor, &mut buffer[..length]) else {
         return SYSCALL_ERROR;
     };

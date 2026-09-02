@@ -24,6 +24,8 @@ sentinel. The assembly entry preserves general registers and returns with iretq.
 | 15 | exec | user path, path length |
 | 16 | fork | none |
 
+Descriptor 0 reads the nonblocking PS/2 byte stream; descriptors 1 and 2 write to COM1. The reserved standard descriptors cannot be closed, and VFS handles begin at 3. See [standard streams](standard-streams.md).
+
 All paths and I/O payloads have fixed upper bounds. Pointer-bearing calls translate and
 validate each user page before copying. File and IPC calls additionally pass capability,
 credential, descriptor, and VFS/queue checks.
