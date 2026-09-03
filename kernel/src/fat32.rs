@@ -122,12 +122,23 @@ pub fn mount(device: &mut impl BlockDevice) -> Result<Volume, Error> {
     })
 }
 
+/// Look up a short name in the volume root directory.
 pub fn find_root(
     device: &mut impl BlockDevice,
     volume: Volume,
     short_name: &[u8; 11],
 ) -> Result<DirectoryEntry, Error> {
-    let mut cluster = volume.root_cluster;
+    find_in_directory(device, volume, volume.root_cluster, short_name)
+}
+
+/// Look up a short name in any directory starting at `dir_cluster`.
+pub fn find_in_directory(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    dir_cluster: u32,
+    short_name: &[u8; 11],
+) -> Result<DirectoryEntry, Error> {
+    let mut cluster = dir_cluster;
     let mut visited = [0_u32; MAX_READ_CLUSTERS];
     let mut visited_count = 0;
     let mut sector = [0_u8; SECTOR_SIZE];
@@ -161,12 +172,23 @@ pub fn find_root(
     }
 }
 
+/// List entries in the volume root directory.
 pub fn list_root(
     device: &mut impl BlockDevice,
     volume: Volume,
     output: &mut [Option<DirectoryEntry>],
 ) -> Result<usize, Error> {
-    let mut cluster = volume.root_cluster;
+    list_directory(device, volume, volume.root_cluster, output)
+}
+
+/// List entries in any directory starting at `dir_cluster`.
+pub fn list_directory(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    dir_cluster: u32,
+    output: &mut [Option<DirectoryEntry>],
+) -> Result<usize, Error> {
+    let mut cluster = dir_cluster;
     let mut visited = [0_u32; MAX_READ_CLUSTERS];
     let mut visited_count = 0;
     let mut count = 0;
@@ -219,6 +241,87 @@ pub fn list_root(
             ClusterLink::Next(next) => next,
             ClusterLink::End => return Ok(count),
         };
+    }
+}
+
+/// Resolve a Unix-style absolute path of 8.3 components against a FAT32 volume.
+///
+/// Example: `"/BIN/SH"` or `"BIN/SH"` (leading slash optional). Each component is
+/// converted to a FAT 8.3 short name. Returns the final directory entry.
+pub fn resolve_path(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    path: &str,
+) -> Result<DirectoryEntry, Error> {
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        return Err(Error::NotFound);
+    }
+
+    // Collect up to 8 path components without allocation.
+    let mut parts = [""; 8];
+    let mut part_count = 0usize;
+    for component in path.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." || part_count == parts.len() {
+            return Err(Error::NotFound);
+        }
+        parts[part_count] = component;
+        part_count += 1;
+    }
+    if part_count == 0 {
+        return Err(Error::NotFound);
+    }
+
+    let mut cluster = volume.root_cluster;
+    let mut current = None;
+    for (i, component) in parts[..part_count].iter().enumerate() {
+        let short = encode_short_name(component).ok_or(Error::NotFound)?;
+        let entry = find_in_directory(device, volume, cluster, &short)?;
+        let is_last = i + 1 == part_count;
+        if !is_last {
+            if entry.attributes & 0x10 == 0 || entry.first_cluster < 2 {
+                return Err(Error::NotFound);
+            }
+            cluster = entry.first_cluster;
+        }
+        current = Some(entry);
+    }
+    current.ok_or(Error::NotFound)
+}
+
+/// Encode a path component into a FAT 8.3 short name (space-padded).
+pub fn encode_short_name(name: &str) -> Option<[u8; 11]> {
+    if name.is_empty() || name.len() > 12 {
+        return None;
+    }
+    let mut out = [b' '; 11];
+    let (base, ext) = match name.find('.') {
+        Some(pos) => (&name[..pos], &name[pos + 1..]),
+        None => (name, ""),
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    if base.contains('.') || ext.contains('.') {
+        return None;
+    }
+    for (i, byte) in base.bytes().enumerate() {
+        out[i] = to_fat_char(byte)?;
+    }
+    for (i, byte) in ext.bytes().enumerate() {
+        out[8 + i] = to_fat_char(byte)?;
+    }
+    Some(out)
+}
+
+fn to_fat_char(byte: u8) -> Option<u8> {
+    match byte {
+        b'a'..=b'z' => Some(byte - (b'a' - b'A')),
+        b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' => Some(byte),
+        _ => None,
     }
 }
 

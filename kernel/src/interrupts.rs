@@ -147,9 +147,24 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     let address = Cr2::read();
+    let fault_address = address.ok().map(|addr| addr.as_u64());
+
+    // Copy-on-write: user write to a present read-only page that is
+    // logically writable in the process mapping tables.
+    if error_code.contains(PageFaultErrorCode::USER_MODE)
+        && error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+        && error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+    {
+        if let Some(addr) = fault_address {
+            if task::try_handle_cow_fault(addr) {
+                return;
+            }
+        }
+    }
+
     dump_exception_context("PAGE FAULT", &stack_frame, Some(error_code.bits()));
-    if let Ok(addr) = address {
-        serial::write_fmt(format_args!("FAULT ADDRESS: {:#x}\n", addr.as_u64()));
+    if let Some(addr) = fault_address {
+        serial::write_fmt(format_args!("FAULT ADDRESS: {:#x}\n", addr));
     } else {
         serial::write_fmt(format_args!("FAULT ADDRESS: UNAVAILABLE\n"));
     }

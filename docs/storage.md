@@ -58,14 +58,18 @@ node count for later lifecycle checks. No-disk and non-FAT media are non-fatal o
 ## Current boundary
 
 File reads follow at most 64 clusters and may span multiple sectors and clusters.
-Subdirectory lookup and directory mutation are not yet
-implemented. The next storage increments are:
+Subdirectory **lookup and path resolution** are implemented (`find_in_directory`,
+`list_directory`, `resolve_path`, `encode_short_name`). Boot import walks up to
+two directory levels into the VFS under `/mnt`. Directory mutation (create/write
+on disk) is not yet implemented.
 
-1. Subdirectory lookup and path traversal.
-2. Backup-GPT validation and extended/logical MBR partitions.
-3. ATA writes plus secondary-channel and slave-device discovery.
-4. AHCI, NVMe, or virtio-blk transport.
-5. Crash-safe file and directory updates.
+Next storage increments:
+
+1. Backup-GPT validation and extended/logical MBR partitions.
+2. ATA writes plus secondary-channel and slave-device discovery.
+3. AHCI, NVMe, or virtio-blk transport.
+4. Crash-safe file and directory updates on media.
+5. Deeper than 2-level import / on-demand path resolution into VFS.
 
 Boot-time self-tests validate block bounds, read-only protection, FAT32 geometry,
 root-chain lookup, missing entries, invalid signatures, MBR/GPT bounds, GPT CRC corruption, partition-relative I/O, multi-cluster reads,

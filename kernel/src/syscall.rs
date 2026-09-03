@@ -129,6 +129,19 @@ pub enum Number {
     Getgid = 14,
     Exec = 15,
     Fork = 16,
+    /// path ptr, path len → packs kind|size|writable into return value
+    Stat = 17,
+    /// path ptr, path len, entry index → writes DirEntry to user buffer in RSI... 
+    /// Actually: arg0=path, arg1=path_len, arg2=index; entry copied via a side channel is awkward.
+    /// Convention: arg0=path ptr, arg1=path len | (index<<32), arg2=user buffer for name (MAX_DIR_NAME).
+    /// Return: name length | (kind<<16), or error.
+    Readdir = 18,
+    /// path ptr, path len
+    Mkdir = 19,
+    /// path ptr, path len
+    Chdir = 20,
+    /// user buffer, capacity → length written
+    Getcwd = 21,
 }
 
 pub fn entry_address() -> u64 {
@@ -282,6 +295,137 @@ fn sys_open(user_path: u64, length: u64) -> u64 {
             IO_COMPLETIONS.fetch_or(IO_OPEN, Ordering::Release);
             descriptor
         }
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+/// `stat(path)` → packed result:
+/// bits[7:0]   = kind (0=file, 1=directory)
+/// bits[39:8]  = size (24 bits)
+/// bit 40      = writable
+fn sys_stat(user_path: u64, length: u64) -> u64 {
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut path_buf = [0_u8; MAX_PATH_SIZE];
+    if crate::paging::copy_from_current_user(user_path, &mut path_buf[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(path) = core::str::from_utf8(&path_buf[..length]) else {
+        return SYSCALL_ERROR;
+    };
+    match crate::task::stat_path(path) {
+        Ok(stat) => {
+            let kind = match stat.kind {
+                crate::vfs::NodeKind::File => 0u64,
+                crate::vfs::NodeKind::Directory => 1u64,
+            };
+            let size = (stat.size as u64) & 0x00FF_FFFF;
+            let writable = u64::from(stat.writable);
+            kind | (size << 8) | (writable << 40)
+        }
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+/// `readdir(path, index, name_buf)`
+/// arg0 = path pointer, arg1 = path length, arg2 = (index << 32) | name_buf_ptr low...
+/// Simpler: arg0=path, arg1=path_len, arg2=index.
+/// Name is written to a fixed side-buffer? No — use:
+///   arg0 = path ptr
+///   arg1 = path_len | (index << 16)
+///   arg2 = user buffer for name (at least MAX_DIR_NAME bytes)
+/// Return: name_length | (kind << 8) on success.
+fn sys_readdir(user_path: u64, path_len_and_index: u64, user_name_buf: u64) -> u64 {
+    let path_len = (path_len_and_index & 0xFFFF) as usize;
+    let index = (path_len_and_index >> 16) as usize;
+    if path_len == 0 || path_len > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut path_buf = [0_u8; MAX_PATH_SIZE];
+    if crate::paging::copy_from_current_user(user_path, &mut path_buf[..path_len]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(path) = core::str::from_utf8(&path_buf[..path_len]) else {
+        return SYSCALL_ERROR;
+    };
+    match crate::task::readdir_path(path, index) {
+        Ok(entry) => {
+            if crate::paging::copy_to_current_user(user_name_buf, &entry.name[..entry.name_length])
+                .is_err()
+            {
+                return SYSCALL_ERROR;
+            }
+            let kind = match entry.kind {
+                crate::vfs::NodeKind::File => 0u64,
+                crate::vfs::NodeKind::Directory => 1u64,
+            };
+            (entry.name_length as u64) | (kind << 8)
+        }
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+
+fn sys_chdir(user_path: u64, length: u64) -> u64 {
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut path_buf = [0_u8; MAX_PATH_SIZE];
+    if crate::paging::copy_from_current_user(user_path, &mut path_buf[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(path) = core::str::from_utf8(&path_buf[..length]) else {
+        return SYSCALL_ERROR;
+    };
+    match crate::task::chdir_current(path) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_getcwd(user_buffer: u64, capacity: u64) -> u64 {
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return SYSCALL_ERROR;
+    };
+    if capacity == 0 || capacity > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut path_buf = [0_u8; MAX_PATH_SIZE];
+    let Ok(len) = crate::task::current_cwd_str(&mut path_buf) else {
+        return SYSCALL_ERROR;
+    };
+    if len > capacity {
+        return SYSCALL_ERROR;
+    }
+    if crate::paging::copy_to_current_user(user_buffer, &path_buf[..len]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    len as u64
+}
+
+fn sys_mkdir(user_path: u64, length: u64) -> u64 {
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut path_buf = [0_u8; MAX_PATH_SIZE];
+    if crate::paging::copy_from_current_user(user_path, &mut path_buf[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(path) = core::str::from_utf8(&path_buf[..length]) else {
+        return SYSCALL_ERROR;
+    };
+    match crate::task::mkdir_path(path) {
+        Ok(()) => 0,
         Err(_) => SYSCALL_ERROR,
     }
 }
@@ -460,7 +604,9 @@ fn sys_exec(user_path: u64, length: u64) -> u64 {
         );
         return SYSCALL_ERROR;
     };
-    let Some(program) = crate::userspace::load_elf(&image[..image_length]) else {
+    let Some(program) =
+        crate::userspace::load_elf_with_argv(&image[..image_length], &[path])
+    else {
         crate::audit::record(
             actor,
             crate::audit::Action::ProcessExec,
@@ -518,6 +664,11 @@ pub extern "C" fn wovenhat_syscall_dispatch(
             Err(crate::task::WaitError::StillRunning) => u64::MAX - 1,
             Err(crate::task::WaitError::NoSuchChild) => u64::MAX,
         },
+        value if value == Number::Stat as u64 => sys_stat(arg0, arg1),
+        value if value == Number::Readdir as u64 => sys_readdir(arg0, arg1, arg2),
+        value if value == Number::Mkdir as u64 => sys_mkdir(arg0, arg1),
+        value if value == Number::Chdir as u64 => sys_chdir(arg0, arg1),
+        value if value == Number::Getcwd as u64 => sys_getcwd(arg0, arg1),
         _ => u64::MAX,
     };
 

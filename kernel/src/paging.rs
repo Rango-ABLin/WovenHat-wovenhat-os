@@ -14,7 +14,86 @@ use crate::memory;
 const TEST_PAGE_ADDRESS: u64 = 0x4444_4444_0000;
 const TEST_VALUE: u64 = 0x574F_5645_4E48_4154;
 
+/// Maximum number of physical frames currently participating in COW sharing.
+const MAX_COW_FRAMES: usize = 1024;
+
 static PAGING: Mutex<PagingState> = Mutex::new(PagingState::empty());
+static COW_TABLE: Mutex<CowTable> = Mutex::new(CowTable::empty());
+
+/// Tracks reference counts for frames shared across address spaces after fork.
+struct CowEntry {
+    frame: u64,
+    refcount: u32,
+    occupied: bool,
+}
+
+impl CowEntry {
+    const fn empty() -> Self {
+        Self {
+            frame: 0,
+            refcount: 0,
+            occupied: false,
+        }
+    }
+}
+
+struct CowTable {
+    entries: [CowEntry; MAX_COW_FRAMES],
+}
+
+impl CowTable {
+    const fn empty() -> Self {
+        Self {
+            entries: [CowEntry::empty(); MAX_COW_FRAMES],
+        }
+    }
+
+    fn find_slot(&self, frame: u64) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.occupied && entry.frame == frame)
+    }
+
+    /// Register a newly shared frame. First share sets refcount to 2 (parent + child).
+    fn share(&mut self, frame: u64) -> Result<(), MapRangeError> {
+        if let Some(slot) = self.find_slot(frame) {
+            self.entries[slot].refcount = self.entries[slot].refcount.saturating_add(1);
+            return Ok(());
+        }
+        let slot = self
+            .entries
+            .iter()
+            .position(|entry| !entry.occupied)
+            .ok_or(MapRangeError::OutOfFrames)?;
+        self.entries[slot] = CowEntry {
+            frame,
+            refcount: 2,
+            occupied: true,
+        };
+        Ok(())
+    }
+
+    /// Drop one reference. Returns true if the frame should be freed.
+    fn release(&mut self, frame: u64) -> bool {
+        let Some(slot) = self.find_slot(frame) else {
+            // Not shared — caller should free normally.
+            return true;
+        };
+        let entry = &mut self.entries[slot];
+        entry.refcount = entry.refcount.saturating_sub(1);
+        if entry.refcount == 0 {
+            *entry = CowEntry::empty();
+            return true;
+        }
+        false
+    }
+
+    fn refcount(&self, frame: u64) -> u32 {
+        self.find_slot(frame)
+            .map(|slot| self.entries[slot].refcount)
+            .unwrap_or(1)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AddressSpace {
@@ -310,6 +389,7 @@ pub fn map_user_range_in(
     }
     Ok(())
 }
+/// Eager byte-copy clone (legacy). Prefer [`share_user_range_in`] for fork.
 pub fn clone_user_range_in(
     source: AddressSpace,
     destination: AddressSpace,
@@ -371,6 +451,235 @@ pub fn clone_user_range_in(
         let _ = unmap_user_range_in(destination, start, size);
     }
     copy_result
+}
+
+/// Copy-on-write share: map `destination` to the same physical frames as `source`.
+///
+/// If the logical mapping is writable, both address spaces receive the page as
+/// read-only. The first write faults and is resolved by [`try_break_cow`].
+pub fn share_user_range_in(
+    source: AddressSpace,
+    destination: AddressSpace,
+    start: u64,
+    size: usize,
+    writable: bool,
+    executable: bool,
+) -> Result<(), MapRangeError> {
+    if source == destination {
+        return Err(MapRangeError::InvalidRange);
+    }
+    let (start_page, end_page) = page_range(start, size)?;
+    // Writable pages become RO in both spaces so a later write can break COW.
+    let shared_writable = false;
+    let flags = user_flags(shared_writable, executable);
+
+    let paging = PAGING.lock();
+    let mut source_mapper = mapper_for(&paging, source)?;
+    let mut destination_mapper = mapper_for(&paging, destination)?;
+    let mut allocator = memory::allocator();
+    let mut cow = COW_TABLE.lock();
+    let mut mapped_pages = 0usize;
+
+    for page in Page::range_inclusive(start_page, end_page) {
+        let TranslateResult::Mapped {
+            frame,
+            offset,
+            flags: source_flags,
+        } = source_mapper.translate(page.start_address())
+        else {
+            rollback_shared(
+                &mut destination_mapper,
+                &mut *allocator,
+                &mut cow,
+                start_page,
+                mapped_pages,
+            );
+            return Err(MapRangeError::NotMapped);
+        };
+        if offset != 0 || !source_flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            rollback_shared(
+                &mut destination_mapper,
+                &mut *allocator,
+                &mut cow,
+                start_page,
+                mapped_pages,
+            );
+            return Err(MapRangeError::MappingFailed);
+        }
+
+        if destination_mapper
+            .translate_addr(page.start_address())
+            .is_some()
+        {
+            rollback_shared(
+                &mut destination_mapper,
+                &mut *allocator,
+                &mut cow,
+                start_page,
+                mapped_pages,
+            );
+            return Err(MapRangeError::AlreadyMapped);
+        }
+
+        // Map destination to the same frame.
+        match unsafe { destination_mapper.map_to(page, frame, flags, &mut *allocator) } {
+            Ok(flush) => {
+                flush.ignore();
+            }
+            Err(_) => {
+                rollback_shared(
+                    &mut destination_mapper,
+                    &mut *allocator,
+                    &mut cow,
+                    start_page,
+                    mapped_pages,
+                );
+                return Err(MapRangeError::MappingFailed);
+            }
+        }
+
+        // Strip write permission from the source page when the range is logically writable.
+        if writable && source_flags.contains(PageTableFlags::WRITABLE) {
+            let ro_flags = user_flags(false, executable);
+            if unsafe { source_mapper.update_flags(page, ro_flags) }.is_err() {
+                rollback_shared(
+                    &mut destination_mapper,
+                    &mut *allocator,
+                    &mut cow,
+                    start_page,
+                    mapped_pages + 1,
+                );
+                return Err(MapRangeError::MappingFailed);
+            }
+        }
+
+        // Track sharing for every page that is (or becomes) COW-backed.
+        // Read-only pages are also shared so unmap refcounting stays correct.
+        if cow.share(frame.start_address().as_u64()).is_err() {
+            rollback_shared(
+                &mut destination_mapper,
+                &mut *allocator,
+                &mut cow,
+                start_page,
+                mapped_pages + 1,
+            );
+            return Err(MapRangeError::OutOfFrames);
+        }
+        mapped_pages += 1;
+    }
+    Ok(())
+}
+
+fn rollback_shared(
+    destination_mapper: &mut OffsetPageTable<'static>,
+    allocator: &mut memory::PhysicalFrameAllocator,
+    cow: &mut CowTable,
+    start_page: Page<Size4KiB>,
+    mapped_pages: usize,
+) {
+    let mut page = start_page;
+    for _ in 0..mapped_pages {
+        if let Ok((frame, flush)) = destination_mapper.unmap(page) {
+            flush.ignore();
+            let phys = frame.start_address().as_u64();
+            if cow.release(phys) {
+                let _ = allocator.deallocate_frame(frame);
+            }
+        }
+        page = Page::containing_address(page.start_address() + Size4KiB::SIZE);
+    }
+}
+
+/// Resolve a user write fault on a COW page.
+///
+/// Returns `true` if the fault was handled (caller should resume the process).
+pub fn try_break_cow(address_space: AddressSpace, fault_address: u64) -> bool {
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(fault_address));
+    let paging = PAGING.lock();
+    let Ok(mut mapper) = mapper_for(&paging, address_space) else {
+        return false;
+    };
+
+    let TranslateResult::Mapped {
+        frame: old_frame,
+        offset,
+        flags,
+    } = mapper.translate(page.start_address())
+    else {
+        return false;
+    };
+    if offset != 0 || !flags.contains(PageTableFlags::PRESENT) {
+        return false;
+    }
+    // Only break when the hardware page is currently read-only.
+    if flags.contains(PageTableFlags::WRITABLE) {
+        return false;
+    }
+
+    let old_phys = old_frame.start_address().as_u64();
+    let mut cow = COW_TABLE.lock();
+    let refs = cow.refcount(old_phys);
+
+    // Preserve NX / USER bits from the existing mapping; add WRITABLE.
+    let mut new_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+    if flags.contains(PageTableFlags::NO_EXECUTE) {
+        new_flags |= PageTableFlags::NO_EXECUTE;
+    }
+
+    if refs <= 1 {
+        // Sole owner: just restore write permission. Keep the frame.
+        if unsafe { mapper.update_flags(page, new_flags) }.is_err() {
+            return false;
+        }
+        if let Some(slot) = cow.find_slot(old_phys) {
+            cow.entries[slot] = CowEntry::empty();
+        }
+        return true;
+    }
+
+    // Shared: allocate a private copy.
+    let Some(new_frame) = memory::allocate_frame() else {
+        return false;
+    };
+    let source_pointer =
+        (paging.physical_memory_offset.checked_add(old_phys).unwrap_or(0)) as *const u8;
+    let destination_pointer = (paging
+        .physical_memory_offset
+        .checked_add(new_frame.start_address().as_u64())
+        .unwrap_or(0)) as *mut u8;
+    if source_pointer.is_null() || destination_pointer.is_null() {
+        let _ = memory::deallocate_frame(new_frame);
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(source_pointer, destination_pointer, Size4KiB::SIZE as usize);
+    }
+
+    // Replace mapping. x86_64 Mapper has no direct remap, so unmap + map.
+    let Ok((_, flush)) = mapper.unmap(page) else {
+        let _ = memory::deallocate_frame(new_frame);
+        return false;
+    };
+    flush.ignore();
+
+    let mut allocator = memory::allocator();
+    match unsafe { mapper.map_to(page, new_frame, new_flags, &mut *allocator) } {
+        Ok(flush) => {
+            flush.flush();
+        }
+        Err(_) => {
+            // Best-effort restore of the old mapping.
+            let _ = unsafe { mapper.map_to(page, old_frame, flags, &mut *allocator) };
+            let _ = memory::deallocate_frame(new_frame);
+            return false;
+        }
+    }
+
+    // Drop one reference on the shared frame.
+    if cow.release(old_phys) {
+        let _ = memory::deallocate_frame(old_frame);
+    }
+    true
 }
 pub fn protect_user_range_in(
     address_space: AddressSpace,
@@ -450,6 +759,16 @@ pub fn zero_user_range_in(
     }
     Ok(())
 }
+fn release_frame(frame: PhysFrame<Size4KiB>) -> bool {
+    let phys = frame.start_address().as_u64();
+    let should_free = COW_TABLE.lock().release(phys);
+    if should_free {
+        memory::deallocate_frame(frame)
+    } else {
+        true
+    }
+}
+
 pub fn unmap_user_range_in(
     address_space: AddressSpace,
     start: u64,
@@ -466,12 +785,13 @@ pub fn unmap_user_range_in(
         } else {
             flush.ignore();
         }
-        if !memory::deallocate_frame(frame) {
+        if !release_frame(frame) {
             return Err(MapRangeError::MappingFailed);
         }
     }
     Ok(())
 }
+
 pub fn destroy_user_address_space(
     address_space: AddressSpace,
     ranges: &[(u64, usize)],
@@ -487,7 +807,7 @@ pub fn destroy_user_address_space(
         for page in Page::range_inclusive(start_page, end_page) {
             let (frame, flush) = mapper.unmap(page).map_err(|_| MapRangeError::NotMapped)?;
             flush.ignore();
-            if !memory::deallocate_frame(frame) {
+            if !release_frame(frame) {
                 return Err(MapRangeError::MappingFailed);
             }
         }

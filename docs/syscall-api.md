@@ -23,6 +23,11 @@ sentinel. The assembly entry preserves general registers and returns with iretq.
 | 14 | getgid | none |
 | 15 | exec | user path, path length |
 | 16 | fork | none |
+| 17 | stat | user path, path length → packed kind/size/writable |
+| 18 | readdir | user path, path_len|(index<<16), user name buffer → name_len|(kind<<8) |
+| 19 | mkdir | user path, path length |
+| 20 | chdir | user path, path length |
+| 21 | getcwd | user buffer, capacity → length |
 
 Descriptor 0 reads the nonblocking PS/2 byte stream; descriptors 1 and 2 write to COM1. The reserved standard descriptors cannot be closed, and VFS handles begin at 3. See [standard streams](standard-streams.md).
 
@@ -54,6 +59,6 @@ descriptor tables and do not overcommit memory.
 
 ## Current boundary
 
-Fork currently performs eager deep copies rather than copy-on-write, and descriptor
-positions are copied by value rather than shared through reference-counted open-file
-descriptions. There is no `argv`/environment transfer yet.
+Fork uses copy-on-write page sharing; open-file descriptions are reference-counted so
+offsets are shared across parent and child. There is no `argv`/environment transfer yet.
+Directories are first-class VFS nodes; `stat`, `readdir`, and `mkdir` are available.

@@ -375,6 +375,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("EXEC IMAGE: INSTALL FAILED");
         halt();
     }
+    if userspace::install_init_executable() {
+        console.println("INIT IMAGE: INSTALLED");
+    } else {
+        console.println("INIT IMAGE: INSTALL FAILED");
+        halt();
+    }
     let vfs_nodes_before_userspace = vfs::node_count();
     let boot_devices = [
         device::Device {

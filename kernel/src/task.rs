@@ -343,8 +343,12 @@ pub struct Process {
     pub credentials: Credentials,
     pub exit_code: i32,
     address_space: Option<userspace::AddressSpace>,
-    files: [Option<vfs::OpenFile>; MAX_FILE_DESCRIPTORS],
+    /// Per-process file-descriptor table. Entries are handles into the
+    /// system-wide refcounted open-file table in `vfs`.
+    files: [Option<vfs::OpenFileId>; MAX_FILE_DESCRIPTORS],
     memory_mappings: [Option<userspace::AnonymousMapping>; userspace::MAX_ANONYMOUS_MAPPINGS],
+    cwd: [u8; crate::config::MAX_PATH_SIZE],
+    cwd_len: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -365,6 +369,7 @@ pub enum FileError {
     NotFound,
     TooManyFiles,
     BadDescriptor,
+    AlreadyExists,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -537,6 +542,16 @@ fn create_process(
     parent: ProcessId,
     address_space: userspace::AddressSpace,
 ) -> Process {
+    let mut cwd = [0u8; crate::config::MAX_PATH_SIZE];
+    cwd[0] = b'/';
+    let mut cwd_len = 1usize;
+    {
+        let processes = PROCESS_TABLE.lock();
+        if let Some(parent_proc) = processes.iter().flatten().find(|p| p.id == parent) {
+            cwd = parent_proc.cwd;
+            cwd_len = parent_proc.cwd_len;
+        }
+    }
     Process {
         id: ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed)),
         task_id,
@@ -547,6 +562,31 @@ fn create_process(
         address_space: Some(address_space),
         files: [None; MAX_FILE_DESCRIPTORS],
         memory_mappings: [None; userspace::MAX_ANONYMOUS_MAPPINGS],
+        cwd,
+        cwd_len,
+    }
+}
+
+/// Clone a parent's file-descriptor table for fork.
+/// Each live descriptor bumps the shared open-file refcount so offsets are shared.
+fn clone_file_table(
+    parent_files: &[Option<vfs::OpenFileId>; MAX_FILE_DESCRIPTORS],
+) -> Result<[Option<vfs::OpenFileId>; MAX_FILE_DESCRIPTORS], ProcessError> {
+    let mut child_files = [None; MAX_FILE_DESCRIPTORS];
+    for (index, entry) in parent_files.iter().enumerate() {
+        if let Some(id) = entry {
+            child_files[index] = Some(vfs::clone_open_file(*id).map_err(|_| ProcessError::Full)?);
+        }
+    }
+    Ok(child_files)
+}
+
+/// Drop every open-file reference held by a process (used on close-all / reap).
+fn release_file_table(files: &mut [Option<vfs::OpenFileId>; MAX_FILE_DESCRIPTORS]) {
+    for entry in files.iter_mut() {
+        if let Some(id) = entry.take() {
+            let _ = vfs::close_open_file(id);
+        }
     }
 }
 
@@ -613,6 +653,29 @@ pub fn current_process_id() -> u64 {
         .flatten()
         .find(|process| process.task_id == task_id)
         .map_or(task_id.as_u64(), |process| process.id.as_u64())
+}
+
+/// Attempt to resolve a user write fault via copy-on-write.
+/// Returns true if the fault was handled and the process may resume.
+pub fn try_handle_cow_fault(fault_address: u64) -> bool {
+    let task_id = current_task_id();
+    let processes = PROCESS_TABLE.lock();
+    let Some(process) = processes
+        .iter()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+    else {
+        return false;
+    };
+    let Some(address_space) = process.address_space else {
+        return false;
+    };
+    if !address_space.is_logically_writable(fault_address, &process.memory_mappings) {
+        return false;
+    }
+    let paging_as = address_space.paging();
+    drop(processes);
+    paging::try_break_cow(paging_as, fault_address)
 }
 
 pub fn current_credentials() -> Credentials {
@@ -714,6 +777,18 @@ pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, P
             userspace::destroy_process_address_space(cloned_address_space, parent.memory_mappings);
         return Err(ProcessError::Full);
     }
+    let child_files = match clone_file_table(&parent.files) {
+        Ok(files) => files,
+        Err(err) => {
+            drop(processes);
+            drop(scheduler);
+            let _ = userspace::destroy_process_address_space(
+                cloned_address_space,
+                parent.memory_mappings,
+            );
+            return Err(err);
+        }
+    };
     scheduler.tasks[task_slot].initialize_fork(
         task_slot,
         child_task_id,
@@ -730,8 +805,10 @@ pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, P
         credentials: parent.credentials,
         exit_code: 0,
         address_space: Some(cloned_address_space),
-        files: parent.files,
+        files: child_files,
         memory_mappings: parent.memory_mappings,
+        cwd: parent.cwd,
+        cwd_len: parent.cwd_len,
     });
     Ok(child_id)
 }
@@ -799,6 +876,9 @@ pub fn exit_current_process(exit_code: i32) -> ! {
             .and_then(|process| {
                 process.state = ProcessState::Exited;
                 process.exit_code = exit_code;
+                // Drop open-file references as soon as the process exits so
+                // offsets and description slots are not held by zombies.
+                release_file_table(&mut process.files);
                 process.address_space.take().map(|address_space| {
                     let memory_mappings = core::mem::replace(
                         &mut process.memory_mappings,
@@ -843,16 +923,19 @@ pub fn wait_process(child_id: u64) -> Result<i32, WaitError> {
     ) else {
         return Err(WaitError::NoSuchChild);
     };
-    let process = processes[slot].ok_or(WaitError::NoSuchChild)?;
+    let process = processes[slot].as_mut().ok_or(WaitError::NoSuchChild)?;
     if process.state != ProcessState::Exited {
         return Err(WaitError::StillRunning);
     }
+    // Defensive: ensure no open-file references remain when the process slot is freed.
+    release_file_table(&mut process.files);
+    let exit_code = process.exit_code;
     assert!(
         ipc::unregister(child.as_u64()).is_ok(),
         "reaped process has no IPC endpoint"
     );
     processes[slot] = None;
-    Ok(process.exit_code)
+    Ok(exit_code)
 }
 
 pub fn zombie_count() -> usize {
@@ -948,8 +1031,9 @@ pub fn open_current(path: &str) -> Result<u64, FileError> {
     if !current_has(Capability::FileRead) {
         return Err(FileError::PermissionDenied);
     }
+    let path = resolve_path_for_current(path)?;
     let task_id = current_task_id();
-    let file = vfs::open(path).map_err(|_| FileError::NotFound)?;
+    let file = vfs::open(&path).map_err(|_| FileError::NotFound)?;
     let mut processes = PROCESS_TABLE.lock();
     let process = processes
         .iter_mut()
@@ -966,18 +1050,20 @@ pub fn open_current(path: &str) -> Result<u64, FileError> {
 pub fn read_current(descriptor: u64, buffer: &mut [u8]) -> Result<usize, FileError> {
     let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
     let task_id = current_task_id();
-    let mut processes = PROCESS_TABLE.lock();
+    let processes = PROCESS_TABLE.lock();
     let process = processes
-        .iter_mut()
+        .iter()
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let file = process
+    let id = process
         .files
-        .get_mut(descriptor)
-        .and_then(Option::as_mut)
+        .get(descriptor)
+        .copied()
+        .flatten()
         .ok_or(FileError::BadDescriptor)?;
-    vfs::read(file, buffer).map_err(|_| FileError::BadDescriptor)
+    drop(processes);
+    vfs::read(id, buffer).map_err(|_| FileError::BadDescriptor)
 }
 
 pub fn write_current(descriptor: u64, buffer: &[u8]) -> Result<usize, FileError> {
@@ -986,22 +1072,28 @@ pub fn write_current(descriptor: u64, buffer: &[u8]) -> Result<usize, FileError>
     }
     let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
     let task_id = current_task_id();
-    let mut processes = PROCESS_TABLE.lock();
+    let processes = PROCESS_TABLE.lock();
     let process = processes
-        .iter_mut()
+        .iter()
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let file = process
+    let id = process
         .files
-        .get_mut(descriptor)
-        .and_then(Option::as_mut)
+        .get(descriptor)
+        .copied()
+        .flatten()
         .ok_or(FileError::BadDescriptor)?;
-    vfs::write(file, buffer).map_err(|_| FileError::BadDescriptor)
+    drop(processes);
+    vfs::write(id, buffer).map_err(|_| FileError::BadDescriptor)
 }
 
 pub fn close_current(descriptor: u64) -> Result<(), FileError> {
     let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
+    // Standard streams cannot be closed.
+    if descriptor < 3 {
+        return Err(FileError::BadDescriptor);
+    }
     let task_id = current_task_id();
     let mut processes = PROCESS_TABLE.lock();
     let process = processes
@@ -1009,14 +1101,14 @@ pub fn close_current(descriptor: u64) -> Result<(), FileError> {
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let file = process
+    let id = process
         .files
         .get_mut(descriptor)
+        .ok_or(FileError::BadDescriptor)?
+        .take()
         .ok_or(FileError::BadDescriptor)?;
-    if file.take().is_none() {
-        return Err(FileError::BadDescriptor);
-    }
-    Ok(())
+    drop(processes);
+    vfs::close_open_file(id).map_err(|_| FileError::BadDescriptor)
 }
 
 pub fn open_file_count() -> usize {
@@ -1027,6 +1119,145 @@ pub fn open_file_count() -> usize {
         .map(|process| process.files.iter().flatten().count())
         .sum()
 }
+
+pub fn stat_path(path: &str) -> Result<vfs::Stat, FileError> {
+    if !current_has(Capability::FileRead) {
+        return Err(FileError::PermissionDenied);
+    }
+    let path = resolve_path_for_current(path)?;
+    vfs::stat(&path).map_err(|_| FileError::NotFound)
+}
+
+pub fn readdir_path(path: &str, index: usize) -> Result<vfs::DirEntry, FileError> {
+    if !current_has(Capability::FileRead) {
+        return Err(FileError::PermissionDenied);
+    }
+    let path = resolve_path_for_current(path)?;
+    vfs::readdir(&path, index).map_err(|_| FileError::NotFound)
+}
+
+pub fn mkdir_path(path: &str) -> Result<(), FileError> {
+    if !current_has(Capability::FileWrite) {
+        return Err(FileError::PermissionDenied);
+    }
+    let path = resolve_path_for_current(path)?;
+    match vfs::mkdir(&path) {
+        Ok(()) => Ok(()),
+        Err(vfs::Error::AlreadyExists) => Err(FileError::AlreadyExists),
+        Err(vfs::Error::Full) => Err(FileError::TooManyFiles),
+        Err(_) => Err(FileError::NotFound),
+    }
+}
+
+
+pub fn current_cwd_str(buf: &mut [u8]) -> Result<usize, FileError> {
+    let (cwd, len) = current_cwd();
+    if buf.len() < len {
+        return Err(FileError::TooManyFiles);
+    }
+    buf[..len].copy_from_slice(&cwd[..len]);
+    Ok(len)
+}
+
+pub fn current_cwd() -> ([u8; crate::config::MAX_PATH_SIZE], usize) {
+    let processes = PROCESS_TABLE.lock();
+    let task_id = current_task_id();
+    if let Some(p) = processes.iter().flatten().find(|p| p.task_id == task_id) {
+        return (p.cwd, p.cwd_len);
+    }
+    let mut root = [0u8; crate::config::MAX_PATH_SIZE];
+    root[0] = b'/';
+    (root, 1)
+}
+
+pub fn chdir_current(path: &str) -> Result<(), FileError> {
+    if !current_has(Capability::FileRead) {
+        return Err(FileError::PermissionDenied);
+    }
+    let absolute = resolve_path_for_current(path)?;
+    match vfs::stat(&absolute) {
+        Ok(stat) if stat.kind == vfs::NodeKind::Directory => {}
+        _ => return Err(FileError::NotFound),
+    }
+    let bytes = absolute.as_bytes();
+    if bytes.len() > crate::config::MAX_PATH_SIZE {
+        return Err(FileError::NotFound);
+    }
+    let mut processes = PROCESS_TABLE.lock();
+    let task_id = current_task_id();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|p| p.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    process.cwd = [0; crate::config::MAX_PATH_SIZE];
+    process.cwd[..bytes.len()].copy_from_slice(bytes);
+    process.cwd_len = bytes.len();
+    Ok(())
+}
+
+pub fn resolve_path_for_current(path: &str) -> Result<alloc::string::String, FileError> {
+    let cwd = current_cwd();
+    resolve_path_with_cwd(path, &cwd)
+}
+
+fn resolve_path_with_cwd(
+    path: &str,
+    cwd: &([u8; crate::config::MAX_PATH_SIZE], usize),
+) -> Result<alloc::string::String, FileError> {
+    if path.is_empty() {
+        return Err(FileError::NotFound);
+    }
+    if path.starts_with('/') {
+        return normalize_absolute(path);
+    }
+    let cwd_str = core::str::from_utf8(&cwd.0[..cwd.1]).map_err(|_| FileError::NotFound)?;
+    let mut joined = alloc::string::String::new();
+    if cwd_str == "/" {
+        joined.push('/');
+        joined.push_str(path);
+    } else {
+        joined.push_str(cwd_str);
+        joined.push('/');
+        joined.push_str(path);
+    }
+    normalize_absolute(&joined)
+}
+
+fn normalize_absolute(path: &str) -> Result<alloc::string::String, FileError> {
+    if !path.starts_with('/') {
+        return Err(FileError::NotFound);
+    }
+    let mut stack = alloc::vec::Vec::new();
+    for component in path.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            let _ = stack.pop();
+            continue;
+        }
+        if component.as_bytes().contains(&0) {
+            return Err(FileError::NotFound);
+        }
+        stack.push(component);
+    }
+    if stack.is_empty() {
+        return Ok(alloc::string::String::from("/"));
+    }
+    let mut out = alloc::string::String::from("/");
+    for (i, part) in stack.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    if out.len() > crate::config::MAX_PATH_SIZE {
+        return Err(FileError::NotFound);
+    }
+    Ok(out)
+}
+
 pub fn process_count() -> usize {
     PROCESS_TABLE
         .lock()

@@ -1,10 +1,14 @@
 use crate::{
     benchmark, capability::Capability, console::Console, heap, keyboard::Key, memory, paging,
-    syscall, task, timer, userspace, vfs,
+    storage, syscall, task, timer, userspace, vfs,
 };
 
 const PROMPT: &str = "WOVENHAT> ";
 const COMMAND_CAPACITY: usize = 128;
+
+/// Kernel shell working directory (independent of userspace process cwd).
+static mut SHELL_CWD: [u8; 128] = [b'/', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+static mut SHELL_CWD_LEN: usize = 1;
 
 pub struct Shell {
     command: [u8; COMMAND_CAPACITY],
@@ -62,10 +66,17 @@ impl Shell {
             .unwrap_or("")
             .trim();
 
-        match command {
+        let (verb, arg) = split_command(command);
+
+        match verb {
             "" => {}
             "help" => {
-                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP BENCH FS CAT SPAWN SYSCALL USER RING3");
+                console.println("COMMANDS: HELP CLEAR VERSION TICKS TASKS CAPS MEMORY PAGING HEAP BENCH FS LS CAT INIT SPAWN SYSCALL USER RING3");
+                console.println("  LS [PATH]   list directory (default /)");
+                console.println("  CAT <PATH>  print file (loads /mnt/... from disk on demand)");
+                console.println("  INIT        spawn userspace init process");
+                console.println("  CD [PATH]   change directory");
+                console.println("  PWD         print working directory");
             }
             "clear" => {
                 if !authorize(Capability::Console, console) {
@@ -207,24 +218,45 @@ impl Shell {
                 print_u64(console, task::open_file_count() as u64);
                 console.newline();
             }
+            "ls" => {
+                if !authorize(Capability::FileRead, console) {
+                    self.finish(console);
+                    return;
+                }
+                let path = if arg.is_empty() { "/" } else { arg };
+                run_ls(path, console);
+            }
             "cat" => {
                 if !authorize(Capability::FileRead, console) {
                     self.finish(console);
                     return;
                 }
-                let Ok(mut file) = vfs::open("/etc/motd") else {
-                    console.println("VFS OPEN FAILED");
+                let path = if arg.is_empty() { "/etc/motd" } else { arg };
+                run_cat(path, console);
+            }
+            "init" => {
+                if !authorize(Capability::TaskControl, console) {
                     self.finish(console);
                     return;
-                };
-                let mut buffer = [0_u8; 64];
-                match vfs::read(&mut file, &mut buffer) {
-                    Ok(length) => match core::str::from_utf8(&buffer[..length]) {
-                        Ok(text) => console.print(text),
-                        Err(_) => console.println("VFS DATA IS NOT UTF-8"),
-                    },
-                    Err(_) => console.println("VFS READ FAILED"),
                 }
+                run_init(console);
+            }
+            "cd" => {
+                if !authorize(Capability::FileRead, console) {
+                    self.finish(console);
+                    return;
+                }
+                let path = if arg.is_empty() { "/" } else { arg };
+                if !shell_chdir(path) {
+                    console.println("CD FAILED");
+                }
+            }
+            "pwd" => {
+                if !authorize(Capability::FileRead, console) {
+                    self.finish(console);
+                    return;
+                }
+                console.println(shell_cwd());
             }
             "spawn" => {
                 if !authorize(Capability::TaskControl, console) {
@@ -306,7 +338,7 @@ impl Shell {
             }
             _ => {
                 console.print("UNKNOWN COMMAND: ");
-                console.println(command);
+                console.println(verb);
             }
         }
 
@@ -316,6 +348,190 @@ impl Shell {
     fn finish(&mut self, console: &mut Console<'_>) {
         self.length = 0;
         self.print_prompt(console);
+    }
+}
+
+
+
+fn shell_cwd() -> &'static str {
+    // SAFETY: kernel shell is single-threaded at the console.
+    unsafe {
+        core::str::from_utf8(&SHELL_CWD[..SHELL_CWD_LEN]).unwrap_or("/")
+    }
+}
+
+fn shell_resolve(path: &str) -> Option<alloc::string::String> {
+    let absolute = if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else {
+        let cwd = shell_cwd();
+        let mut joined = alloc::string::String::new();
+        if cwd == "/" {
+            joined.push('/');
+            joined.push_str(path);
+        } else {
+            joined.push_str(cwd);
+            joined.push('/');
+            joined.push_str(path);
+        }
+        joined
+    };
+    // Normalize . and ..
+    let mut stack = alloc::vec::Vec::new();
+    for component in absolute.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            let _ = stack.pop();
+            continue;
+        }
+        stack.push(component);
+    }
+    if stack.is_empty() {
+        return Some(alloc::string::String::from("/"));
+    }
+    let mut out = alloc::string::String::from("/");
+    for (i, part) in stack.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    Some(out)
+}
+
+fn shell_chdir(path: &str) -> bool {
+    let Some(absolute) = shell_resolve(path) else {
+        return false;
+    };
+    match vfs::stat(&absolute) {
+        Ok(stat) if stat.kind == vfs::NodeKind::Directory => {}
+        _ => return false,
+    }
+    let bytes = absolute.as_bytes();
+    if bytes.len() >= 128 {
+        return false;
+    }
+    unsafe {
+        SHELL_CWD = [0; 128];
+        SHELL_CWD[..bytes.len()].copy_from_slice(bytes);
+        SHELL_CWD_LEN = bytes.len();
+    }
+    true
+}
+
+fn split_command(command: &str) -> (&str, &str) {
+    let command = command.trim();
+    if command.is_empty() {
+        return ("", "");
+    }
+    match command.find(char::is_whitespace) {
+        Some(idx) => {
+            let verb = &command[..idx];
+            let arg = command[idx..].trim_start();
+            (verb, arg)
+        }
+        None => (command, ""),
+    }
+}
+
+fn run_ls(path: &str, console: &mut Console<'_>) {
+    let Some(path) = shell_resolve(path) else {
+        console.println("BAD PATH");
+        return;
+    };
+    let path = path.as_str();
+    match vfs::stat(path) {
+        Ok(stat) if stat.kind == vfs::NodeKind::Directory => {}
+        Ok(_) => {
+            console.println("NOT A DIRECTORY");
+            return;
+        }
+        Err(_) => {
+            console.println("PATH NOT FOUND");
+            return;
+        }
+    }
+    let mut index = 0usize;
+    loop {
+        match vfs::readdir(path, index) {
+            Ok(entry) => {
+                console.print(if entry.kind == vfs::NodeKind::Directory {
+                    "d "
+                } else {
+                    "f "
+                });
+                console.println(entry.name_str());
+                index += 1;
+            }
+            Err(_) => break,
+        }
+        if index > 64 {
+            break;
+        }
+    }
+    if index == 0 {
+        console.println("(empty)");
+    }
+}
+
+fn run_cat(path: &str, console: &mut Console<'_>) {
+    let Some(path) = shell_resolve(path) else {
+        console.println("BAD PATH");
+        return;
+    };
+    let path = path.as_str();
+    // On-demand import for /mnt/... paths not yet in the VFS.
+    if path.starts_with("/mnt/") {
+        if let Err(err) = storage::ensure_path(path) {
+            match err {
+                storage::EnsureError::NotFound => console.println("FILE NOT FOUND ON VOLUME"),
+                storage::EnsureError::NoDevice => console.println("NO BLOCK DEVICE"),
+                storage::EnsureError::NotFat32 => console.println("NOT A FAT32 VOLUME"),
+                storage::EnsureError::TooLarge => console.println("FILE TOO LARGE FOR VFS"),
+                _ => console.println("MOUNT LOOKUP FAILED"),
+            }
+            return;
+        }
+    }
+    let Ok(file) = vfs::open(path) else {
+        console.println("VFS OPEN FAILED");
+        return;
+    };
+    let mut buffer = [0_u8; 256];
+    match vfs::read(file, &mut buffer) {
+        Ok(0) => console.println("(empty)"),
+        Ok(length) => match core::str::from_utf8(&buffer[..length]) {
+            Ok(text) => {
+                console.print(text);
+                if !text.ends_with('\n') {
+                    console.newline();
+                }
+            }
+            Err(_) => console.println("VFS DATA IS NOT UTF-8"),
+        },
+        Err(_) => console.println("VFS READ FAILED"),
+    }
+    let _ = vfs::close_open_file(file);
+}
+
+fn run_init(console: &mut Console<'_>) {
+    let Some(program) = userspace::create_init_process() else {
+        console.println("INIT IMAGE FAILED");
+        return;
+    };
+    match task::spawn_user_process("init", program) {
+        Ok((id, context)) => {
+            console.print("INIT SCHEDULED: PID=");
+            print_u64(console, id.as_u64());
+            console.print(" ENTRY=");
+            print_hex_u64(console, context.entry);
+            console.print(" STACK=");
+            print_hex_u64(console, context.stack_top);
+            console.newline();
+        }
+        Err(_) => console.println("INIT SPAWN FAILED"),
     }
 }
 

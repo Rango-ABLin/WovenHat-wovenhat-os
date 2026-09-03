@@ -145,11 +145,41 @@ global_asm!(
     "wovenhat_exec_program_end:",
     ".previous",
 );
+
+// Userspace init: read argc/argv from the stack, print a banner, exit 0.
+global_asm!(
+    ".section .rodata.wovenhat_init_stub, \"a\"",
+    ".global wovenhat_init_program_start",
+    ".global wovenhat_init_program_end",
+    "wovenhat_init_program_start:",
+    // crt0: argc in [rsp], argv at [rsp+8] (kept on stack for later use)
+    "mov r12, [rsp]",
+    "lea r13, [rsp + 8]",
+    // write(1, banner, len)
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + wovenhat_init_banner]",
+    "mov edx, 28",
+    "int 0x80",
+    // exit(0)
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "1:",
+    "jmp 1b",
+    "wovenhat_init_banner:",
+    ".ascii \"[INIT] userspace online\\n\"",
+    "wovenhat_init_program_end:",
+    ".previous",
+);
+
 unsafe extern "C" {
     static wovenhat_user_program_start: u8;
     static wovenhat_user_program_end: u8;
     static wovenhat_exec_program_start: u8;
     static wovenhat_exec_program_end: u8;
+    static wovenhat_init_program_start: u8;
+    static wovenhat_init_program_end: u8;
 }
 #[derive(Clone, Copy, Debug)]
 pub struct UserImage {
@@ -198,6 +228,104 @@ impl UserStack {
     }
 }
 
+/// Maximum number of argv strings placed on the initial user stack.
+pub const MAX_ARGV: usize = 8;
+/// Maximum total bytes for all argv string data (including NULs).
+pub const MAX_ARGV_BYTES: usize = 512;
+
+/// Minimal crt0 contract expected by the kernel stack layout:
+///
+/// ```asm
+/// _start:
+///     mov rdi, [rsp]       ; argc
+///     lea rsi, [rsp+8]     ; argv
+///     call main
+///     mov eax, 3           ; exit
+///     mov rdi, rax
+///     int 0x80
+/// ```
+///
+/// Build a System V-style initial stack for a new user process.
+///
+/// Layout (high → low addresses):
+/// ```text
+///   [ string area: argv[0]\0 argv[1]\0 ... ]
+///   [ padding to 16-byte alignment ]
+///   NULL          (argv terminator)
+///   argv[n-1]
+///   ...
+///   argv[0]
+///   argc
+///   ← rsp (16-byte aligned)
+/// ```
+///
+/// On entry the process may read argc from `[rsp]` and argv from `[rsp+8]`.
+/// Registers are not set; a minimal crt0 can load them from the stack.
+///
+/// Returns the new stack pointer (value to place in RSP), or `None` on failure.
+pub fn setup_argv_stack(
+    address_space: paging::AddressSpace,
+    stack: UserStack,
+    args: &[&str],
+) -> Option<u64> {
+    if args.len() > MAX_ARGV {
+        return None;
+    }
+    let mut string_bytes = 0usize;
+    for arg in args {
+        string_bytes = string_bytes.checked_add(arg.len().checked_add(1)?)?;
+    }
+    if string_bytes > MAX_ARGV_BYTES {
+        return None;
+    }
+
+    // Write strings just below stack.top, growing downward conceptually but we
+    // place them in a contiguous region ending at stack.top.
+    let strings_start = stack.top.checked_sub(string_bytes as u64)?;
+    if strings_start < stack.base {
+        return None;
+    }
+
+    let mut cursor = strings_start;
+    let mut argv_ptrs = [0u64; MAX_ARGV];
+    for (i, arg) in args.iter().enumerate() {
+        argv_ptrs[i] = cursor;
+        let mut buf = [0u8; 256];
+        if arg.len() >= buf.len() {
+            return None;
+        }
+        buf[..arg.len()].copy_from_slice(arg.as_bytes());
+        // include trailing NUL
+        paging::write_user_bytes(address_space, cursor, &buf[..arg.len() + 1]).ok()?;
+        cursor = cursor.checked_add(arg.len() as u64 + 1)?;
+    }
+
+    // Build the pointer vector below the string area.
+    // argc + (n+1) pointers, then align rsp to 16 bytes.
+    let argc = args.len() as u64;
+    let pointer_words = 1 + args.len() + 1; // argc + argv... + NULL
+    let pointer_bytes = pointer_words * 8;
+    let mut rsp = strings_start.checked_sub(pointer_bytes as u64)?;
+    // 16-byte align
+    rsp &= !0xfu64;
+    if rsp < stack.base {
+        return None;
+    }
+
+    // Write argc
+    paging::write_user_bytes(address_space, rsp, &argc.to_le_bytes()).ok()?;
+    // Write argv pointers
+    for i in 0..args.len() {
+        let addr = rsp + 8 + (i as u64) * 8;
+        paging::write_user_bytes(address_space, addr, &argv_ptrs[i].to_le_bytes()).ok()?;
+    }
+    // NULL terminator
+    let null_addr = rsp + 8 + (args.len() as u64) * 8;
+    paging::write_user_bytes(address_space, null_addr, &0u64.to_le_bytes()).ok()?;
+
+    Some(rsp)
+}
+
 const USER_MMAP_START: u64 = USER_REGION_START + 0x10_0000;
 const USER_MMAP_STRIDE: u64 = 0x10_000;
 const USER_MMAP_MAX_SIZE: usize = USER_MMAP_STRIDE as usize;
@@ -231,6 +359,45 @@ pub struct AddressSpace {
     stack_base: u64,
     mappings: [UserMapping; MAX_ELF_SEGMENTS],
     mapping_count: usize,
+}
+
+impl AddressSpace {
+    pub fn paging(self) -> paging::AddressSpace {
+        self.paging
+    }
+
+    pub fn root_address(self) -> u64 {
+        self.paging.root_address()
+    }
+
+    /// Returns whether `address` falls in a logically writable mapping
+    /// (ELF segment, user stack, or anonymous region tracked by the process).
+    pub fn is_logically_writable(
+        self,
+        address: u64,
+        anonymous: &[Option<AnonymousMapping>; MAX_ANONYMOUS_MAPPINGS],
+    ) -> bool {
+        if address >= self.stack_base && address < self.stack_base + UserStack::SIZE as u64 {
+            return true;
+        }
+        for mapping in &self.mappings[..self.mapping_count] {
+            if mapping.writable
+                && address >= mapping.start
+                && address < mapping.start + mapping.size as u64
+            {
+                return true;
+            }
+        }
+        for mapping in anonymous.iter().flatten() {
+            if mapping.writable
+                && address >= mapping.address
+                && address < mapping.address + mapping.size as u64
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -295,6 +462,27 @@ pub fn create_exec_process() -> Option<UserProgram> {
     };
     let elf = build_stub_elf(stub)?;
     load_elf(&elf)
+}
+
+/// Spawnable userspace init process (`argv[0] == "/init"`).
+pub fn create_init_process() -> Option<UserProgram> {
+    let stub = unsafe {
+        let start = &wovenhat_init_program_start as *const u8;
+        let end = &wovenhat_init_program_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    let elf = build_stub_elf(stub)?;
+    load_elf_with_argv(&elf, &["/init"])
+}
+
+/// Install `/bin/init` into the VFS for later `exec`.
+pub fn install_init_executable() -> bool {
+    let stub = unsafe {
+        let start = &wovenhat_init_program_start as *const u8;
+        let end = &wovenhat_init_program_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    build_stub_elf(stub).is_some_and(|elf| crate::vfs::create_read_only("/bin/init", &elf).is_ok())
 }
 pub fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
     let image = crate::elf::parse(bytes).ok()?;
@@ -379,10 +567,13 @@ pub fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
         return None;
     }
 
+    // Default argv so every loaded image starts with a valid C-style stack.
+    let stack_top = setup_argv_stack(page_table, stack, &["a.out"])?;
+
     Some(UserProgram {
         image: UserImage {
             entry: image.entry,
-            stack_top: stack.top,
+            stack_top,
             image_size: bytes.len() as u64,
             load_segments: image.segment_count(),
         },
@@ -394,6 +585,15 @@ pub fn load_elf(bytes: &[u8]) -> Option<UserProgram> {
             mapping_count,
         },
     })
+}
+
+/// Load an ELF and place a custom argv vector on the user stack.
+pub fn load_elf_with_argv(bytes: &[u8], args: &[&str]) -> Option<UserProgram> {
+    let mut program = load_elf(bytes)?;
+    // Rebuild argv over the default one.
+    let stack_top = setup_argv_stack(program.address_space.paging(), program.stack, args)?;
+    program.image.stack_top = stack_top;
+    Some(program)
 }
 
 fn release_with_stack(page_table: paging::AddressSpace, stack_base: u64, mappings: &[UserMapping]) {
@@ -488,8 +688,9 @@ pub fn clone_address_space(
     let mut completed = [(0_u64, 0_usize); MAX_ELF_SEGMENTS + 1 + MAX_ANONYMOUS_MAPPINGS];
     let mut completed_count = 0;
 
+    // Copy-on-write: share physical frames and mark writable ranges read-only.
     for mapping in &source.mappings[..source.mapping_count] {
-        if paging::clone_user_range_in(
+        if paging::share_user_range_in(
             source.paging,
             destination.paging,
             mapping.start,
@@ -505,7 +706,7 @@ pub fn clone_address_space(
         completed[completed_count] = (mapping.start, mapping.size);
         completed_count += 1;
     }
-    if paging::clone_user_range_in(
+    if paging::share_user_range_in(
         source.paging,
         destination.paging,
         source.stack_base,
@@ -522,7 +723,7 @@ pub fn clone_address_space(
     completed_count += 1;
 
     for mapping in anonymous.iter().flatten() {
-        if paging::clone_user_range_in(
+        if paging::share_user_range_in(
             source.paging,
             destination.paging,
             mapping.address,
@@ -548,16 +749,6 @@ fn release_clone(address_space: paging::AddressSpace, ranges: &[(u64, usize)]) {
         let _ = paging::destroy_user_address_space(address_space, ranges);
     }
 }
-impl AddressSpace {
-    pub fn paging(self) -> paging::AddressSpace {
-        self.paging
-    }
-
-    pub fn root_address(self) -> u64 {
-        self.paging.root_address()
-    }
-}
-
 fn build_stub_elf(stub: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     const PAYLOAD_OFFSET: usize = 4096;
     const PROGRAM_HEADER_OFFSET: usize = 64;
