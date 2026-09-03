@@ -3363,10 +3363,20 @@ fn build_stub_elf(stub: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     write_u64(&mut bytes, PROGRAM_HEADER_OFFSET + 8, PAYLOAD_OFFSET as u64)?;
     write_u64(&mut bytes, PROGRAM_HEADER_OFFSET + 16, USER_REGION_START)?;
     write_u64(&mut bytes, PROGRAM_HEADER_OFFSET + 32, stub.len() as u64)?;
+    // The generated user programs started as sub-page stubs, but the shell and
+    // future userland binaries can grow beyond one 4 KiB page.  ELF requires
+    // p_memsz >= p_filesz, so size the load segment dynamically and round it
+    // up to a page boundary for the mapper.  Keep at least one page so the
+    // original tiny-stub layout and self-tests remain valid.
+    let memory_size = stub
+        .len()
+        .max(USER_CODE_SIZE)
+        .checked_add(4095)?
+        & !4095;
     write_u64(
         &mut bytes,
         PROGRAM_HEADER_OFFSET + 40,
-        USER_CODE_SIZE as u64,
+        memory_size as u64,
     )?;
     write_u64(&mut bytes, PROGRAM_HEADER_OFFSET + 48, 4096)?;
     bytes[PAYLOAD_OFFSET..].copy_from_slice(stub);
