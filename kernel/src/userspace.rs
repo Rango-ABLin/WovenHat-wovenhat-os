@@ -1,6 +1,6 @@
 use core::arch::global_asm;
 
-use crate::config::{MAX_ANONYMOUS_MAPPINGS, MAX_ELF_SEGMENTS};
+use crate::config::MAX_ELF_SEGMENTS;
 use crate::paging;
 
 pub use crate::config::MAX_ANONYMOUS_MAPPINGS;
@@ -1357,16 +1357,14 @@ global_asm!(
     "int 0x80",
     "cmp rax, -1",
     "je wovenhat_sh_pipe_fail",
-    "mov r12, rax",
-    "and r12, 0xffffffff",
+    "mov r12d, eax",
     "mov r13, rax",
     "shr r13, 32",
     "mov eax, 23",
     "int 0x80",
     "cmp rax, -1",
     "je wovenhat_sh_pipe_fail",
-    "mov rbx, rax",
-    "and rbx, 0xffffffff",
+    "mov ebx, eax",
     "mov r11, rax",
     "shr r11, 32",
     // fork stage 0 writer to pipe0
@@ -1552,8 +1550,7 @@ global_asm!(
     "int 0x80",
     "cmp rax, -1",
     "je wovenhat_sh_pipe_fail",
-    "mov r12, rax",
-    "and r12, 0xffffffff",
+    "mov r12d, eax",
     "mov r13, rax",
     "shr r13, 32",
     // fork left (writer)
@@ -1972,6 +1969,53 @@ global_asm!(
     "wovenhat_sys_sync:",
     "mov eax, 32",
     "int 0x80",
+    "ret",
+    ".global wovenhat_sys_sigaction",
+    "wovenhat_sys_sigaction:",
+    "mov eax, 34",
+    "int 0x80",
+    "ret",
+    ".global wovenhat_sys_getpgrp",
+    "wovenhat_sys_getpgrp:",
+    "mov eax, 35",
+    "int 0x80",
+    "ret",
+    ".global wovenhat_sys_setpgid",
+    "wovenhat_sys_setpgid:",
+    "mov eax, 36",
+    "int 0x80",
+    "ret",
+    ".global wovenhat_memcpy",
+    "wovenhat_memcpy:",
+    "mov rax, rdi",
+    "mov rcx, rdx",
+    "rep movsb",
+    "ret",
+    ".global wovenhat_memset",
+    "wovenhat_memset:",
+    "mov r8, rdi",
+    "mov rax, rsi",
+    "mov rcx, rdx",
+    "rep stosb",
+    "mov rax, r8",
+    "ret",
+    ".global wovenhat_strcmp",
+    "wovenhat_strcmp:",
+    "1:",
+    "movzx eax, byte ptr [rdi]",
+    "movzx ecx, byte ptr [rsi]",
+    "cmp eax, ecx",
+    "jne 2f",
+    "test eax, eax",
+    "je 3f",
+    "inc rdi",
+    "inc rsi",
+    "jmp 1b",
+    "2:",
+    "sub eax, ecx",
+    "ret",
+    "3:",
+    "xor eax, eax",
     "ret",
     // --- minimal heap (bump allocator over one mmap region) ---
     // layout of heap page: [0]=base, [8]=curr, [16]=end  (all u64)
@@ -2515,6 +2559,104 @@ global_asm!(
     ".previous",
 );
 
+
+// /bin/pwd — print current working directory.
+global_asm!(
+    ".section .rodata.wovenhat_pwd_stub, \"a\"",
+    ".global wovenhat_pwd_program_start",
+    ".global wovenhat_pwd_program_end",
+    "wovenhat_pwd_program_start:",
+    "sub rsp, 136",
+    "mov eax, 21",
+    "mov rdi, rsp",
+    "mov esi, 128",
+    "int 0x80",
+    "cmp rax, -1",
+    "je 1f",
+    "mov rdx, rax",
+    "mov eax, 1",
+    "mov edi, 1",
+    "mov rsi, rsp",
+    "int 0x80",
+    "mov byte ptr [rsp + 128], 10",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rsp + 128]",
+    "mov edx, 1",
+    "int 0x80",
+    "xor edi, edi",
+    "jmp 2f",
+    "1:",
+    "mov edi, 1",
+    "2:",
+    "mov eax, 3",
+    "int 0x80",
+    "wovenhat_pwd_program_end:",
+    ".previous",
+);
+
+// /bin/mkdir — mkdir argv[1].
+global_asm!(
+    ".section .rodata.wovenhat_mkdir_stub, \"a\"",
+    ".global wovenhat_mkdir_program_start",
+    ".global wovenhat_mkdir_program_end",
+    "wovenhat_mkdir_program_start:",
+    "cmp qword ptr [rsp], 2",
+    "jb 3f",
+    "mov rdi, [rsp + 16]",
+    "xor esi, esi",
+    "1:",
+    "cmp byte ptr [rdi + rsi], 0",
+    "je 2f",
+    "inc rsi",
+    "jmp 1b",
+    "2:",
+    "mov eax, 19",
+    "int 0x80",
+    "cmp rax, -1",
+    "sete dil",
+    "movzx edi, dil",
+    "jmp 4f",
+    "3:",
+    "mov edi, 1",
+    "4:",
+    "mov eax, 3",
+    "int 0x80",
+    "wovenhat_mkdir_program_end:",
+    ".previous",
+);
+
+// /bin/rm — unlink argv[1].
+global_asm!(
+    ".section .rodata.wovenhat_rm_stub, \"a\"",
+    ".global wovenhat_rm_program_start",
+    ".global wovenhat_rm_program_end",
+    "wovenhat_rm_program_start:",
+    "cmp qword ptr [rsp], 2",
+    "jb 3f",
+    "mov rdi, [rsp + 16]",
+    "xor esi, esi",
+    "1:",
+    "cmp byte ptr [rdi + rsi], 0",
+    "je 2f",
+    "inc rsi",
+    "jmp 1b",
+    "2:",
+    "mov eax, 28",
+    "int 0x80",
+    "cmp rax, -1",
+    "sete dil",
+    "movzx edi, dil",
+    "jmp 4f",
+    "3:",
+    "mov edi, 1",
+    "4:",
+    "mov eax, 3",
+    "int 0x80",
+    "wovenhat_rm_program_end:",
+    ".previous",
+);
+
 unsafe extern "C" {
     static wovenhat_user_program_start: u8;
     static wovenhat_user_program_end: u8;
@@ -2536,6 +2678,12 @@ unsafe extern "C" {
     static wovenhat_ls_program_end: u8;
     static wovenhat_sleepbin_program_start: u8;
     static wovenhat_sleepbin_program_end: u8;
+    static wovenhat_pwd_program_start: u8;
+    static wovenhat_pwd_program_end: u8;
+    static wovenhat_mkdir_program_start: u8;
+    static wovenhat_mkdir_program_end: u8;
+    static wovenhat_rm_program_start: u8;
+    static wovenhat_rm_program_end: u8;
 }
 #[derive(Clone, Copy, Debug)]
 pub struct UserImage {
@@ -2902,6 +3050,21 @@ pub fn install_echo_executable() -> bool {
         core::slice::from_raw_parts(start, end.offset_from(start) as usize)
     };
     build_stub_elf(stub).is_some_and(|elf| crate::vfs::create_read_only("/bin/echo", &elf).is_ok())
+}
+
+pub fn install_pwd_executable() -> bool {
+    let stub = unsafe { core::slice::from_raw_parts(&wovenhat_pwd_program_start, (&wovenhat_pwd_program_end as *const u8).offset_from(&wovenhat_pwd_program_start) as usize) };
+    build_stub_elf(stub).is_some_and(|elf| crate::vfs::create_read_only("/bin/pwd", &elf).is_ok())
+}
+
+pub fn install_mkdir_executable() -> bool {
+    let stub = unsafe { core::slice::from_raw_parts(&wovenhat_mkdir_program_start, (&wovenhat_mkdir_program_end as *const u8).offset_from(&wovenhat_mkdir_program_start) as usize) };
+    build_stub_elf(stub).is_some_and(|elf| crate::vfs::create_read_only("/bin/mkdir", &elf).is_ok())
+}
+
+pub fn install_rm_executable() -> bool {
+    let stub = unsafe { core::slice::from_raw_parts(&wovenhat_rm_program_start, (&wovenhat_rm_program_end as *const u8).offset_from(&wovenhat_rm_program_start) as usize) };
+    build_stub_elf(stub).is_some_and(|elf| crate::vfs::create_read_only("/bin/rm", &elf).is_ok())
 }
 
 pub fn install_shell_executable() -> bool {

@@ -157,6 +157,11 @@ pub enum Number {
     Getticks = 31,
     Sync = 32,
     Ioctl = 33,
+    /// sig, handler (0=default, 1=ignore, otherwise userspace address)
+    Sigaction = 34,
+    Getpgrp = 35,
+    /// pid, pgid (0 follows POSIX current/default conventions)
+    Setpgid = 36,
 }
 
 pub fn entry_address() -> u64 {
@@ -690,6 +695,27 @@ fn sys_fork(frame: *const UserForkFrame) -> u64 {
         }
     }
 }
+fn sys_sigaction(sig: u64, handler: u64) -> u64 {
+    crate::task::sigaction_current(sig, handler).unwrap_or(SYSCALL_ERROR)
+}
+
+fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
+    match crate::task::set_process_group(pid, pgid) { Ok(()) => 0, Err(_) => SYSCALL_ERROR }
+}
+
+/// Arrange a caught signal to enter its userspace handler after this syscall.
+/// The handler receives `sig` in RDI and a normal `ret` resumes the interrupted RIP.
+fn prepare_signal_delivery(frame: *const UserForkFrame) {
+    let Some((sig, handler)) = crate::task::take_pending_signal_current() else { return; };
+    if frame.is_null() { return; }
+    let frame = unsafe { &mut *(frame as *mut UserForkFrame) };
+    let Some(new_rsp) = frame.rsp.checked_sub(8) else { return; };
+    if crate::paging::copy_to_current_user(new_rsp, &frame.rip.to_le_bytes()).is_err() { return; }
+    frame.rsp = new_rsp;
+    frame.rip = handler;
+    frame.rdi = sig;
+}
+
 fn sys_exec(user_path: u64, length: u64) -> u64 {
     let actor = crate::task::current_process_id();
     if !crate::task::current_has(crate::capability::Capability::FileRead)
@@ -798,9 +824,13 @@ pub extern "C" fn wovenhat_syscall_dispatch(
         value if value == Number::Getticks as u64 => sys_getticks(),
         value if value == Number::Sync as u64 => sys_sync(),
         value if value == Number::Ioctl as u64 => sys_ioctl(arg0, arg1, arg2),
+        value if value == Number::Sigaction as u64 => sys_sigaction(arg0, arg1),
+        value if value == Number::Getpgrp as u64 => crate::task::current_process_group(),
+        value if value == Number::Setpgid as u64 => sys_setpgid(arg0, arg1),
         _ => u64::MAX,
     };
 
+    prepare_signal_delivery(frame);
     LAST_COMPLETED.store(number, Ordering::Release);
     COMPLETIONS.fetch_add(1, Ordering::Release);
     result

@@ -334,7 +334,6 @@ fn task_bootstrap() -> ! {
     entry.expect("scheduled task is missing its entry point")()
 }
 
-#[derive(Clone, Copy)]
 /// What a process file descriptor refers to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FdKind {
@@ -343,6 +342,7 @@ pub enum FdKind {
     PipeWrite(usize),
 }
 
+#[derive(Clone, Copy)]
 pub struct Process {
     pub id: ProcessId,
     pub task_id: TaskId,
@@ -358,6 +358,8 @@ pub struct Process {
     cwd: [u8; crate::config::MAX_PATH_SIZE],
     cwd_len: usize,
     pending_signal: u64,
+    process_group: u64,
+    signal_actions: [u64; 32],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -554,15 +556,18 @@ fn create_process(
     let mut cwd = [0u8; crate::config::MAX_PATH_SIZE];
     cwd[0] = b'/';
     let mut cwd_len = 1usize;
+    let mut inherited_group = None;
     {
         let processes = PROCESS_TABLE.lock();
         if let Some(parent_proc) = processes.iter().flatten().find(|p| p.id == parent) {
             cwd = parent_proc.cwd;
             cwd_len = parent_proc.cwd_len;
+            inherited_group = Some(parent_proc.process_group);
         }
     }
+    let id = ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed));
     Process {
-        id: ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed)),
+        id,
         task_id,
         state: ProcessState::Ready,
         parent,
@@ -574,6 +579,8 @@ fn create_process(
         cwd,
         cwd_len,
         pending_signal: 0,
+        process_group: inherited_group.unwrap_or(id.as_u64()),
+        signal_actions: [0; 32],
     }
 }
 
@@ -841,6 +848,8 @@ pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, P
         cwd: parent.cwd,
         cwd_len: parent.cwd_len,
         pending_signal: 0,
+        process_group: parent.process_group,
+        signal_actions: parent.signal_actions,
     });
     Ok(child_id)
 }
@@ -1301,12 +1310,16 @@ pub fn mkdir_path(path: &str) -> Result<(), FileError> {
         return Err(FileError::PermissionDenied);
     }
     let path = resolve_path_for_current(path)?;
-    match vfs::mkdir(&path) {
+    let result = match vfs::mkdir(&path) {
         Ok(()) => Ok(()),
         Err(vfs::Error::AlreadyExists) => Err(FileError::AlreadyExists),
         Err(vfs::Error::Full) => Err(FileError::TooManyFiles),
         Err(_) => Err(FileError::NotFound),
+    };
+    if result.is_ok() && path.starts_with("/mnt/") {
+        let _ = crate::storage::persist_directory(&path);
     }
+    result
 }
 
 
@@ -1784,27 +1797,86 @@ unsafe fn push_stack_value(cursor: &mut usize, value: u64) {
 
 
 pub fn kill_process(pid: u64, sig: u64) -> Result<(), FileError> {
-    // Minimal POSIX-ish: SIGTERM(15) / SIGKILL(9) mark process for exit.
-    if sig != 9 && sig != 15 && sig != 0 {
-        return Err(FileError::NotFound);
-    }
+    if sig > 31 { return Err(FileError::NotFound); }
+    let current_pid = current_process_id();
     let mut processes = PROCESS_TABLE.lock();
-    let process = processes
-        .iter_mut()
-        .flatten()
-        .find(|p| p.id.as_u64() == pid)
-        .ok_or(FileError::NotFound)?;
-    if sig == 0 {
-        return Ok(()); // existence check
+    let current_group = processes.iter().flatten()
+        .find(|p| p.id.as_u64() == current_pid)
+        .map(|p| p.process_group)
+        .unwrap_or(current_pid);
+
+    // POSIX-ish targets: pid>0 one process; pid==0 caller's process group;
+    // a two's-complement negative pid targets process group abs(pid).
+    let signed = pid as i64;
+    let target_group = if pid == 0 { Some(current_group) } else if signed < 0 { Some(signed.wrapping_neg() as u64) } else { None };
+    let mut matched = false;
+    for process in processes.iter_mut().flatten() {
+        let selected = if let Some(group) = target_group { process.process_group == group } else { process.id.as_u64() == pid };
+        if !selected { continue; }
+        matched = true;
+        if sig == 0 { continue; }
+        let action = process.signal_actions[sig as usize];
+        if action == 1 { continue; } // SIG_IGN
+        if action > 1 && sig != 9 {
+            process.pending_signal = sig;
+            continue;
+        }
+        // Default action for the currently supported terminating signals.
+        if sig == 9 || sig == 15 || sig == 2 {
+            process.pending_signal = sig;
+            if process.state != ProcessState::Exited {
+                process.state = ProcessState::Exited;
+                process.exit_code = 128 + sig as i32;
+                release_file_table(&mut process.files);
+            }
+        } else {
+            process.pending_signal = sig;
+        }
     }
-    process.pending_signal = sig;
-    if process.state != ProcessState::Exited {
-        process.state = ProcessState::Exited;
-        process.exit_code = 128 + (sig as i32);
-        // Unblock pipe peers and drop resources.
-        release_file_table(&mut process.files);
-    }
+    if matched { Ok(()) } else { Err(FileError::NotFound) }
+}
+
+/// Set/query a minimal sigaction disposition. `handler` uses 0=SIG_DFL, 1=SIG_IGN,
+/// otherwise it is a userspace handler address. Returns the previous disposition.
+pub fn sigaction_current(sig: u64, handler: u64) -> Result<u64, FileError> {
+    if sig == 0 || sig > 31 || sig == 9 { return Err(FileError::PermissionDenied); }
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes.iter_mut().flatten().find(|p| p.task_id == task_id).ok_or(FileError::NoProcess)?;
+    let slot = &mut process.signal_actions[sig as usize];
+    let old = *slot;
+    *slot = handler;
+    Ok(old)
+}
+
+pub fn current_process_group() -> u64 {
+    let task_id = current_task_id();
+    PROCESS_TABLE.lock().iter().flatten().find(|p| p.task_id == task_id)
+        .map(|p| p.process_group).unwrap_or(current_process_id())
+}
+
+pub fn set_process_group(pid: u64, pgid: u64) -> Result<(), FileError> {
+    let caller = current_process_id();
+    let target = if pid == 0 { caller } else { pid };
+    let group = if pgid == 0 { target } else { pgid };
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes.iter_mut().flatten().find(|p| p.id.as_u64() == target).ok_or(FileError::NotFound)?;
+    if target != caller && process.parent.as_u64() != caller { return Err(FileError::PermissionDenied); }
+    process.process_group = group;
     Ok(())
+}
+
+/// Return and clear a pending caught signal for the current process.
+pub fn take_pending_signal_current() -> Option<(u64, u64)> {
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes.iter_mut().flatten().find(|p| p.task_id == task_id)?;
+    let sig = process.pending_signal;
+    if sig == 0 || sig > 31 { return None; }
+    let handler = process.signal_actions[sig as usize];
+    if handler <= 1 { return None; }
+    process.pending_signal = 0;
+    Some((sig, handler))
 }
 
 

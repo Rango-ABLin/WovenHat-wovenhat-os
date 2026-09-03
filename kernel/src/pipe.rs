@@ -53,7 +53,7 @@ struct Table {
 impl Table {
     const fn new() -> Self {
         Self {
-            pipes: [Pipe::empty(); MAX_PIPES],
+            pipes: [const { Pipe::empty() }; MAX_PIPES],
         }
     }
 

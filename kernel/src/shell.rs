@@ -784,7 +784,7 @@ fn split_command(command: &str) -> (&str, &str) {
     }
 }
 
-fn lowercase<'a>(verb: &str, buf: &'a mut [u8; 32]) -> &'a str {
+fn lowercase<'a>(verb: &'a str, buf: &'a mut [u8; 32]) -> &'a str {
     if verb.len() > buf.len() {
         return verb;
     }

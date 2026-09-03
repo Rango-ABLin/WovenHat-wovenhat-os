@@ -1,7 +1,7 @@
 use spin::Mutex;
 
 use crate::config::{
-    IPC_QUEUE_DEPTH as QUEUE_DEPTH, MAX_IPC_ENDPOINTS as MAX_ENDPOINTS, MAX_MESSAGE_SIZE,
+    IPC_QUEUE_DEPTH as QUEUE_DEPTH, MAX_IPC_ENDPOINTS as MAX_ENDPOINTS,
 };
 
 pub use crate::config::MAX_MESSAGE_SIZE;

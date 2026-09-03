@@ -1,4 +1,4 @@
-use crate::{ata, fat32, gpt, partition, vfs};
+use crate::{ata, block_cache::CachedDevice, fat32, gpt, partition, vfs};
 
 const DIRECTORY_ATTRIBUTE: u8 = 0x10;
 const MAX_IMPORT_DEPTH: usize = 2;
@@ -318,19 +318,20 @@ pub enum PersistError {
 
 /// Persist a VFS file under `/mnt/` to the live ATA FAT32 volume.
 ///
-/// Only root-directory 8.3 short names are accepted (no subdirectories yet).
-/// The relative component after `/mnt/` must encode to a valid FAT 8.3 name.
+/// Multi-component paths are supported. Missing FAT32 directories are created
+/// automatically; every component currently follows FAT 8.3 naming rules.
 pub fn persist_path(path: &str) -> Result<(), PersistError> {
     if !path.starts_with("/mnt/") {
         return Err(PersistError::NotSupported);
     }
     let relative = &path[5..];
-    if relative.is_empty() || relative.contains('/') {
-        // Only root directory writes for now.
+    if relative.is_empty() {
         return Err(PersistError::BadName);
     }
-    if fat32::encode_short_name(relative).is_none() {
-        return Err(PersistError::BadName);
+    for component in relative.split('/') {
+        if component.is_empty() || component == "." || component == ".." || fat32::encode_short_name(component).is_none() {
+            return Err(PersistError::BadName);
+        }
     }
 
     let mut data = [0_u8; vfs::NODE_CAPACITY];
@@ -349,34 +350,85 @@ pub fn persist_path(path: &str) -> Result<(), PersistError> {
 
 fn persist_on_device(
     device: &mut impl crate::block::BlockDevice,
-    name: &str,
+    path: &str,
+    data: &[u8],
+) -> Result<(), PersistError> {
+    // Cache metadata + data sectors for the whole transaction, then flush once.
+    let mut cache = CachedDevice::<_, 16>::new(device);
+    let result = persist_on_cached_device(&mut cache, path, data);
+    let flushed = cache.flush().map_err(|_| PersistError::Failed);
+    result.and(flushed)
+}
+
+fn persist_on_cached_device(
+    device: &mut impl crate::block::BlockDevice,
+    path: &str,
     data: &[u8],
 ) -> Result<(), PersistError> {
     // Same mount order as import: superfloppy → MBR → GPT.
     match fat32::mount(device) {
-        Ok(volume) => {
-            return fat32::create_root_file(device, volume, name, data).map_err(map_persist_err);
-        }
+        Ok(volume) => return fat32::create_path_file(device, volume, path, data).map_err(map_persist_err),
         Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
         Err(_) => return Err(PersistError::Failed),
     }
 
     if let Ok(Some(part)) = partition::find_fat32(device) {
-        let mut view =
-            partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+        let mut view = partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
         let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
-        return fat32::create_root_file(&mut view, volume, name, data).map_err(map_persist_err);
+        return fat32::create_path_file(&mut view, volume, path, data).map_err(map_persist_err);
     }
 
     match gpt::find_fat_partition(device) {
         Ok(Some(part)) => {
-            let mut view =
-                partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+            let mut view = partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
             let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
-            fat32::create_root_file(&mut view, volume, name, data).map_err(map_persist_err)
+            fat32::create_path_file(&mut view, volume, path, data).map_err(map_persist_err)
         }
         Ok(None) | Err(gpt::Error::MissingProtectiveMbr) => Err(PersistError::Failed),
         Err(_) => Err(PersistError::Failed),
+    }
+}
+
+/// Persist a VFS directory under `/mnt/`, creating missing FAT32 components.
+pub fn persist_directory(path: &str) -> Result<(), PersistError> {
+    if path == "/mnt" { return Ok(()); }
+    if !path.starts_with("/mnt/") { return Err(PersistError::NotSupported); }
+    let relative = &path[5..];
+    if relative.is_empty() { return Err(PersistError::BadName); }
+    for component in relative.split('/') {
+        if component.is_empty() || component == "." || component == ".." || fat32::encode_short_name(component).is_none() {
+            return Err(PersistError::BadName);
+        }
+    }
+    ata::with_primary_master(|disk| {
+        let mut cache = CachedDevice::<_, 16>::new(disk);
+        let result = mkdir_on_cached_device(&mut cache, relative);
+        let flushed = cache.flush().map_err(|_| PersistError::Failed);
+        result.and(flushed)
+    }).unwrap_or(Err(PersistError::NoDevice))
+}
+
+fn mkdir_on_cached_device(
+    device: &mut impl crate::block::BlockDevice,
+    path: &str,
+) -> Result<(), PersistError> {
+    match fat32::mount(device) {
+        Ok(volume) => return fat32::mkdir_path(device, volume, path).map_err(map_persist_err),
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
+        Err(_) => return Err(PersistError::Failed),
+    }
+    if let Ok(Some(part)) = partition::find_fat32(device) {
+        let mut view = partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+        let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
+        return fat32::mkdir_path(&mut view, volume, path).map_err(map_persist_err);
+    }
+    match gpt::find_fat_partition(device) {
+        Ok(Some(part)) => {
+            let mut view = partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+            let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
+            fat32::mkdir_path(&mut view, volume, path).map_err(map_persist_err)
+        }
+        _ => Err(PersistError::Failed),
     }
 }
 

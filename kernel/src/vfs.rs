@@ -398,7 +398,7 @@ struct OpenFileTable {
 impl OpenFileTable {
     const fn empty() -> Self {
         Self {
-            entries: [OpenFileDescription::empty(); MAX_OPEN_FILES],
+            entries: [const { OpenFileDescription::empty() }; MAX_OPEN_FILES],
         }
     }
 
@@ -567,7 +567,7 @@ pub fn read_all(path: &str, buffer: &mut [u8]) -> Result<usize, Error> {
 
 pub fn seek(id: OpenFileId, offset: usize) -> Result<usize, Error> {
     let mut table = OPEN_FILES.lock();
-    let entry = table.get_mut(id).ok_or(Error::NotFound)?;
+    let entry = table.get_mut(id)?;
     let registry = REGISTRY.lock();
     let node = registry.nodes.get(entry.node).filter(|n| n.occupied).ok_or(Error::NotFound)?;
     let max = node.length;

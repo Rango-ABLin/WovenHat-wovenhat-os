@@ -9,6 +9,7 @@ mod ata;
 mod audit;
 mod benchmark;
 mod block;
+mod block_cache;
 mod capability;
 mod config;
 mod console;
@@ -38,6 +39,8 @@ mod task;
 mod timer;
 mod userspace;
 mod vfs;
+mod virtio_net;
+mod network;
 
 use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, BootloaderConfig};
 
@@ -229,6 +232,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("BLOCK DEVICE I/O: FAILED");
         halt();
     }
+    if block_cache::self_test() {
+        console.println("BLOCK CACHE: OK");
+    } else {
+        console.println("BLOCK CACHE: FAILED");
+        halt();
+    }
 
     if ata::self_test() {
         console.println("ATA IDENTIFY PARSER: OK");
@@ -242,6 +251,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         console.println("FAT32 VALIDATION: FAILED");
         halt();
+    }
+    if network::self_test() {
+        console.println("NETWORK/SMOLTCP ADAPTER: OK");
+    } else {
+        console.println("NETWORK/SMOLTCP ADAPTER: FAILED");
+        halt();
+    }
+    match virtio_net::probe() {
+        virtio_net::ProbeStatus::Found(_) => console.println("VIRTIO-NET PCI: DETECTED"),
+        virtio_net::ProbeStatus::Missing => console.println("VIRTIO-NET PCI: NOT PRESENT"),
     }
 
     if vfs::self_test() {
@@ -405,6 +424,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         && userspace::install_cat_executable()
         && userspace::install_ls_executable()
         && userspace::install_sleep_executable()
+        && userspace::install_pwd_executable()
+        && userspace::install_mkdir_executable()
+        && userspace::install_rm_executable()
     {
         console.println("BIN UTILS: INSTALLED");
     } else {

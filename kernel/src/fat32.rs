@@ -560,13 +560,23 @@ pub fn create_root_file(
     name: &str,
     data: &[u8],
 ) -> Result<(), Error> {
+    create_file_in_directory(device, volume, volume.root_cluster, name, data)
+}
+
+pub fn create_file_in_directory(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    dir_cluster: u32,
+    name: &str,
+    data: &[u8],
+) -> Result<(), Error> {
     let short = encode_short_name(name).ok_or(Error::NameTooLong)?;
     if data.len() > u32::MAX as usize {
         return Err(Error::NoSpace);
     }
 
     // Locate an existing entry to overwrite, or a free/deleted slot.
-    let mut slot_cluster = volume.root_cluster;
+    let mut slot_cluster = dir_cluster;
     let mut slot_sector_lba: u64 = 0;
     let mut slot_offset = 0usize;
     let mut found_slot = false;
@@ -574,7 +584,7 @@ pub fn create_root_file(
     let mut visited = [0_u32; MAX_READ_CLUSTERS];
     let mut visited_count = 0;
     let mut sector = [0_u8; SECTOR_SIZE];
-    let mut cluster = volume.root_cluster;
+    let mut cluster = dir_cluster;
 
     'search: loop {
         if visited_count == visited.len() {
@@ -608,6 +618,8 @@ pub fn create_root_file(
                 let mut entry_name = [0_u8; 11];
                 entry_name.copy_from_slice(&sector[offset..offset + 11]);
                 if entry_name == short {
+                    // Never replace a directory with file data.
+                    if attributes & 0x10 != 0 { return Err(Error::WriteFailed); }
                     // Overwrite existing file entry.
                     let high = read_u16(&sector, offset + 20) as u32;
                     let low = read_u16(&sector, offset + 26) as u32;
@@ -732,6 +744,182 @@ pub fn create_root_file(
 
     let _ = slot_cluster; // silence unused when not extending
     Ok(())
+}
+
+
+fn resolve_parent_cluster(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    path: &str,
+    create_missing: bool,
+) -> Result<(u32, [u8; 13], usize), Error> {
+    let path = path.trim_matches('/');
+    if path.is_empty() { return Err(Error::NameTooLong); }
+    let mut parts = [""; 16];
+    let mut count = 0usize;
+    for part in path.split('/') {
+        if part.is_empty() || part == "." { continue; }
+        if part == ".." || count == parts.len() { return Err(Error::NameTooLong); }
+        parts[count] = part;
+        count += 1;
+    }
+    if count == 0 { return Err(Error::NameTooLong); }
+    let leaf = parts[count - 1];
+    if encode_short_name(leaf).is_none() { return Err(Error::NameTooLong); }
+    let mut leaf_buf = [0u8; 13];
+    leaf_buf[..leaf.len()].copy_from_slice(leaf.as_bytes());
+
+    let mut cluster = volume.root_cluster;
+    for component in &parts[..count - 1] {
+        let short = encode_short_name(component).ok_or(Error::NameTooLong)?;
+        match find_in_directory(device, volume, cluster, &short) {
+            Ok(entry) => {
+                if entry.attributes & 0x10 == 0 || entry.first_cluster < 2 {
+                    return Err(Error::NotFound);
+                }
+                cluster = entry.first_cluster;
+            }
+            Err(Error::NotFound) if create_missing => {
+                cluster = create_directory_in(device, volume, cluster, component)?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok((cluster, leaf_buf, leaf.len()))
+}
+
+fn find_directory_slot(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    dir_cluster: u32,
+    short: &[u8; 11],
+) -> Result<(u64, usize, Option<DirectoryEntry>), Error> {
+    let mut cluster = dir_cluster;
+    let mut visited = [0u32; MAX_READ_CLUSTERS];
+    let mut visited_count = 0usize;
+    let mut deleted: Option<(u64, usize)> = None;
+    let mut sector = [0u8; SECTOR_SIZE];
+    loop {
+        if visited_count == visited.len() { return Err(Error::ChainTooLong); }
+        if visited[..visited_count].contains(&cluster) { return Err(Error::ChainLoop); }
+        visited[visited_count] = cluster;
+        visited_count += 1;
+        let base = volume.cluster_lba(cluster)?;
+        for si in 0..volume.sectors_per_cluster as u64 {
+            let lba = base + si;
+            device.read_sector(lba, &mut sector).map_err(Error::Block)?;
+            for i in 0..DIRECTORY_ENTRIES_PER_SECTOR {
+                let off = i * DIRECTORY_ENTRY_SIZE;
+                let first = sector[off];
+                if first == 0 {
+                    let (l,o) = deleted.unwrap_or((lba, off));
+                    return Ok((l,o,None));
+                }
+                if first == 0xe5 {
+                    if deleted.is_none() { deleted = Some((lba, off)); }
+                    continue;
+                }
+                let attr = sector[off + 11];
+                if attr == 0x0f || attr & 0x08 != 0 { continue; }
+                let mut found = [0u8; 11];
+                found.copy_from_slice(&sector[off..off+11]);
+                if &found == short {
+                    let first_cluster = ((read_u16(&sector, off+20) as u32) << 16) | read_u16(&sector, off+26) as u32;
+                    return Ok((lba, off, Some(DirectoryEntry { short_name: found, first_cluster, size: read_u32(&sector, off+28), attributes: attr })));
+                }
+            }
+        }
+        cluster = match next_cluster(device, volume, cluster)? {
+            ClusterLink::Next(n) => n,
+            ClusterLink::End => return deleted.map(|(l,o)| (l,o,None)).ok_or(Error::DirectoryFull),
+        };
+    }
+}
+
+fn write_directory_entry(
+    device: &mut impl BlockDevice,
+    lba: u64,
+    offset: usize,
+    short: &[u8; 11],
+    attributes: u8,
+    first_cluster: u32,
+    size: u32,
+) -> Result<(), Error> {
+    let mut sector = [0u8; SECTOR_SIZE];
+    device.read_sector(lba, &mut sector).map_err(Error::Block)?;
+    for b in &mut sector[offset..offset + DIRECTORY_ENTRY_SIZE] { *b = 0; }
+    sector[offset..offset+11].copy_from_slice(short);
+    sector[offset+11] = attributes;
+    write_u16(&mut sector, offset+20, (first_cluster >> 16) as u16);
+    write_u16(&mut sector, offset+26, first_cluster as u16);
+    write_u32(&mut sector, offset+28, size);
+    device.write_sector(lba, &sector).map_err(Error::Block)
+}
+
+fn create_directory_in(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    parent_cluster: u32,
+    name: &str,
+) -> Result<u32, Error> {
+    let short = encode_short_name(name).ok_or(Error::NameTooLong)?;
+    let (slot_lba, slot_offset, existing) = find_directory_slot(device, volume, parent_cluster, &short)?;
+    if let Some(entry) = existing {
+        if entry.attributes & 0x10 != 0 && entry.first_cluster >= 2 { return Ok(entry.first_cluster); }
+        return Err(Error::WriteFailed);
+    }
+    let cluster = allocate_cluster(device, volume)?;
+    let base = volume.cluster_lba(cluster)?;
+    let zero = [0u8; SECTOR_SIZE];
+    for s in 0..volume.sectors_per_cluster as u64 {
+        device.write_sector(base+s, &zero).map_err(Error::Block)?;
+    }
+    // Dot entries make directories interoperable with other FAT32 implementations.
+    let mut first = [0u8; SECTOR_SIZE];
+    first[0..11].copy_from_slice(b".          ");
+    first[11] = 0x10;
+    write_u16(&mut first, 20, (cluster >> 16) as u16);
+    write_u16(&mut first, 26, cluster as u16);
+    first[32..43].copy_from_slice(b"..         ");
+    first[43] = 0x10;
+    let dotdot = if parent_cluster == volume.root_cluster { volume.root_cluster } else { parent_cluster };
+    write_u16(&mut first, 32+20, (dotdot >> 16) as u16);
+    write_u16(&mut first, 32+26, dotdot as u16);
+    device.write_sector(base, &first).map_err(Error::Block)?;
+    write_directory_entry(device, slot_lba, slot_offset, &short, 0x10, cluster, 0)?;
+    Ok(cluster)
+}
+
+/// Create a FAT32 directory path, creating any missing 8.3 components.
+pub fn mkdir_path(device: &mut impl BlockDevice, volume: Volume, path: &str) -> Result<(), Error> {
+    let path = path.trim_matches('/');
+    if path.is_empty() { return Ok(()); }
+    let mut cluster = volume.root_cluster;
+    for component in path.split('/') {
+        if component.is_empty() || component == "." { continue; }
+        if component == ".." { return Err(Error::NameTooLong); }
+        let short = encode_short_name(component).ok_or(Error::NameTooLong)?;
+        cluster = match find_in_directory(device, volume, cluster, &short) {
+            Ok(entry) if entry.attributes & 0x10 != 0 && entry.first_cluster >= 2 => entry.first_cluster,
+            Ok(_) => return Err(Error::WriteFailed),
+            Err(Error::NotFound) => create_directory_in(device, volume, cluster, component)?,
+            Err(err) => return Err(err),
+        };
+    }
+    Ok(())
+}
+
+/// Create or overwrite a file at a multi-component FAT32 path. Parent directories
+/// are created automatically. Components currently use FAT 8.3 names.
+pub fn create_path_file(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    path: &str,
+    data: &[u8],
+) -> Result<(), Error> {
+    let (parent, leaf, leaf_len) = resolve_parent_cluster(device, volume, path, true)?;
+    let leaf = core::str::from_utf8(&leaf[..leaf_len]).map_err(|_| Error::NameTooLong)?;
+    create_file_in_directory(device, volume, parent, leaf, data)
 }
 
 struct TestDisk {

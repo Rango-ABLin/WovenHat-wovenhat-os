@@ -44,7 +44,7 @@ struct CowTable {
 impl CowTable {
     const fn empty() -> Self {
         Self {
-            entries: [CowEntry::empty(); MAX_COW_FRAMES],
+            entries: [const { CowEntry::empty() }; MAX_COW_FRAMES],
         }
     }
 
@@ -506,6 +506,8 @@ pub fn share_user_range_in(
             );
             return Err(MapRangeError::MappingFailed);
         }
+        let frame = PhysFrame::<Size4KiB>::from_start_address(frame.start_address())
+            .map_err(|_| MapRangeError::MappingFailed)?;
 
         if destination_mapper
             .translate_addr(page.start_address())
@@ -611,6 +613,9 @@ pub fn try_break_cow(address_space: AddressSpace, fault_address: u64) -> bool {
     if offset != 0 || !flags.contains(PageTableFlags::PRESENT) {
         return false;
     }
+    let Ok(old_frame) = PhysFrame::<Size4KiB>::from_start_address(old_frame.start_address()) else {
+        return false;
+    };
     // Only break when the hardware page is currently read-only.
     if flags.contains(PageTableFlags::WRITABLE) {
         return false;
