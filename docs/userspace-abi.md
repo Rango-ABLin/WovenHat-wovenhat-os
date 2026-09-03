@@ -1,55 +1,73 @@
 # Userspace ABI
 
+## Overview
+
+WovenHat userspace is ring-3 code entered via `iretq` with a System V-style
+stack. Programs are ELF images loaded by the kernel (`load_elf` /
+`load_elf_with_argv`) or by `exec`.
+
 ## Syscall entry
 
-- Interrupt vector `0x80` (DPL 3)
-- Arguments: `RAX` = call number, `RDI`, `RSI`, `RDX`
-- Return: `RAX` (or `u64::MAX` on error)
+- Vector: `int 0x80` (DPL 3)
+- Args: `RAX` = number, `RDI`, `RSI`, `RDX`
+- Return: `RAX` (`u64::MAX` on error)
 
-See [syscall-api.md](syscall-api.md) for the full table including `stat` (17),
-`readdir` (18), and `mkdir` (19).
+| # | Name | Notes |
+|---|------|--------|
+| 0 | read | fd 0 = keyboard (non-blocking) |
+| 1 | write | fd 1/2 = serial console |
+| 2 | open | path, path_len → fd |
+| 3 | exit | status |
+| 4 | getpid | |
+| 5 | waitpid | child pid; `-2` still running |
+| 6 | close | |
+| 7 | yield | |
+| 8 | mmap | length, writable |
+| 9 | munmap | |
+| 10 | file_write | fd, buf, len |
+| 11–12 | message_send / receive | IPC |
+| 13–14 | getuid / getgid | |
+| 15 | exec | path, path_len (replaces image) |
+| 16 | fork | parent→child pid, child→0 |
+| 17 | stat | packed metadata |
+| 18 | readdir | path, len\|(index≪16), name buf |
+| 19 | mkdir | |
+| 20 | chdir | |
+| 21 | getcwd | |
+| 22 | dup | |
+| 23 | pipe | read\|(write≪32) |
+| 24 | dup2 | |
+| 25 | getppid | |
+| 26 | kill | 0/9/15 |
 
-## Initial process stack (argc / argv)
-
-When the kernel loads an ELF via `load_elf` / `load_elf_with_argv` / `exec`, it
-builds a System V-style argument area on the user stack:
+## Initial stack
 
 ```text
-high addresses
-  argv string bytes (NUL-terminated)
-  padding to 16-byte alignment
-  NULL                 ← argv[argc]
-  argv[argc-1]
-  ...
-  argv[0]
-  argc                 ← RSP at entry
-low addresses
+  [ argv strings ]
+  NULL          ← envp terminator (empty env)
+  NULL          ← argv terminator
+  argv[n-1] … argv[0]
+  argc          ← RSP
 ```
 
-A minimal crt0:
+## Default capabilities (userspace)
 
-```asm
-.global _start
-_start:
-    mov rdi, [rsp]          # argc
-    lea rsi, [rsp + 8]      # argv
-    # call main(argc, argv)  — language runtime specific
-    mov eax, 3              # exit
-    mov rdi, 0
-    int 0x80
-```
+Console, FileRead, FileWrite, Ipc, ProcessCreate.
 
-`exec("/bin/sh")` sets `argv[0]` to the path string. `load_elf` defaults to
-`argv = ["a.out"]`.
+## Installed programs
 
-## Capabilities and credentials
+| Path | Role |
+|------|------|
+| `/bin/sh` | Interactive shell |
+| `/bin/init` | Banner then `exec /bin/sh` |
+| `/bin/selftest` | Boot / regression self-test |
 
-New processes start as UID/GID 1000 with the restricted userspace capability set.
-File and process syscalls enforce capabilities at the kernel boundary.
+## Shell builtins (`/bin/sh`)
 
-## Memory
+`help`, `echo`, `cat`, `ls`, `mkdir`, `cd`, `pwd`, `exit`/`quit`.  
+Any other line is treated as a path: `fork` → `exec` → parent `waitpid`.
 
-- User region begins at `0x0000_4000_0000_0000`
-- Stack is placed near the top of that region with a guard page
-- `mmap` / `munmap` manage anonymous mappings
-- After `fork`, writable pages are copy-on-write until first write
+## Boot flow
+
+After kernel self-tests, boot schedules `init`, which replaces itself with
+`/bin/sh`. The kernel diagnostic shell remains available via F1.

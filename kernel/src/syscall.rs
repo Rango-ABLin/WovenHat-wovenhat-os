@@ -142,6 +142,21 @@ pub enum Number {
     Chdir = 20,
     /// user buffer, capacity → length written
     Getcwd = 21,
+    Dup = 22,
+    /// returns read_fd in low 32 bits, write_fd in high 32 bits
+    Pipe = 23,
+    /// oldfd, newfd
+    Dup2 = 24,
+    Getppid = 25,
+    /// pid, sig — minimal: record pending signal on target
+    Kill = 26,
+    Lseek = 27,
+    Unlink = 28,
+    Sleep = 29,
+    Rename = 30,
+    Getticks = 31,
+    Sync = 32,
+    Ioctl = 33,
 }
 
 pub fn entry_address() -> u64 {
@@ -537,6 +552,108 @@ fn sys_message_receive(user_buffer: u64, capacity: u64, user_sender: u64) -> u64
     message.payload().len() as u64
 }
 
+fn sys_pipe() -> u64 {
+    match crate::task::pipe_current() {
+        Ok((r, w)) => r | (w << 32),
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_dup2(old: u64, new: u64) -> u64 {
+    match crate::task::dup2_current(old, new) {
+        Ok(fd) => fd,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_getppid() -> u64 {
+    crate::task::getppid_current()
+}
+
+fn sys_lseek(fd: u64, offset: u64) -> u64 {
+    match crate::task::seek_current(fd, offset) {
+        Ok(pos) => pos,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_unlink(user_path: u64, length: u64) -> u64 {
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut path = [0_u8; MAX_PATH_SIZE];
+    if crate::paging::copy_from_current_user(user_path, &mut path[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(path) = core::str::from_utf8(&path[..length]) else {
+        return SYSCALL_ERROR;
+    };
+    match crate::task::unlink_current(path) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_rename(user_old: u64, old_len_and_new_len: u64, user_new: u64) -> u64 {
+    let old_len = (old_len_and_new_len & 0xffff) as usize;
+    let new_len = ((old_len_and_new_len >> 16) & 0xffff) as usize;
+    if old_len == 0 || new_len == 0 || old_len > MAX_PATH_SIZE || new_len > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+    let mut old = [0_u8; MAX_PATH_SIZE];
+    let mut new = [0_u8; MAX_PATH_SIZE];
+    if crate::paging::copy_from_current_user(user_old, &mut old[..old_len]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    if crate::paging::copy_from_current_user(user_new, &mut new[..new_len]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(old) = core::str::from_utf8(&old[..old_len]) else {
+        return SYSCALL_ERROR;
+    };
+    let Ok(new) = core::str::from_utf8(&new[..new_len]) else {
+        return SYSCALL_ERROR;
+    };
+    match crate::task::rename_current(old, new) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_getticks() -> u64 {
+    crate::timer::ticks()
+}
+
+fn sys_sync() -> u64 {
+    crate::storage::sync_all_mounted() as u64
+}
+
+fn sys_ioctl(_fd: u64, _req: u64, _arg: u64) -> u64 {
+    0 // no-op placeholder for future TTY control
+}
+
+fn sys_sleep(ticks: u64) -> u64 {
+    crate::task::sleep_current(ticks);
+    0
+}
+
+fn sys_kill(pid: u64, sig: u64) -> u64 {
+    match crate::task::kill_process(pid, sig) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_dup(descriptor: u64) -> u64 {
+    match crate::task::dup_current(descriptor) {
+        Ok(fd) => fd,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
 fn sys_close(descriptor: u64) -> u64 {
     match crate::task::close_current(descriptor) {
         Ok(()) => {
@@ -669,6 +786,18 @@ pub extern "C" fn wovenhat_syscall_dispatch(
         value if value == Number::Mkdir as u64 => sys_mkdir(arg0, arg1),
         value if value == Number::Chdir as u64 => sys_chdir(arg0, arg1),
         value if value == Number::Getcwd as u64 => sys_getcwd(arg0, arg1),
+        value if value == Number::Dup as u64 => sys_dup(arg0),
+        value if value == Number::Pipe as u64 => sys_pipe(),
+        value if value == Number::Dup2 as u64 => sys_dup2(arg0, arg1),
+        value if value == Number::Getppid as u64 => sys_getppid(),
+        value if value == Number::Kill as u64 => sys_kill(arg0, arg1),
+        value if value == Number::Lseek as u64 => sys_lseek(arg0, arg1),
+        value if value == Number::Unlink as u64 => sys_unlink(arg0, arg1),
+        value if value == Number::Sleep as u64 => sys_sleep(arg0),
+        value if value == Number::Rename as u64 => sys_rename(arg0, arg1, arg2),
+        value if value == Number::Getticks as u64 => sys_getticks(),
+        value if value == Number::Sync as u64 => sys_sync(),
+        value if value == Number::Ioctl as u64 => sys_ioctl(arg0, arg1, arg2),
         _ => u64::MAX,
     };
 

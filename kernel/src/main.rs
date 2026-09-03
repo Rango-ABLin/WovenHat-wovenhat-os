@@ -29,6 +29,7 @@ mod paging;
 mod panic;
 mod partition;
 mod pic;
+mod pipe;
 mod serial;
 mod shell;
 mod storage;
@@ -249,6 +250,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("VFS READ/WRITE: FAILED");
         halt();
     }
+    if pipe::self_test() {
+        console.println("PIPE: OK");
+    } else {
+        console.println("PIPE: FAILED");
+        halt();
+    }
     if storage::self_test() {
         console.println("STORAGE MOUNT PATHS: OK");
     } else {
@@ -379,6 +386,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("INIT IMAGE: INSTALLED");
     } else {
         console.println("INIT IMAGE: INSTALL FAILED");
+        halt();
+    }
+    if userspace::install_shell_executable() {
+        console.println("SHELL IMAGE: INSTALLED");
+    } else {
+        console.println("SHELL IMAGE: INSTALL FAILED");
+        halt();
+    }
+    if userspace::install_echo_executable() {
+        console.println("ECHO IMAGE: INSTALLED");
+    } else {
+        console.println("ECHO IMAGE: INSTALL FAILED");
+        halt();
+    }
+    if userspace::install_true_executable()
+        && userspace::install_false_executable()
+        && userspace::install_cat_executable()
+        && userspace::install_ls_executable()
+        && userspace::install_sleep_executable()
+    {
+        console.println("BIN UTILS: INSTALLED");
+    } else {
+        console.println("BIN UTILS: INSTALL FAILED");
         halt();
     }
     let vfs_nodes_before_userspace = vfs::node_count();
@@ -672,6 +702,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::write_line(format_args!("[BOOT] ALL VALIDATIONS PASSED"));
     #[cfg(feature = "qemu-test")]
     qemu_test_exit_success();
+
+    // Start userspace init -> /bin/sh (non-fatal if spawn fails).
+    match userspace::create_init_process() {
+        Some(program) => match task::spawn_user_process("init", program) {
+            Ok((pid, _)) => {
+                serial::write_line(format_args!(
+                    "[BOOT] userspace init/sh scheduled as pid {}",
+                    pid.as_u64()
+                ));
+                console.println("USERSPACE INIT+SH: STARTED");
+            }
+            Err(_) => console.println("USERSPACE INIT+SH: SPAWN FAILED"),
+        },
+        None => console.println("USERSPACE INIT+SH: IMAGE FAILED"),
+    }
 
     console.println("");
     let mut desktop = gui::Desktop::new(graphics::Color::DARK_BLUE);

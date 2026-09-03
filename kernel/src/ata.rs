@@ -15,6 +15,7 @@ const ALT_STATUS: u16 = 0x3f6;
 
 const COMMAND_IDENTIFY: u8 = 0xec;
 const COMMAND_READ_SECTORS: u8 = 0x20;
+const COMMAND_WRITE_SECTORS: u8 = 0x30;
 const STATUS_ERR: u8 = 1;
 const STATUS_DRQ: u8 = 1 << 3;
 const STATUS_DF: u8 = 1 << 5;
@@ -90,8 +91,41 @@ impl BlockDevice for AtaPio {
         Ok(())
     }
 
-    fn write_sector(&mut self, _lba: u64, _sector: &[u8]) -> Result<(), Error> {
-        Err(Error::ReadOnly)
+    fn write_sector(&mut self, lba: u64, sector: &[u8]) -> Result<(), Error> {
+        if sector.len() != SECTOR_SIZE {
+            return Err(Error::InvalidBuffer);
+        }
+        if lba >= self.sectors || lba >= LBA28_SECTORS {
+            return Err(Error::OutOfBounds);
+        }
+
+        unsafe {
+            if !poll_not_busy() {
+                return Err(Error::DeviceFault);
+            }
+            outb(DRIVE, 0xe0 | ((lba >> 24) as u8 & 0x0f));
+            outb(SECTOR_COUNT, 1);
+            outb(LBA_LOW, lba as u8);
+            outb(LBA_MID, (lba >> 8) as u8);
+            outb(LBA_HIGH, (lba >> 16) as u8);
+            outb(STATUS_COMMAND, COMMAND_WRITE_SECTORS);
+            if !poll_data_ready() {
+                return Err(Error::DeviceFault);
+            }
+            for index in 0..SECTOR_SIZE / 2 {
+                let word = u16::from_le_bytes([sector[index * 2], sector[index * 2 + 1]]);
+                outw(DATA, word);
+            }
+            // Wait for the write to complete (BSY clear, no ERR/DF).
+            if !poll_not_busy() {
+                return Err(Error::DeviceFault);
+            }
+            let status = inb(STATUS_COMMAND);
+            if status & (STATUS_ERR | STATUS_DF) != 0 {
+                return Err(Error::DeviceFault);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -177,4 +211,8 @@ unsafe fn inw(port: u16) -> u16 {
 
 unsafe fn outb(port: u16, value: u8) {
     asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+}
+
+unsafe fn outw(port: u16, value: u16) {
+    asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
 }

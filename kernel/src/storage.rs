@@ -304,3 +304,104 @@ pub enum EnsureError {
     Vfs,
     Failed,
 }
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistError {
+    NotSupported,
+    NotFound,
+    NoDevice,
+    BadName,
+    TooLarge,
+    Failed,
+}
+
+/// Persist a VFS file under `/mnt/` to the live ATA FAT32 volume.
+///
+/// Only root-directory 8.3 short names are accepted (no subdirectories yet).
+/// The relative component after `/mnt/` must encode to a valid FAT 8.3 name.
+pub fn persist_path(path: &str) -> Result<(), PersistError> {
+    if !path.starts_with("/mnt/") {
+        return Err(PersistError::NotSupported);
+    }
+    let relative = &path[5..];
+    if relative.is_empty() || relative.contains('/') {
+        // Only root directory writes for now.
+        return Err(PersistError::BadName);
+    }
+    if fat32::encode_short_name(relative).is_none() {
+        return Err(PersistError::BadName);
+    }
+
+    let mut data = [0_u8; vfs::NODE_CAPACITY];
+    let length = match vfs::read_all(path, &mut data) {
+        Ok(n) => n,
+        Err(vfs::Error::NotFound) => return Err(PersistError::NotFound),
+        Err(_) => return Err(PersistError::Failed),
+    };
+    if length > vfs::NODE_CAPACITY {
+        return Err(PersistError::TooLarge);
+    }
+
+    ata::with_primary_master(|disk| persist_on_device(disk, relative, &data[..length]))
+        .unwrap_or(Err(PersistError::NoDevice))
+}
+
+fn persist_on_device(
+    device: &mut impl crate::block::BlockDevice,
+    name: &str,
+    data: &[u8],
+) -> Result<(), PersistError> {
+    // Same mount order as import: superfloppy → MBR → GPT.
+    match fat32::mount(device) {
+        Ok(volume) => {
+            return fat32::create_root_file(device, volume, name, data).map_err(map_persist_err);
+        }
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
+        Err(_) => return Err(PersistError::Failed),
+    }
+
+    if let Ok(Some(part)) = partition::find_fat32(device) {
+        let mut view =
+            partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+        let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
+        return fat32::create_root_file(&mut view, volume, name, data).map_err(map_persist_err);
+    }
+
+    match gpt::find_fat_partition(device) {
+        Ok(Some(part)) => {
+            let mut view =
+                partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+            let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
+            fat32::create_root_file(&mut view, volume, name, data).map_err(map_persist_err)
+        }
+        Ok(None) | Err(gpt::Error::MissingProtectiveMbr) => Err(PersistError::Failed),
+        Err(_) => Err(PersistError::Failed),
+    }
+}
+
+fn map_persist_err(err: fat32::Error) -> PersistError {
+    match err {
+        fat32::Error::NotFound => PersistError::NotFound,
+        fat32::Error::NameTooLong | fat32::Error::DirectoryFull => PersistError::BadName,
+        fat32::Error::NoSpace => PersistError::TooLarge,
+        fat32::Error::Block(_) | fat32::Error::WriteFailed => PersistError::Failed,
+        _ => PersistError::Failed,
+    }
+}
+
+pub fn fat32_writable() -> bool {
+    true
+}
+
+/// Best-effort walk of every VFS file under `/mnt/` and persist each one.
+/// Returns the number of files successfully written.
+pub fn sync_all_mounted() -> usize {
+    let mut ok = 0usize;
+    vfs::for_each_file_with_prefix("/mnt/", |path, _data| {
+        if persist_path(path).is_ok() {
+            ok += 1;
+        }
+    });
+    ok
+}

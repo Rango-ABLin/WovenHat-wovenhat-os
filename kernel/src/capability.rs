@@ -43,6 +43,7 @@ impl CapabilitySet {
         Self::empty()
             .with(Capability::Console)
             .with(Capability::FileRead)
+            .with(Capability::FileWrite)
             .with(Capability::Ipc)
             .with(Capability::ProcessCreate)
     }

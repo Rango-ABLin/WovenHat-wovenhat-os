@@ -50,3 +50,6 @@ pub const MAX_DEVICES: usize = 32;
 
 /// Maximum allocations tracked by the simple kernel heap.
 pub const MAX_HEAP_ALLOCATIONS: usize = 512;
+
+/// Global open-file description table capacity (refcount-shared across processes).
+pub const MAX_OPEN_FILES: usize = 64;

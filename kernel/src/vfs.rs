@@ -118,7 +118,7 @@ impl Registry {
         nodes[3] = Node::directory(b"/mnt");
         nodes[4] = Node::directory(b"/bin");
         nodes[5] = Node::with_data(b"/etc/motd", b"Welcome to WovenHat OS.\n", false);
-        nodes[6] = Node::with_data(b"/etc/version", b"WovenHat kernel 0.0.7\n", false);
+        nodes[6] = Node::with_data(b"/etc/version", b"WovenHat kernel 0.0.8\n", false);
         nodes[7] = Node::with_data(b"/tmp/vfs-self-test", b"", true);
         Self { nodes }
     }
@@ -192,6 +192,75 @@ impl Registry {
 
     fn count(&self) -> usize {
         self.nodes.iter().filter(|node| node.occupied).count()
+    }
+
+    fn remove(&mut self, path: &str) -> Result<(), Error> {
+        if path == "/" {
+            return Err(Error::ReadOnly);
+        }
+        let index = self
+            .nodes
+            .iter()
+            .position(|node| node.matches(path))
+            .ok_or(Error::NotFound)?;
+        let node = &self.nodes[index];
+        // Refuse to remove non-empty directories.
+        if node.kind == NodeKind::Directory {
+            let dir_path = node.path_str();
+            for other in self.nodes.iter().filter(|n| n.occupied) {
+                if immediate_child_name(dir_path, other.path_str()).is_some() {
+                    return Err(Error::Full); // reuse as "not empty"
+                }
+            }
+        }
+        self.nodes[index] = Node::empty();
+        Ok(())
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), Error> {
+        validate_absolute_path(old)?;
+        validate_absolute_path(new)?;
+        if old == "/" || new == "/" {
+            return Err(Error::ReadOnly);
+        }
+        if self.nodes.iter().any(|n| n.matches(new)) {
+            return Err(Error::AlreadyExists);
+        }
+        let index = self
+            .nodes
+            .iter()
+            .position(|n| n.matches(old))
+            .ok_or(Error::NotFound)?;
+        let node = &mut self.nodes[index];
+        let bytes = new.as_bytes();
+        if bytes.len() >= PATH_CAPACITY {
+            return Err(Error::Full);
+        }
+        node.path = [0; PATH_CAPACITY];
+        node.path[..bytes.len()].copy_from_slice(bytes);
+        node.path_length = bytes.len();
+        Ok(())
+    }
+
+    fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), Error> {
+        validate_absolute_path(path)?;
+        if data.len() > NODE_CAPACITY {
+            return Err(Error::Full);
+        }
+        if let Some(index) = self.nodes.iter().position(|n| n.matches(path)) {
+            let node = &mut self.nodes[index];
+            if node.kind != NodeKind::File {
+                return Err(Error::AlreadyExists);
+            }
+            if !node.writable {
+                return Err(Error::ReadOnly);
+            }
+            node.data[..data.len()].copy_from_slice(data);
+            node.length = data.len();
+            return Ok(());
+        }
+        // Create new writable file (parent must exist).
+        self.insert(path, data, true).map(|_| ())
     }
 
     fn stat(&self, path: &str) -> Result<Stat, Error> {
@@ -405,6 +474,20 @@ pub fn create_read_only(path: &str, data: &[u8]) -> Result<(), Error> {
     REGISTRY.lock().insert(path, data, false).map(|_| ())
 }
 
+/// Create or overwrite a writable file.
+pub fn write_file(path: &str, data: &[u8]) -> Result<(), Error> {
+    REGISTRY.lock().write_file(path, data)
+}
+
+/// Remove a file or empty directory.
+pub fn remove(path: &str) -> Result<(), Error> {
+    REGISTRY.lock().remove(path)
+}
+
+pub fn rename(old: &str, new: &str) -> Result<(), Error> {
+    REGISTRY.lock().rename(old, new)
+}
+
 /// Create a directory. Parent must already exist.
 pub fn mkdir(path: &str) -> Result<(), Error> {
     REGISTRY.lock().mkdir(path).map(|_| ())
@@ -482,6 +565,19 @@ pub fn read_all(path: &str, buffer: &mut [u8]) -> Result<usize, Error> {
     Ok(node.length)
 }
 
+pub fn seek(id: OpenFileId, offset: usize) -> Result<usize, Error> {
+    let mut table = OPEN_FILES.lock();
+    let entry = table.get_mut(id).ok_or(Error::NotFound)?;
+    let registry = REGISTRY.lock();
+    let node = registry.nodes.get(entry.node).filter(|n| n.occupied).ok_or(Error::NotFound)?;
+    let max = node.length;
+    drop(registry);
+    // Allow seek to end (offset == length) for append; not past EOF beyond length for simplicity.
+    let pos = core::cmp::min(offset, max);
+    entry.offset = pos;
+    Ok(pos)
+}
+
 pub fn write(id: OpenFileId, buffer: &[u8]) -> Result<usize, Error> {
     let mut table = OPEN_FILES.lock();
     let entry = table.get_mut(id)?;
@@ -513,6 +609,24 @@ pub fn write(id: OpenFileId, buffer: &[u8]) -> Result<usize, Error> {
         return Err(Error::Full);
     }
     Ok(count)
+}
+
+/// Invoke `f` for every occupied file node whose path starts with `prefix`.
+/// Directories are skipped. Intended for storage layer discovery under `/mnt`.
+pub fn for_each_file_with_prefix<F>(prefix: &str, mut f: F)
+where
+    F: FnMut(&str, &[u8]),
+{
+    let registry = REGISTRY.lock();
+    for node in registry.nodes.iter() {
+        if !node.occupied || node.kind != NodeKind::File {
+            continue;
+        }
+        let path = node.path_str();
+        if path.starts_with(prefix) {
+            f(path, &node.data[..node.length]);
+        }
+    }
 }
 
 pub fn node_count() -> usize {

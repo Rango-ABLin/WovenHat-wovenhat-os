@@ -335,6 +335,14 @@ fn task_bootstrap() -> ! {
 }
 
 #[derive(Clone, Copy)]
+/// What a process file descriptor refers to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FdKind {
+    File(vfs::OpenFileId),
+    PipeRead(usize),
+    PipeWrite(usize),
+}
+
 pub struct Process {
     pub id: ProcessId,
     pub task_id: TaskId,
@@ -345,10 +353,11 @@ pub struct Process {
     address_space: Option<userspace::AddressSpace>,
     /// Per-process file-descriptor table. Entries are handles into the
     /// system-wide refcounted open-file table in `vfs`.
-    files: [Option<vfs::OpenFileId>; MAX_FILE_DESCRIPTORS],
+    files: [Option<FdKind>; MAX_FILE_DESCRIPTORS],
     memory_mappings: [Option<userspace::AnonymousMapping>; userspace::MAX_ANONYMOUS_MAPPINGS],
     cwd: [u8; crate::config::MAX_PATH_SIZE],
     cwd_len: usize,
+    pending_signal: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -564,28 +573,50 @@ fn create_process(
         memory_mappings: [None; userspace::MAX_ANONYMOUS_MAPPINGS],
         cwd,
         cwd_len,
+        pending_signal: 0,
     }
 }
 
 /// Clone a parent's file-descriptor table for fork.
 /// Each live descriptor bumps the shared open-file refcount so offsets are shared.
 fn clone_file_table(
-    parent_files: &[Option<vfs::OpenFileId>; MAX_FILE_DESCRIPTORS],
-) -> Result<[Option<vfs::OpenFileId>; MAX_FILE_DESCRIPTORS], ProcessError> {
+    parent_files: &[Option<FdKind>; MAX_FILE_DESCRIPTORS],
+) -> Result<[Option<FdKind>; MAX_FILE_DESCRIPTORS], ProcessError> {
     let mut child_files = [None; MAX_FILE_DESCRIPTORS];
     for (index, entry) in parent_files.iter().enumerate() {
-        if let Some(id) = entry {
-            child_files[index] = Some(vfs::clone_open_file(*id).map_err(|_| ProcessError::Full)?);
+        match entry {
+            Some(FdKind::File(id)) => {
+                child_files[index] =
+                    Some(FdKind::File(vfs::clone_open_file(*id).map_err(|_| ProcessError::Full)?));
+            }
+            Some(FdKind::PipeRead(id)) => {
+                crate::pipe::clone_reader(*id).map_err(|_| ProcessError::Full)?;
+                child_files[index] = Some(FdKind::PipeRead(*id));
+            }
+            Some(FdKind::PipeWrite(id)) => {
+                crate::pipe::clone_writer(*id).map_err(|_| ProcessError::Full)?;
+                child_files[index] = Some(FdKind::PipeWrite(*id));
+            }
+            None => {}
         }
     }
     Ok(child_files)
 }
 
-/// Drop every open-file reference held by a process (used on close-all / reap).
-fn release_file_table(files: &mut [Option<vfs::OpenFileId>; MAX_FILE_DESCRIPTORS]) {
-    for entry in files.iter_mut() {
-        if let Some(id) = entry.take() {
+fn release_fd(fd: FdKind) {
+    match fd {
+        FdKind::File(id) => {
             let _ = vfs::close_open_file(id);
+        }
+        FdKind::PipeRead(id) => crate::pipe::close_reader(id),
+        FdKind::PipeWrite(id) => crate::pipe::close_writer(id),
+    }
+}
+
+fn release_file_table(files: &mut [Option<FdKind>; MAX_FILE_DESCRIPTORS]) {
+    for entry in files.iter_mut() {
+        if let Some(fd) = entry.take() {
+            release_fd(fd);
         }
     }
 }
@@ -809,6 +840,7 @@ pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, P
         memory_mappings: parent.memory_mappings,
         cwd: parent.cwd,
         cwd_len: parent.cwd_len,
+        pending_signal: 0,
     });
     Ok(child_id)
 }
@@ -1031,19 +1063,28 @@ pub fn open_current(path: &str) -> Result<u64, FileError> {
     if !current_has(Capability::FileRead) {
         return Err(FileError::PermissionDenied);
     }
-    let path = resolve_path_for_current(path)?;
+    let file = match vfs::open(path) {
+        Ok(id) => id,
+        Err(_) => {
+            // POSIX-ish O_CREAT for missing files when writer-capable.
+            if !current_has(Capability::FileWrite) {
+                return Err(FileError::NotFound);
+            }
+            vfs::write_file(path, &[]).map_err(|_| FileError::NotFound)?;
+            vfs::open(path).map_err(|_| FileError::NotFound)?
+        }
+    };
     let task_id = current_task_id();
-    let file = vfs::open(&path).map_err(|_| FileError::NotFound)?;
     let mut processes = PROCESS_TABLE.lock();
     let process = processes
         .iter_mut()
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let descriptor = (3..MAX_FILE_DESCRIPTORS)
+    let descriptor = (0..MAX_FILE_DESCRIPTORS)
         .find(|descriptor| process.files[*descriptor].is_none())
         .ok_or(FileError::TooManyFiles)?;
-    process.files[descriptor] = Some(file);
+    process.files[descriptor] = Some(FdKind::File(file));
     Ok(descriptor as u64)
 }
 
@@ -1056,20 +1097,21 @@ pub fn read_current(descriptor: u64, buffer: &mut [u8]) -> Result<usize, FileErr
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let id = process
+    let fd = process
         .files
         .get(descriptor)
         .copied()
         .flatten()
         .ok_or(FileError::BadDescriptor)?;
     drop(processes);
-    vfs::read(id, buffer).map_err(|_| FileError::BadDescriptor)
+    match fd {
+        FdKind::File(id) => vfs::read(id, buffer).map_err(|_| FileError::BadDescriptor),
+        FdKind::PipeRead(id) => crate::pipe::read(id, buffer).map_err(|_| FileError::BadDescriptor),
+        FdKind::PipeWrite(_) => Err(FileError::BadDescriptor),
+    }
 }
 
 pub fn write_current(descriptor: u64, buffer: &[u8]) -> Result<usize, FileError> {
-    if !current_has(Capability::FileWrite) {
-        return Err(FileError::PermissionDenied);
-    }
     let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
     let task_id = current_task_id();
     let processes = PROCESS_TABLE.lock();
@@ -1078,14 +1120,131 @@ pub fn write_current(descriptor: u64, buffer: &[u8]) -> Result<usize, FileError>
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let id = process
+    let fd = process
         .files
         .get(descriptor)
         .copied()
         .flatten()
         .ok_or(FileError::BadDescriptor)?;
     drop(processes);
-    vfs::write(id, buffer).map_err(|_| FileError::BadDescriptor)
+    match fd {
+        FdKind::File(id) => {
+            if !current_has(Capability::FileWrite) {
+                return Err(FileError::PermissionDenied);
+            }
+            vfs::write(id, buffer).map_err(|_| FileError::BadDescriptor)
+        }
+        FdKind::PipeWrite(id) => crate::pipe::write(id, buffer).map_err(|_| FileError::BadDescriptor),
+        FdKind::PipeRead(_) => Err(FileError::BadDescriptor),
+    }
+}
+
+pub fn dup_current(descriptor: u64) -> Result<u64, FileError> {
+    let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    let fd = process
+        .files
+        .get(descriptor)
+        .copied()
+        .flatten()
+        .ok_or(FileError::BadDescriptor)?;
+    let cloned = match fd {
+        FdKind::File(id) => {
+            FdKind::File(vfs::clone_open_file(id).map_err(|_| FileError::TooManyFiles)?)
+        }
+        FdKind::PipeRead(id) => {
+            crate::pipe::clone_reader(id).map_err(|_| FileError::TooManyFiles)?;
+            FdKind::PipeRead(id)
+        }
+        FdKind::PipeWrite(id) => {
+            crate::pipe::clone_writer(id).map_err(|_| FileError::TooManyFiles)?;
+            FdKind::PipeWrite(id)
+        }
+    };
+    let new_descriptor = (0..MAX_FILE_DESCRIPTORS)
+        .find(|slot| process.files[*slot].is_none())
+        .ok_or(FileError::TooManyFiles)?;
+    process.files[new_descriptor] = Some(cloned);
+    Ok(new_descriptor as u64)
+}
+
+pub fn dup2_current(old: u64, new: u64) -> Result<u64, FileError> {
+    let old = usize::try_from(old).map_err(|_| FileError::BadDescriptor)?;
+    let new = usize::try_from(new).map_err(|_| FileError::BadDescriptor)?;
+    if new >= MAX_FILE_DESCRIPTORS {
+        return Err(FileError::BadDescriptor);
+    }
+    if old == new {
+        return Ok(new as u64);
+    }
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    let fd = process
+        .files
+        .get(old)
+        .copied()
+        .flatten()
+        .ok_or(FileError::BadDescriptor)?;
+    let cloned = match fd {
+        FdKind::File(id) => {
+            FdKind::File(vfs::clone_open_file(id).map_err(|_| FileError::TooManyFiles)?)
+        }
+        FdKind::PipeRead(id) => {
+            crate::pipe::clone_reader(id).map_err(|_| FileError::TooManyFiles)?;
+            FdKind::PipeRead(id)
+        }
+        FdKind::PipeWrite(id) => {
+            crate::pipe::clone_writer(id).map_err(|_| FileError::TooManyFiles)?;
+            FdKind::PipeWrite(id)
+        }
+    };
+    if let Some(prev) = process.files[new].take() {
+        release_fd(prev);
+    }
+    process.files[new] = Some(cloned);
+    Ok(new as u64)
+}
+
+pub fn pipe_current() -> Result<(u64, u64), FileError> {
+    let pipe_id = crate::pipe::create().map_err(|_| FileError::TooManyFiles)?;
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    let read_fd = (0..MAX_FILE_DESCRIPTORS)
+        .find(|slot| process.files[*slot].is_none())
+        .ok_or(FileError::TooManyFiles)?;
+    process.files[read_fd] = Some(FdKind::PipeRead(pipe_id));
+    let write_fd = (0..MAX_FILE_DESCRIPTORS)
+        .find(|slot| process.files[*slot].is_none())
+        .ok_or(FileError::TooManyFiles)?;
+    process.files[write_fd] = Some(FdKind::PipeWrite(pipe_id));
+    Ok((read_fd as u64, write_fd as u64))
+}
+
+pub fn getppid_current() -> u64 {
+    let processes = PROCESS_TABLE.lock();
+    let task_id = current_task_id();
+    processes
+        .iter()
+        .flatten()
+        .find(|p| p.task_id == task_id)
+        .map(|p| p.parent.as_u64())
+        .unwrap_or(0)
 }
 
 pub fn close_current(descriptor: u64) -> Result<(), FileError> {
@@ -1101,14 +1260,15 @@ pub fn close_current(descriptor: u64) -> Result<(), FileError> {
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let id = process
+    let fd = process
         .files
         .get_mut(descriptor)
         .ok_or(FileError::BadDescriptor)?
         .take()
         .ok_or(FileError::BadDescriptor)?;
     drop(processes);
-    vfs::close_open_file(id).map_err(|_| FileError::BadDescriptor)
+    release_fd(fd);
+    Ok(())
 }
 
 pub fn open_file_count() -> usize {
@@ -1620,4 +1780,79 @@ unsafe fn push_stack_value(cursor: &mut usize, value: u64) {
     // SAFETY: The caller guarantees that the decremented cursor is a writable,
     // aligned location within the task's private stack.
     unsafe { (*cursor as *mut u64).write(value) };
+}
+
+
+pub fn kill_process(pid: u64, sig: u64) -> Result<(), FileError> {
+    // Minimal POSIX-ish: SIGTERM(15) / SIGKILL(9) mark process for exit.
+    if sig != 9 && sig != 15 && sig != 0 {
+        return Err(FileError::NotFound);
+    }
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|p| p.id.as_u64() == pid)
+        .ok_or(FileError::NotFound)?;
+    if sig == 0 {
+        return Ok(()); // existence check
+    }
+    process.pending_signal = sig;
+    if process.state != ProcessState::Exited {
+        process.state = ProcessState::Exited;
+        process.exit_code = 128 + (sig as i32);
+        // Unblock pipe peers and drop resources.
+        release_file_table(&mut process.files);
+    }
+    Ok(())
+}
+
+
+pub fn seek_current(descriptor: u64, offset: u64) -> Result<u64, FileError> {
+    let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
+    let offset = usize::try_from(offset).map_err(|_| FileError::BadDescriptor)?;
+    let task_id = current_task_id();
+    let processes = PROCESS_TABLE.lock();
+    let process = processes
+        .iter()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
+    let fd = process
+        .files
+        .get(descriptor)
+        .copied()
+        .flatten()
+        .ok_or(FileError::BadDescriptor)?;
+    drop(processes);
+    match fd {
+        FdKind::File(id) => vfs::seek(id, offset)
+            .map(|pos| pos as u64)
+            .map_err(|_| FileError::BadDescriptor),
+        _ => Err(FileError::BadDescriptor),
+    }
+}
+
+pub fn unlink_current(path: &str) -> Result<(), FileError> {
+    if !current_has(Capability::FileWrite) {
+        return Err(FileError::PermissionDenied);
+    }
+    vfs::remove(path).map_err(|e| match e {
+        vfs::Error::NotFound => FileError::NotFound,
+        vfs::Error::ReadOnly => FileError::PermissionDenied,
+        _ => FileError::NotFound,
+    })
+}
+
+
+pub fn rename_current(old: &str, new: &str) -> Result<(), FileError> {
+    if !current_has(Capability::FileWrite) {
+        return Err(FileError::PermissionDenied);
+    }
+    vfs::rename(old, new).map_err(|e| match e {
+        vfs::Error::NotFound => FileError::NotFound,
+        vfs::Error::AlreadyExists => FileError::AlreadyExists,
+        vfs::Error::ReadOnly => FileError::PermissionDenied,
+        _ => FileError::NotFound,
+    })
 }

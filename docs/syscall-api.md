@@ -28,6 +28,11 @@ sentinel. The assembly entry preserves general registers and returns with iretq.
 | 19 | mkdir | user path, path length |
 | 20 | chdir | user path, path length |
 | 21 | getcwd | user buffer, capacity → length |
+| 22 | dup | fd → new fd |
+| 23 | pipe | → read_fd | (write_fd≪32) |
+| 24 | dup2 | oldfd, newfd |
+| 25 | getppid | |
+| 26 | kill | pid, sig (0/9/15) |
 
 Descriptor 0 reads the nonblocking PS/2 byte stream; descriptors 1 and 2 write to COM1. The reserved standard descriptors cannot be closed, and VFS handles begin at 3. See [standard streams](standard-streams.md).
 
