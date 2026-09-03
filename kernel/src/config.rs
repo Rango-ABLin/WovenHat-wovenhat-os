@@ -37,7 +37,7 @@ pub const MAX_IO_SIZE: usize = 1024;
 pub const MAX_VFS_NODES: usize = 64;
 
 /// Capacity of each VFS node data buffer (bytes).
-pub const VFS_NODE_CAPACITY: usize = 8192;
+pub const VFS_NODE_CAPACITY: usize = 64 * 1024;
 
 /// Maximum ELF loadable segments accepted by the loader.
 pub const MAX_ELF_SEGMENTS: usize = 8;

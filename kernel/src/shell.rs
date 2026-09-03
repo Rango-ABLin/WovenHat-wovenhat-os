@@ -453,6 +453,17 @@ fn cmd_userland(console: &mut Console<'_>) {
         console.println("/bin is ready; type 'sh' for the userspace shell");
     } else {
         console.println("userland: one or more built-in programs failed to install");
+        const EXPECTED: [&str; 12] = [
+            "/bin/selftest", "/bin/init", "/bin/sh", "/bin/echo",
+            "/bin/true", "/bin/false", "/bin/cat", "/bin/ls",
+            "/bin/sleep", "/bin/pwd", "/bin/mkdir", "/bin/rm",
+        ];
+        for path in EXPECTED {
+            if vfs::stat(path).is_err() {
+                console.print("missing: ");
+                console.println(path);
+            }
+        }
     }
 }
 
@@ -810,18 +821,47 @@ fn cmd_run(path: &str, console: &mut Console<'_>) {
 fn cmd_sh(console: &mut Console<'_>) {
     let installed = install_userland();
     if installed != 12 {
-        console.println("sh: warning: userland installation incomplete");
+        console.print("sh: userland incomplete (");
+        print_u64(console, installed as u64);
+        console.println("/12)");
+        return;
     }
+
+    crate::serial::write_line(format_args!("[SH] building userspace shell image"));
     let Some(program) = userspace::create_shell_process() else {
         console.println("sh: image failed");
+        crate::serial::write_line(format_args!("[SH] create_shell_process failed"));
         return;
     };
+
+    crate::serial::write_line(format_args!("[SH] image ready; spawning process"));
     match task::spawn_user_process("sh", program) {
         Ok((id, context)) => {
             serial_user_shell_start(id.as_u64(), context.entry);
             terminal::set_foreground(id.as_u64());
+            console.println("starting userspace shell...");
+            crate::serial::write_line(format_args!(
+                "[SH] foreground assigned to pid={}; dispatching immediately",
+                id.as_u64()
+            ));
+
+            // Do not wait for a timer interrupt to happen to schedule the fresh
+            // Ring-3 process.  Yield here from a normal kernel context so the
+            // first userspace dispatch is deterministic and debuggable.
+            task::yield_now();
+
+            // Reaching here means another runnable task eventually scheduled
+            // the kernel task again.  The foreground flag remains owned by the
+            // userspace process until exit_current_process releases it.
+            crate::serial::write_line(format_args!(
+                "[SH] kernel task resumed; foreground_active={}",
+                terminal::foreground_active()
+            ));
         }
-        Err(_) => console.println("sh: spawn failed"),
+        Err(_) => {
+            console.println("sh: spawn failed");
+            crate::serial::write_line(format_args!("[SH] spawn_user_process failed"));
+        }
     }
 }
 
