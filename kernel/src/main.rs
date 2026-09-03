@@ -754,9 +754,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         graphics::Color::CYAN,
     ));
     desktop.add_window(window);
-    console.render_desktop(&desktop);
     let mut shell = Shell::new();
-    let mut desktop_active = true;
+    let mut desktop_active = false;
+
+    // Start in the diagnostic shell. F1 toggles to the graphical desktop.
+    console.clear();
+    console.println("WOVENHAT DIAGNOSTIC SHELL (F1 TO OPEN DESKTOP)");
+    shell.print_prompt(&mut console);
 
     //
     // F1 switches between the desktop and diagnostic shell. Keyboard IRQ
@@ -774,7 +778,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     console.render_desktop(&desktop);
                 } else {
                     console.clear();
-                    console.println("WOVENHAT DIAGNOSTIC SHELL (F1 TO RETURN)");
+                    console.println("WOVENHAT DIAGNOSTIC SHELL (F1 TO OPEN DESKTOP)");
                     shell.print_prompt(&mut console);
                 }
             } else if desktop_active {

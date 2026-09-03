@@ -64,7 +64,7 @@ impl<const SECTORS: usize> BlockDevice for RamDisk<SECTORS> {
 pub fn self_test() -> bool {
     let mut disk = RamDisk::<2>::new();
     let mut written = [0_u8; SECTOR_SIZE];
-    written[..13].copy_from_slice(b"wovenhat-block");
+    written[..14].copy_from_slice(b"wovenhat-block");
     if disk.write_sector(1, &written).is_err() {
         return false;
     }
