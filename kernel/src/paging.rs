@@ -192,6 +192,12 @@ pub fn init(physical_memory_offset: u64) -> Result<(), InitError> {
     Ok(())
 }
 
+pub fn translate_kernel_address(address: u64) -> Option<u64> {
+    let paging = PAGING.lock();
+    let mapper = paging.mapper.as_ref()?;
+    mapper.translate_addr(VirtAddr::new(address)).map(|phys| phys.as_u64())
+}
+
 pub fn self_test(addresses: &[u64]) -> bool {
     let mut paging = PAGING.lock();
     let Some(mapper) = paging.mapper.as_ref() else {

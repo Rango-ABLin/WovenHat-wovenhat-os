@@ -1,23 +1,27 @@
-//! smoltcp-facing Ethernet adapter for WovenHat networking.
+//! WovenHat IPv4 network stack.
 //!
-//! This establishes the no_std smoltcp integration and packet boundary used by
-//! the VirtIO-net transport. IPv4 defaults are intentionally link-local until
-//! DHCP/configuration syscalls are added.
+//! The physical device is the real VirtIO-net transport in `virtio_net` and
+//! smoltcp supplies Ethernet/ARP/IPv4 processing. Stage 3 uses QEMU user-mode
+//! networking's conventional 10.0.2.0/24 topology so the OS has a usable
+//! standalone network without depending on DHCP yet.
 
-use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+use spin::{Mutex, Once};
+use smoltcp::{
+    iface::{Config, Interface, SocketSet, SocketStorage},
+    phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    time::Instant,
+    wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address},
+};
 
-use crate::virtio_net::{self, MAX_FRAME};
+use crate::{timer, virtio_net::{self, MAX_FRAME}};
 
-pub const DEFAULT_MAC: EthernetAddress = EthernetAddress([0x02, 0x57, 0x48, 0x00, 0x00, 0x01]);
-pub const DEFAULT_IPV4: Ipv4Address = Ipv4Address::new(169, 254, 87, 72);
+pub const DEFAULT_IPV4: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
+pub const DEFAULT_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+pub const DEFAULT_PREFIX: u8 = 24;
 
-pub fn default_cidr() -> IpCidr { IpCidr::new(IpAddress::Ipv4(DEFAULT_IPV4), 16) }
+pub fn default_cidr() -> IpCidr { IpCidr::new(IpAddress::Ipv4(DEFAULT_IPV4), DEFAULT_PREFIX) }
 
-pub struct VirtioSmolDevice {
-    rx: [u8; MAX_FRAME],
-}
+pub struct VirtioSmolDevice { rx: [u8; MAX_FRAME] }
 impl VirtioSmolDevice { pub const fn new() -> Self { Self { rx: [0; MAX_FRAME] } } }
 
 pub struct WovenRxToken<'a> { data: &'a mut [u8] }
@@ -48,12 +52,55 @@ impl Device for VirtioSmolDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = 1514;
+        caps.max_transmission_unit = 1500;
         caps.checksum = ChecksumCapabilities::ignored();
         caps
     }
 }
 
+struct Runtime { iface: Interface, device: VirtioSmolDevice }
+static RUNTIME: Once<Mutex<Runtime>> = Once::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitError { Transport(virtio_net::InitError), Route }
+
+pub fn init() -> Result<(), InitError> {
+    if RUNTIME.get().is_some() { return Ok(()); }
+    virtio_net::init().map_err(InitError::Transport)?;
+
+    let mac = EthernetAddress(virtio_net::mac_address());
+    let mut device = VirtioSmolDevice::new();
+    let mut config = Config::new(mac.into());
+    config.random_seed = 0x5748_4f53_4e45_5433;
+    let now = now();
+    let mut iface = Interface::new(config, &mut device, now);
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(default_cidr());
+    });
+    iface.routes_mut().add_default_ipv4_route(DEFAULT_GATEWAY).map_err(|_| InitError::Route)?;
+    RUNTIME.call_once(|| Mutex::new(Runtime { iface, device }));
+    Ok(())
+}
+
+pub fn poll() {
+    virtio_net::poll();
+    let Some(runtime) = RUNTIME.get() else { return; };
+    let mut runtime = runtime.lock();
+    let mut storage = [const { SocketStorage::EMPTY }; 1];
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let Runtime { iface, device } = &mut *runtime;
+    let _ = iface.poll(now(), device, &mut sockets);
+}
+
+pub fn initialized() -> bool { RUNTIME.get().is_some() && virtio_net::is_initialized() }
+
 pub fn self_test() -> bool {
-    default_cidr().prefix_len() == 16 && DEFAULT_MAC.0[0] & 1 == 0 && virtio_net::self_test()
+    default_cidr().prefix_len() == DEFAULT_PREFIX
+        && DEFAULT_GATEWAY == Ipv4Address::new(10, 0, 2, 2)
+        && virtio_net::self_test()
+}
+
+fn now() -> Instant {
+    let millis = timer::ticks().saturating_mul(1000) / timer::FREQUENCY_HZ as u64;
+    Instant::from_millis(millis as i64)
 }

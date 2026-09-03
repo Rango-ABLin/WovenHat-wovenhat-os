@@ -95,6 +95,30 @@ pub fn device(index: usize) -> Option<Device> {
     INVENTORY.lock().devices.get(index).copied().flatten()
 }
 
+pub fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    read_config(bus, device, function, offset)
+}
+
+pub fn write_config_dword(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    unsafe {
+        outl(CONFIG_ADDRESS, config_address(bus, device, function, offset));
+        outl(CONFIG_DATA, value);
+    }
+}
+
+pub fn enable_io_bus_master(bus: u8, device: u8, function: u8) {
+    let value = read_config(bus, device, function, 0x04);
+    // PCI command: bit0 I/O space, bit2 bus master. Preserve status/high bits.
+    write_config_dword(bus, device, function, 0x04, value | 0x0000_0005);
+}
+
+pub fn bar0_io_base(bus: u8, device: u8, function: u8) -> Option<u16> {
+    let bar = read_config(bus, device, function, 0x10);
+    if bar & 1 == 0 { return None; }
+    let base = bar & 0xffff_fffc;
+    u16::try_from(base).ok().filter(|base| *base != 0)
+}
+
 fn probe(bus: u8, device: u8, function: u8) -> Option<Device> {
     let identity = read_config(bus, device, function, 0);
     let vendor_id = identity as u16;

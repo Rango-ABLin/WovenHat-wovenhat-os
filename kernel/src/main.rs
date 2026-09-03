@@ -36,6 +36,7 @@ mod shell;
 mod storage;
 mod syscall;
 mod task;
+mod terminal;
 mod timer;
 mod userspace;
 mod vfs;
@@ -98,6 +99,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let framebuffer_address = buffer.as_ptr() as u64;
     let stack_probe = &info as *const _ as u64;
 
+    terminal::init(buffer, info);
     let mut console = Console::new(buffer, info, 40, 40, 2);
 
     console.clear();
@@ -106,7 +108,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("SECURE INTELLIGENCE PLATFORM");
     console.println("");
 
-    console.println("WOVENHAT KERNEL 0.0.7");
+    console.println("WOVENHAT KERNEL 0.1.0");
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
@@ -266,6 +268,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pic::unmask(keyboard::IRQ);
         x86_64::instructions::interrupts::enable();
 
+        match network::init() {
+            Ok(()) => serial::write_line(format_args!("[NET] virtio-net + smoltcp online at 10.0.2.15/24")),
+            Err(error) => serial::write_line(format_args!("[NET] optional network init skipped: {:?}", error)),
+        }
+
         serial::write_line(format_args!(
             "[BOOT] shell-first runtime ready; entering diagnostic shell"
         ));
@@ -278,11 +285,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("");
         shell.print_prompt(&mut console);
 
+        let mut userspace_was_foreground = false;
         loop {
-            if let Some(key) = keyboard::poll() {
-                shell.handle_key(key, &mut console);
+            let userspace_foreground = terminal::foreground_active();
+            if userspace_was_foreground && !userspace_foreground {
+                console.clear();
+                console.println("WOVENHAT DIAGNOSTIC SHELL");
+                console.println("USERSPACE SESSION ENDED");
+                console.println("");
+                shell.print_prompt(&mut console);
+            }
+            userspace_was_foreground = userspace_foreground;
+
+            if !userspace_foreground {
+                if let Some(key) = keyboard::poll() {
+                    shell.handle_key(key, &mut console);
+                }
             }
 
+            network::poll();
             syscall::service_pending();
             task::preemption_point();
             x86_64::instructions::hlt();

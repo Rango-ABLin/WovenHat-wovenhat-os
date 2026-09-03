@@ -168,7 +168,7 @@ impl<'a> Console<'a> {
     }
 }
 
-fn glyph(c: char) -> [u8; 7] {
+pub(crate) fn glyph(c: char) -> [u8; 7] {
     match c.to_ascii_uppercase() {
         'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
         'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],

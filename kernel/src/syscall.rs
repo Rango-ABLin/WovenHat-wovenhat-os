@@ -289,6 +289,7 @@ fn sys_write(descriptor: u64, user_buffer: u64, length: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     crate::serial::write_bytes(&buffer[..length]);
+    crate::terminal::write_bytes(&buffer[..length]);
     IO_COMPLETIONS.fetch_or(IO_WRITE, Ordering::Release);
     if descriptor == 2 {
         IO_COMPLETIONS.fetch_or(IO_STDERR, Ordering::Release);

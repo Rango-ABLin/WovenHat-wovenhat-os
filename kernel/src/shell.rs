@@ -6,7 +6,7 @@
 
 use crate::{
     benchmark, capability::Capability, console::Console, heap, keyboard::Key, memory, paging,
-    storage, syscall, task, timer, userspace, vfs,
+    device, storage, syscall, task, terminal, timer, userspace, vfs, virtio_net, network,
 };
 
 const PROMPT_PREFIX: &str = "wovenhat:";
@@ -116,7 +116,7 @@ impl Shell {
                     console.clear();
                 }
             }
-            "version" | "ver" => console.println("WovenHat kernel 0.0.8"),
+            "version" | "ver" => console.println("WovenHat kernel 0.1.0"),
             "ticks" | "uptime" => {
                 if authorize(Capability::TimerRead, console) {
                     console.print("ticks: ");
@@ -130,6 +130,18 @@ impl Shell {
                 }
             }
             "caps" => cmd_caps(console),
+            "devices" | "dev" => cmd_devices(console),
+            "net" => cmd_net(console),
+            "userland" => {
+                if authorize(Capability::FileWrite, console) {
+                    cmd_userland(console);
+                }
+            }
+            "kill" => {
+                if authorize(Capability::TaskControl, console) {
+                    cmd_kill(arg, console);
+                }
+            }
             "memory" | "mem" => {
                 if authorize(Capability::MemoryInspect, console) {
                     cmd_memory(console);
@@ -293,18 +305,21 @@ impl Shell {
 
     fn finish(&mut self, console: &mut Console<'_>) {
         self.length = 0;
-        self.print_prompt(console);
+        if !terminal::foreground_active() {
+            self.print_prompt(console);
+        }
     }
 }
 
 fn print_help(console: &mut Console<'_>) {
-    console.println("WovenHat kernel shell 0.0.8");
-    console.println("system:  help clear version ticks|uptime tasks|ps caps");
+    console.println("WovenHat kernel shell 0.1.0");
+    console.println("system:  help clear version ticks|uptime tasks|ps caps devices net");
     console.println("         memory|mem heap paging bench fs mount syscall");
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
     console.println("nav:     cd [path]  pwd  echo <text>");
-    console.println("process: run <elf>  sh  init  spawn  user|ring3");
+    console.println("process: run <elf>  sh  init  spawn  user|ring3  kill <pid> [sig]");
+    console.println("runtime: userland   (install /bin programs on demand)");
 }
 
 fn cmd_tasks(console: &mut Console<'_>) {
@@ -334,6 +349,138 @@ fn cmd_tasks(console: &mut Console<'_>) {
     console.print("  idle: ");
     print_u64(console, summary.idle_heartbeats);
     console.newline();
+}
+
+fn cmd_devices(console: &mut Console<'_>) {
+    console.print("devices: ");
+    print_u64(console, device::count() as u64);
+    console.newline();
+
+    for name in ["framebuffer-console", "com1", "pit", "ps2-keyboard", "ata0"] {
+        if let Some(dev) = device::find(name) {
+            console.print("  ");
+            console.print(dev.name);
+            console.print("  kind=");
+            console.print(match dev.kind {
+                device::DeviceKind::Console => "console",
+                device::DeviceKind::Serial => "serial",
+                device::DeviceKind::Timer => "timer",
+                device::DeviceKind::Keyboard => "keyboard",
+                device::DeviceKind::Block => "block",
+            });
+            if let Some(irq) = dev.irq {
+                console.print(" irq=");
+                print_u64(console, irq as u64);
+            }
+            console.newline();
+        }
+    }
+}
+
+fn cmd_net(console: &mut Console<'_>) {
+    match virtio_net::probe() {
+        virtio_net::ProbeStatus::Found(loc) => {
+            console.print("virtio-net pci: ");
+            print_u64(console, loc.bus as u64);
+            console.print(":");
+            print_u64(console, loc.device as u64);
+            console.print(".");
+            print_u64(console, loc.function as u64);
+            console.newline();
+        }
+        virtio_net::ProbeStatus::Missing => {
+            console.println("virtio-net: not present");
+            console.println("QEMU requires transitional device: disable-modern=on");
+            return;
+        }
+    }
+
+    let stats = virtio_net::stats();
+    console.print("transport: ");
+    console.println(if stats.initialized { "legacy virtqueue DMA online" } else { "not initialized" });
+    if !stats.initialized {
+        console.println("QEMU: -device virtio-net-pci,netdev=net0,disable-modern=on");
+        console.println("      -netdev user,id=net0");
+        return;
+    }
+    console.print("smoltcp: ");
+    console.println(if network::initialized() { "online" } else { "offline" });
+    console.println("ipv4: 10.0.2.15/24  gateway: 10.0.2.2");
+    console.print("rx="); print_u64(console, stats.rx_frames);
+    console.print(" tx="); print_u64(console, stats.tx_frames);
+    console.print(" rx_drop="); print_u64(console, stats.rx_dropped);
+    console.print(" tx_busy="); print_u64(console, stats.tx_busy);
+    console.newline();
+}
+
+fn ensure_program(path: &str, installer: fn() -> bool) -> bool {
+    vfs::stat(path).is_ok() || installer()
+}
+
+fn install_userland() -> u64 {
+    let programs: [(&str, fn() -> bool); 11] = [
+        ("/bin/selftest", userspace::install_stub_executable),
+        ("/bin/init", userspace::install_init_executable),
+        ("/bin/sh", userspace::install_shell_executable),
+        ("/bin/echo", userspace::install_echo_executable),
+        ("/bin/true", userspace::install_true_executable),
+        ("/bin/false", userspace::install_false_executable),
+        ("/bin/cat", userspace::install_cat_executable),
+        ("/bin/ls", userspace::install_ls_executable),
+        ("/bin/sleep", userspace::install_sleep_executable),
+        ("/bin/pwd", userspace::install_pwd_executable),
+        ("/bin/mkdir", userspace::install_mkdir_executable),
+    ];
+
+    let mut installed = 0u64;
+    for (path, installer) in programs {
+        if ensure_program(path, installer) {
+            installed += 1;
+        }
+    }
+    if ensure_program("/bin/rm", userspace::install_rm_executable) {
+        installed += 1;
+    }
+    installed
+}
+
+fn cmd_userland(console: &mut Console<'_>) {
+    let installed = install_userland();
+    console.print("userland: ");
+    print_u64(console, installed);
+    console.println("/12 programs ready");
+    if installed == 12 {
+        console.println("/bin is ready; type 'sh' for the userspace shell");
+    } else {
+        console.println("userland: one or more built-in programs failed to install");
+    }
+}
+
+fn cmd_kill(arg: &str, console: &mut Console<'_>) {
+    let (pid_text, signal_text) = split_command(arg);
+    if pid_text.is_empty() {
+        console.println("usage: kill <pid> [signal]");
+        return;
+    }
+    let Ok(pid) = pid_text.parse::<u64>() else {
+        console.println("kill: invalid pid");
+        return;
+    };
+    let signal = if signal_text.is_empty() {
+        15
+    } else {
+        match signal_text.parse::<u64>() {
+            Ok(value) if value <= 31 => value,
+            _ => {
+                console.println("kill: invalid signal (0..31)");
+                return;
+            }
+        }
+    };
+    match task::kill_process(pid, signal) {
+        Ok(()) => console.println("kill: signal delivered"),
+        Err(_) => console.println("kill: process not found"),
+    }
 }
 
 fn cmd_caps(console: &mut Console<'_>) {
@@ -661,21 +808,27 @@ fn cmd_run(path: &str, console: &mut Console<'_>) {
 }
 
 fn cmd_sh(console: &mut Console<'_>) {
+    let installed = install_userland();
+    if installed != 12 {
+        console.println("sh: warning: userland installation incomplete");
+    }
     let Some(program) = userspace::create_shell_process() else {
         console.println("sh: image failed");
         return;
     };
     match task::spawn_user_process("sh", program) {
         Ok((id, context)) => {
-            console.print("userspace sh pid=");
-            print_u64(console, id.as_u64());
-            console.print(" entry=");
-            print_hex_u64(console, context.entry);
-            console.newline();
-            console.println("(keyboard input goes to the active userspace task)");
+            serial_user_shell_start(id.as_u64(), context.entry);
+            terminal::set_foreground(id.as_u64());
         }
         Err(_) => console.println("sh: spawn failed"),
     }
+}
+
+fn serial_user_shell_start(pid: u64, entry: u64) {
+    crate::serial::write_line(format_args!(
+        "[TTY] userspace shell foreground pid={} entry={:#x}", pid, entry
+    ));
 }
 
 fn cmd_init(console: &mut Console<'_>) {
