@@ -650,15 +650,19 @@ pub fn spawn_user_process(
         return Err(ProcessError::Full);
     };
 
+    // Build the Process before taking PROCESS_TABLE. create_process() needs to
+    // inspect the parent entry to inherit cwd/process-group state, so calling it
+    // while PROCESS_TABLE is already locked would recursively acquire the same
+    // non-reentrant spinlock and deadlock during userspace spawn.
+    let task_id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    let process = create_process(task_id, parent, program.address_space);
+    let process_id = process.id;
+
     let mut processes = PROCESS_TABLE.lock();
     let Some(process_slot) = processes.iter().position(|entry| entry.is_none()) else {
         let _ = userspace::destroy(program.address_space);
         return Err(ProcessError::Full);
     };
-
-    let task_id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
-    let process = create_process(task_id, parent, program.address_space);
-    let process_id = process.id;
     if ipc::register(process_id.as_u64()).is_err() {
         let _ = userspace::destroy(program.address_space);
         return Err(ProcessError::Full);
