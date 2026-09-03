@@ -54,6 +54,10 @@ use x86_64::instructions::interrupts::int3;
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    // The default boot stack is intentionally small. WovenHat performs
+    // substantial early initialization, so give the bootstrap task a 1 MiB
+    // stack while retaining the bootloader's guard-page protection.
+    config.kernel_stack_size = 1024 * 1024;
     config
 };
 
@@ -213,6 +217,76 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         console.println("KERNEL HEAP: SELF TEST FAILED");
         halt();
+    }
+
+    // Normal boots are shell-first. Do not make the interactive console wait
+    // for the exhaustive storage/network/ring3 validation suite. Those tests
+    // remain below for `--features qemu-test` builds.
+    #[cfg(not(feature = "qemu-test"))]
+    {
+        gdt::init();
+        let _user_segments = gdt::user_segments();
+        interrupts::init();
+        task::init();
+
+        pic::init();
+        timer::init();
+
+        let early_devices = [
+            device::Device {
+                name: "framebuffer-console",
+                kind: device::DeviceKind::Console,
+                irq: None,
+            },
+            device::Device {
+                name: "com1",
+                kind: device::DeviceKind::Serial,
+                irq: None,
+            },
+            device::Device {
+                name: "pit",
+                kind: device::DeviceKind::Timer,
+                irq: Some(timer::IRQ),
+            },
+            device::Device {
+                name: "ps2-keyboard",
+                kind: device::DeviceKind::Keyboard,
+                irq: Some(keyboard::IRQ),
+            },
+        ];
+
+        for dev in early_devices {
+            if device::register(dev).is_err() {
+                serial::write_line(format_args!("[BOOT] early device registration failed"));
+                halt();
+            }
+        }
+
+        pic::unmask(timer::IRQ);
+        pic::unmask(keyboard::IRQ);
+        x86_64::instructions::interrupts::enable();
+
+        serial::write_line(format_args!(
+            "[BOOT] shell-first runtime ready; entering diagnostic shell"
+        ));
+
+        let mut shell = Shell::new();
+        console.clear();
+        console.println("WOVENHAT DIAGNOSTIC SHELL");
+        console.println("CORE RUNTIME: ONLINE");
+        console.println("TYPE 'help' FOR COMMANDS");
+        console.println("");
+        shell.print_prompt(&mut console);
+
+        loop {
+            if let Some(key) = keyboard::poll() {
+                shell.handle_key(key, &mut console);
+            }
+
+            syscall::service_pending();
+            task::preemption_point();
+            x86_64::instructions::hlt();
+        }
     }
     if gpt::self_test() {
         console.println("GPT PARTITIONS: VALIDATED");
