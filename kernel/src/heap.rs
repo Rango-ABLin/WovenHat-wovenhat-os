@@ -6,11 +6,11 @@ use core::{
 use alloc::{boxed::Box, vec::Vec};
 use spin::Mutex;
 
+use crate::config::MAX_HEAP_ALLOCATIONS as MAX_ALLOCATIONS;
 use crate::paging;
 
 pub const START: u64 = 0x4444_5000_0000;
 pub const SIZE: usize = 256 * 1024;
-const MAX_ALLOCATIONS: usize = 256;
 
 #[global_allocator]
 static ALLOCATOR: TrackedBumpAllocator = TrackedBumpAllocator;

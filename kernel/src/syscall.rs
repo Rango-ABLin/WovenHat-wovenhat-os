@@ -3,6 +3,8 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+use crate::config::{MAX_IO_SIZE, MAX_PATH_SIZE};
+
 global_asm!(
     ".global wovenhat_syscall_entry",
     "wovenhat_syscall_entry:",
@@ -213,8 +215,6 @@ pub fn service_pending() {
     }
 }
 
-const MAX_IO_SIZE: usize = 256;
-const MAX_PATH_SIZE: usize = 64;
 const SYSCALL_ERROR: u64 = u64::MAX;
 
 fn sys_mmap(length: u64, flags: u64) -> u64 {

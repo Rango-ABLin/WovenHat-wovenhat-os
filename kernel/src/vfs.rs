@@ -1,8 +1,8 @@
 use spin::Mutex;
 
-pub const NODE_CAPACITY: usize = 8192;
-const PATH_CAPACITY: usize = 64;
-const MAX_NODES: usize = 16;
+use crate::config::{MAX_PATH_SIZE as PATH_CAPACITY, MAX_VFS_NODES as MAX_NODES, VFS_NODE_CAPACITY};
+
+pub const NODE_CAPACITY: usize = VFS_NODE_CAPACITY;
 
 #[derive(Clone, Copy)]
 struct Node {

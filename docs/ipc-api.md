@@ -6,10 +6,12 @@ implementation lives in `kernel/src/ipc.rs`; syscall validation is in
 
 ## Limits and lifecycle
 
+Limits are defined in `kernel/src/config.rs`:
+
 - One endpoint is created for every user process.
-- At most 8 endpoints exist, matching the process-table capacity.
-- Each endpoint holds 8 FIFO messages.
-- Each message carries at most 64 bytes and records the sender PID.
+- At most `MAX_IPC_ENDPOINTS` (currently 32) endpoints exist.
+- Each endpoint holds `IPC_QUEUE_DEPTH` (currently 16) FIFO messages.
+- Each message carries at most `MAX_MESSAGE_SIZE` (currently 256) bytes and records the sender PID.
 - Reaping a process removes its endpoint and all queued messages.
 - Duplicate endpoints, unknown destinations, full queues, and oversized messages fail
   deterministically.

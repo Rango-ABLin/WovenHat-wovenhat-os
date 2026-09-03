@@ -62,20 +62,28 @@ WovenHat has moved well beyond a minimal kernel demo. The following subsystems a
 - Benchmark counters (`BENCH` shell command)
 - Extensive boot-time self-tests
 
-### Known Hard Limits (as of this writing)
+### Resource Limits
+
+Limits are now centralized in `kernel/src/config.rs` (Phase A1 started).
+
+**Previous (v0.0.7) → Current**
 ```
-MAX_TASKS              = 8
-MAX_PROCESSES          = 8
-MAX_FILE_DESCRIPTORS   = 8
-MAX_ENDPOINTS (IPC)    = 8
-MAX_MESSAGE_SIZE       = 64 bytes
-MAX_IO_SIZE            = 256 bytes
-MAX_PATH_SIZE          = 64 bytes
-MAX_LOAD_SEGMENTS      = 4
-Kernel heap tracking   = 256 slots
+MAX_TASKS              8  →  32
+MAX_PROCESSES          8  →  32
+MAX_FILE_DESCRIPTORS   8  →  16
+MAX_IPC_ENDPOINTS      8  →  32
+IPC_QUEUE_DEPTH        8  →  16
+MAX_MESSAGE_SIZE      64  →  256 bytes
+MAX_IO_SIZE          256  →  1024 bytes
+MAX_PATH_SIZE         64  →  128 bytes
+MAX_VFS_NODES         16  →  64
+MAX_ELF_SEGMENTS       4  →  8
+MAX_ANONYMOUS_MAPPINGS 8  →  16
+MAX_DEVICES           16  →  32
+MAX_HEAP_ALLOCATIONS 256  →  512
 ```
 
-These limits are intentional for safety and determinism but are the primary scalability bottleneck.
+Further work in Phase A: freelist/slab allocation for process/task tables, refcounted open files, and COW fork.
 
 ---
 

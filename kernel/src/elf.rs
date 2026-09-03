@@ -1,6 +1,7 @@
+use crate::config::MAX_ELF_SEGMENTS as MAX_LOAD_SEGMENTS;
+
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;
-const MAX_LOAD_SEGMENTS: usize = 4;
 const PT_LOAD: u32 = 1;
 const PF_EXECUTE: u32 = 1;
 const PF_WRITE: u32 = 2;

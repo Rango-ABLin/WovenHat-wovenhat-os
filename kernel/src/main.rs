@@ -10,6 +10,7 @@ mod audit;
 mod benchmark;
 mod block;
 mod capability;
+mod config;
 mod console;
 mod device;
 mod elf;

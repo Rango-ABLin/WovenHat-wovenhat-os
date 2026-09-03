@@ -1,8 +1,10 @@
 use spin::Mutex;
 
-pub const MAX_MESSAGE_SIZE: usize = 64;
-const MAX_ENDPOINTS: usize = 8;
-const QUEUE_DEPTH: usize = 8;
+use crate::config::{
+    IPC_QUEUE_DEPTH as QUEUE_DEPTH, MAX_IPC_ENDPOINTS as MAX_ENDPOINTS, MAX_MESSAGE_SIZE,
+};
+
+pub use crate::config::MAX_MESSAGE_SIZE;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Message {

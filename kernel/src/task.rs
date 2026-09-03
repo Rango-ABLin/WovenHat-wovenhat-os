@@ -8,13 +8,10 @@ use spin::Mutex;
 
 use crate::{
     capability::{Capability, CapabilitySet},
+    config::{MAX_FILE_DESCRIPTORS, MAX_PROCESSES, MAX_TASKS, TASK_STACK_SIZE},
     gdt, ipc, paging, timer, userspace, vfs,
 };
 
-const MAX_TASKS: usize = 8;
-const MAX_PROCESSES: usize = 8;
-const MAX_FILE_DESCRIPTORS: usize = 8;
-const TASK_STACK_SIZE: usize = 4096 * 2;
 const KERNEL_TASK_ID: TaskId = TaskId(0);
 const IDLE_TASK_ID: TaskId = TaskId(1);
 

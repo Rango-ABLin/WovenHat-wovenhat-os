@@ -1,6 +1,9 @@
 use core::arch::global_asm;
 
+use crate::config::{MAX_ANONYMOUS_MAPPINGS, MAX_ELF_SEGMENTS};
 use crate::paging;
+
+pub use crate::config::MAX_ANONYMOUS_MAPPINGS;
 
 const USER_REGION_START: u64 = 0x0000_4000_0000_0000;
 const USER_STACK_OFFSET: u64 = 0x1f_0000;
@@ -195,8 +198,6 @@ impl UserStack {
     }
 }
 
-const MAX_ELF_SEGMENTS: usize = 4;
-pub const MAX_ANONYMOUS_MAPPINGS: usize = 8;
 const USER_MMAP_START: u64 = USER_REGION_START + 0x10_0000;
 const USER_MMAP_STRIDE: u64 = 0x10_000;
 const USER_MMAP_MAX_SIZE: usize = USER_MMAP_STRIDE as usize;

@@ -1,6 +1,6 @@
 use spin::Mutex;
 
-const MAX_DEVICES: usize = 16;
+use crate::config::MAX_DEVICES;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
