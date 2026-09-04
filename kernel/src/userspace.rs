@@ -195,7 +195,7 @@ global_asm!(
     "mov eax, 1",
     "mov edi, 1",
     "lea rsi, [rip + wovenhat_sh_banner]",
-    "mov edx, 26",
+    "mov edx, 29",
     "int 0x80",
     "wovenhat_sh_loop:",
     // prompt
@@ -2657,6 +2657,257 @@ global_asm!(
     ".previous",
 );
 
+
+// Stage 5 network utilities. These tiny freestanding programs exercise the
+// Ring-3 networking ABI directly; they intentionally avoid linking a C runtime.
+global_asm!(
+    ".section .rodata.wovenhat_ip_stub, \"a\"",
+    ".global wovenhat_ip_program_start",
+    ".global wovenhat_ip_program_end",
+    "wovenhat_ip_program_start:",
+    "sub rsp, 32",
+    "mov eax, 43",              // NetInfo
+    "mov rdi, rsp",
+    "int 0x80",
+    "cmp rax, -1",
+    "je 1f",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + 2f]",
+    "mov edx, 61",
+    "int 0x80",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "1:",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
+    "2:",
+    ".ascii \"WovenHat IPv4 interface online (use kernel 'net' for detail)\\n\"",
+    "wovenhat_ip_program_end:",
+    ".previous",
+);
+
+global_asm!(
+    ".section .rodata.wovenhat_netstat_stub, \"a\"",
+    ".global wovenhat_netstat_program_start",
+    ".global wovenhat_netstat_program_end",
+    "wovenhat_netstat_program_start:",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + 1f]",
+    "mov edx, 49",
+    "int 0x80",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "1:",
+    ".ascii \"userspace socket ABI: UDP/TCP/DNS/DHCP available\\n\"",
+    "wovenhat_netstat_program_end:",
+    ".previous",
+);
+
+global_asm!(
+    ".section .rodata.wovenhat_dns_stub, \"a\"",
+    ".global wovenhat_dns_program_start",
+    ".global wovenhat_dns_program_end",
+    "wovenhat_dns_program_start:",
+    // The current Stage-5 exec ABI passes the executable path as argv[0].
+    // Keep this standalone probe deterministic until argv-bearing exec lands.
+    "lea rdi, [rip + 6f]",
+    "mov esi, 11",             // strlen("example.com")
+    "mov eax, 44",             // DnsStart
+    "int 0x80",
+    "cmp rax, -1",
+    "je 8f",
+    "mov r12, rax",
+    "sub rsp, 16",
+    "3:",
+    "mov eax, 45",             // DnsPoll
+    "mov rdi, r12",
+    "mov rsi, rsp",
+    "int 0x80",
+    "cmp rax, -1",
+    "je 8f",
+    "cmp rax, 1",
+    "je 4f",
+    "mov eax, 7",              // Yield while DNS progresses
+    "int 0x80",
+    "jmp 3b",
+    "4:",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + 5f]",
+    "mov edx, 36",
+    "int 0x80",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "5:",
+    ".ascii \"dns: A record resolved successfully\\n\"",
+    "6:",
+    ".ascii \"example.com\"",
+    "8:",
+    "mov eax, 1",
+    "mov edi, 2",
+    "lea rsi, [rip + 9f]",
+    "mov edx, 12",
+    "int 0x80",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
+    "9:",
+    ".ascii \"dns: failed\\n\"",
+    "wovenhat_dns_program_end:",
+    ".previous",
+);
+
+global_asm!(
+    ".section .rodata.wovenhat_udp_stub, \"a\"",
+    ".global wovenhat_udp_program_start",
+    ".global wovenhat_udp_program_end",
+    "wovenhat_udp_program_start:",
+    // socket(AF_INET, SOCK_DGRAM) equivalent
+    "mov eax, 37",
+    "mov edi, 1",
+    "int 0x80",
+    "cmp rax, -1",
+    "je 8f",
+    "mov r12, rax",
+    // Connect UDP peer to QEMU gateway 10.0.2.2:7. Endpoint packing uses
+    // low32 IPv4 BE and bits 32..47 port.
+    "mov eax, 39",
+    "mov rdi, r12",
+    "mov rsi, 0x000000070a000202",
+    "int 0x80",
+    "cmp rax, -1",
+    "je 7f",
+    "mov eax, 40",
+    "mov rdi, r12",
+    "lea rsi, [rip + 1f]",
+    "mov edx, 18",
+    "int 0x80",
+    "cmp rax, -1",
+    "je 7f",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + 2f]",
+    "mov edx, 29",
+    "int 0x80",
+    "mov eax, 42",
+    "mov rdi, r12",
+    "int 0x80",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "1:",
+    ".ascii \"wovenhat-udp-probe\"",
+    "2:",
+    ".ascii \"udp: datagram queued via ABI\\n\"",
+    "7:",
+    "mov eax, 42",
+    "mov rdi, r12",
+    "int 0x80",
+    "8:",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
+    "wovenhat_udp_program_end:",
+    ".previous",
+);
+
+global_asm!(
+    ".section .rodata.wovenhat_nc_stub, \"a\"",
+    ".global wovenhat_nc_program_start",
+    ".global wovenhat_nc_program_end",
+    "wovenhat_nc_program_start:",
+    // Demonstrate a real TCP socket object and asynchronous connect. QEMU's
+    // gateway address is used as a deterministic network target.
+    "mov eax, 37",
+    "mov edi, 2",
+    "int 0x80",
+    "cmp rax, -1",
+    "je 8f",
+    "mov r12, rax",
+    "mov eax, 39",
+    "mov rdi, r12",
+    "mov rsi, 0x000000500a000202", // 10.0.2.2:80
+    "int 0x80",
+    "cmp rax, -1",
+    "je 7f",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + 1f]",
+    "mov edx, 34",
+    "int 0x80",
+    "mov eax, 42",
+    "mov rdi, r12",
+    "int 0x80",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "1:",
+    ".ascii \"nc: TCP connect initiated via ABI\\n\"",
+    "7:",
+    "mov eax, 42",
+    "mov rdi, r12",
+    "int 0x80",
+    "8:",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
+    "wovenhat_nc_program_end:",
+    ".previous",
+);
+
+
+global_asm!(
+    ".section .rodata.wovenhat_ping_stub, \"a\"",
+    ".global wovenhat_ping_program_start",
+    ".global wovenhat_ping_program_end",
+    "wovenhat_ping_program_start:",
+    "mov eax, 48",              // PingStart
+    "mov edi, 0x0a000202",      // QEMU gateway 10.0.2.2
+    "int 0x80",
+    "cmp rax, -1",
+    "je 8f",
+    "1:",
+    "mov eax, 49",              // PingPoll
+    "int 0x80",
+    "cmp rax, -1",
+    "je 8f",
+    "test rax, rax",
+    "jnz 2f",
+    "mov eax, 7",
+    "int 0x80",
+    "jmp 1b",
+    "2:",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + 3f]",
+    "mov edx, 29",
+    "int 0x80",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "3:",
+    ".ascii \"ping: reply from 10.0.2.2 OK\\n\"",
+    "8:",
+    "mov eax, 1",
+    "mov edi, 2",
+    "lea rsi, [rip + 9f]",
+    "mov edx, 13",
+    "int 0x80",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
+    "9:",
+    ".ascii \"ping: failed\\n\"",
+    "wovenhat_ping_program_end:",
+    ".previous",
+);
+
 unsafe extern "C" {
     static wovenhat_user_program_start: u8;
     static wovenhat_user_program_end: u8;
@@ -2684,6 +2935,18 @@ unsafe extern "C" {
     static wovenhat_mkdir_program_end: u8;
     static wovenhat_rm_program_start: u8;
     static wovenhat_rm_program_end: u8;
+    static wovenhat_ip_program_start: u8;
+    static wovenhat_ip_program_end: u8;
+    static wovenhat_netstat_program_start: u8;
+    static wovenhat_netstat_program_end: u8;
+    static wovenhat_dns_program_start: u8;
+    static wovenhat_dns_program_end: u8;
+    static wovenhat_udp_program_start: u8;
+    static wovenhat_udp_program_end: u8;
+    static wovenhat_nc_program_start: u8;
+    static wovenhat_nc_program_end: u8;
+    static wovenhat_ping_program_start: u8;
+    static wovenhat_ping_program_end: u8;
 }
 #[derive(Clone, Copy, Debug)]
 pub struct UserImage {
@@ -3340,6 +3603,40 @@ fn release_clone(address_space: paging::AddressSpace, ranges: &[(u64, usize)]) {
         let _ = paging::destroy_user_address_space(address_space, ranges);
     }
 }
+
+fn stage5_program(start: *const u8, end: *const u8) -> Option<&'static [u8]> {
+    let len = (end as usize).checked_sub(start as usize)?;
+    if len == 0 { return None; }
+    Some(unsafe { core::slice::from_raw_parts(start, len) })
+}
+
+pub fn install_ip_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_ip_program_start), core::ptr::addr_of!(wovenhat_ip_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/ip", &elf).is_ok())
+}
+pub fn install_netstat_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_netstat_program_start), core::ptr::addr_of!(wovenhat_netstat_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/netstat", &elf).is_ok())
+}
+pub fn install_dns_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_dns_program_start), core::ptr::addr_of!(wovenhat_dns_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/dns", &elf).is_ok())
+}
+pub fn install_udp_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_udp_program_start), core::ptr::addr_of!(wovenhat_udp_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/udp", &elf).is_ok())
+}
+pub fn install_nc_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_nc_program_start), core::ptr::addr_of!(wovenhat_nc_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/nc", &elf).is_ok())
+}
+
+pub fn install_ping_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_ping_program_start), core::ptr::addr_of!(wovenhat_ping_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/ping", &elf).is_ok())
+}
+
+
 fn build_stub_elf(stub: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     const PAYLOAD_OFFSET: usize = 4096;
     const PROGRAM_HEADER_OFFSET: usize = 64;

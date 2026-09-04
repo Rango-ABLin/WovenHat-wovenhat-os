@@ -162,6 +162,31 @@ pub enum Number {
     Getpgrp = 35,
     /// pid, pgid (0 follows POSIX current/default conventions)
     Setpgid = 36,
+    /// kind: 1=UDP, 2=TCP -> process-owned network descriptor
+    Socket = 37,
+    /// socket, local port
+    Bind = 38,
+    /// socket, packed IPv4 endpoint
+    Connect = 39,
+    /// socket, user buffer, length
+    NetSend = 40,
+    /// socket, user buffer, capacity
+    NetRecv = 41,
+    NetClose = 42,
+    /// user pointer to network::NetInfo
+    NetInfo = 43,
+    /// hostname pointer, length -> query id
+    DnsStart = 44,
+    /// query id, user IPv4[4] buffer -> 0 pending, 1 complete
+    DnsPoll = 45,
+    /// socket -> packed peer endpoint
+    NetPeer = 46,
+    /// 0=static fallback, nonzero=enable DHCP
+    Dhcp = 47,
+    /// packed IPv4 in low 32 bits
+    PingStart = 48,
+    /// 0 pending, otherwise RTT ticks + 1
+    PingPoll = 49,
 }
 
 pub fn entry_address() -> u64 {
@@ -769,6 +794,130 @@ fn sys_exec(user_path: u64, length: u64) -> u64 {
     );
     crate::task::exec_current(program)
 }
+
+fn sys_socket(kind: u64) -> u64 {
+    let kind = match kind {
+        1 => crate::network::SocketKind::Udp,
+        2 => crate::network::SocketKind::Tcp,
+        _ => return SYSCALL_ERROR,
+    };
+    crate::network::socket_open(crate::task::current_process_id(), kind)
+        .unwrap_or(SYSCALL_ERROR)
+}
+
+fn sys_net_bind(socket: u64, port: u64) -> u64 {
+    let Ok(port) = u16::try_from(port) else { return SYSCALL_ERROR; };
+    crate::network::socket_bind(crate::task::current_process_id(), socket, port)
+        .map_or(SYSCALL_ERROR, |()| 0)
+}
+
+fn sys_net_connect(socket: u64, packed: u64) -> u64 {
+    let Ok(endpoint) = crate::network::endpoint_from_packed(packed) else { return SYSCALL_ERROR; };
+    crate::network::socket_connect(crate::task::current_process_id(), socket, endpoint)
+        .map_or(SYSCALL_ERROR, |()| 0)
+}
+
+fn sys_net_send(socket: u64, user_buffer: u64, length: u64) -> u64 {
+    let Ok(length) = usize::try_from(length) else { return SYSCALL_ERROR; };
+    if length > MAX_IO_SIZE { return SYSCALL_ERROR; }
+    let mut buffer = [0u8; MAX_IO_SIZE];
+    if crate::paging::copy_from_current_user(user_buffer, &mut buffer[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    crate::network::socket_send(crate::task::current_process_id(), socket, &buffer[..length])
+        .map_or(SYSCALL_ERROR, |n| n as u64)
+}
+
+fn sys_net_recv(socket: u64, user_buffer: u64, capacity: u64) -> u64 {
+    let Ok(capacity) = usize::try_from(capacity) else { return SYSCALL_ERROR; };
+    if capacity > MAX_IO_SIZE { return SYSCALL_ERROR; }
+    let mut buffer = [0u8; MAX_IO_SIZE];
+    match crate::network::socket_recv(crate::task::current_process_id(), socket, &mut buffer[..capacity]) {
+        Ok((n, _)) => {
+            if crate::paging::copy_to_current_user(user_buffer, &buffer[..n]).is_err() {
+                SYSCALL_ERROR
+            } else {
+                n as u64
+            }
+        }
+        Err(crate::network::SocketError::WouldBlock) => u64::MAX - 1,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_net_close(socket: u64) -> u64 {
+    crate::network::socket_close(crate::task::current_process_id(), socket)
+        .map_or(SYSCALL_ERROR, |()| 0)
+}
+
+fn sys_net_info(user_buffer: u64) -> u64 {
+    let info = crate::network::net_info();
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&info as *const crate::network::NetInfo).cast::<u8>(),
+            core::mem::size_of::<crate::network::NetInfo>(),
+        )
+    };
+    if crate::paging::copy_to_current_user(user_buffer, bytes).is_err() {
+        SYSCALL_ERROR
+    } else {
+        bytes.len() as u64
+    }
+}
+
+fn sys_dns_start(user_name: u64, length: u64) -> u64 {
+    let Ok(length) = usize::try_from(length) else { return SYSCALL_ERROR; };
+    if length == 0 || length > 253 { return SYSCALL_ERROR; }
+    let mut name = [0u8; 253];
+    if crate::paging::copy_from_current_user(user_name, &mut name[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Ok(name) = core::str::from_utf8(&name[..length]) else { return SYSCALL_ERROR; };
+    crate::network::dns_start(name).unwrap_or(SYSCALL_ERROR)
+}
+
+fn sys_dns_poll(query: u64, user_ipv4: u64) -> u64 {
+    match crate::network::dns_poll(query) {
+        Ok(None) => 0,
+        Ok(Some(ip)) => {
+            let octets = ip.octets();
+            if crate::paging::copy_to_current_user(user_ipv4, &octets).is_err() {
+                SYSCALL_ERROR
+            } else {
+                1
+            }
+        }
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_net_peer(socket: u64) -> u64 {
+    match crate::network::socket_peer(crate::task::current_process_id(), socket) {
+        Ok(Some(endpoint)) => crate::network::endpoint_to_packed(endpoint),
+        Ok(None) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+fn sys_dhcp(enabled: u64) -> u64 {
+    crate::network::set_dhcp(enabled != 0).map_or(SYSCALL_ERROR, |()| 0)
+}
+
+
+fn sys_ping_start(ip_packed: u64) -> u64 {
+    let raw = (ip_packed & 0xffff_ffff) as u32;
+    let ip = smoltcp::wire::Ipv4Address::from_octets(raw.to_be_bytes());
+    crate::network::ping_start(ip).map_or(SYSCALL_ERROR, |()| 0)
+}
+
+fn sys_ping_poll() -> u64 {
+    match crate::network::ping_poll() {
+        Ok(None) => 0,
+        Ok(Some(ticks)) => ticks.saturating_add(1),
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wovenhat_syscall_dispatch(
     number: u64,
@@ -828,6 +977,19 @@ pub extern "C" fn wovenhat_syscall_dispatch(
         value if value == Number::Sigaction as u64 => sys_sigaction(arg0, arg1),
         value if value == Number::Getpgrp as u64 => crate::task::current_process_group(),
         value if value == Number::Setpgid as u64 => sys_setpgid(arg0, arg1),
+        value if value == Number::Socket as u64 => sys_socket(arg0),
+        value if value == Number::Bind as u64 => sys_net_bind(arg0, arg1),
+        value if value == Number::Connect as u64 => sys_net_connect(arg0, arg1),
+        value if value == Number::NetSend as u64 => sys_net_send(arg0, arg1, arg2),
+        value if value == Number::NetRecv as u64 => sys_net_recv(arg0, arg1, arg2),
+        value if value == Number::NetClose as u64 => sys_net_close(arg0),
+        value if value == Number::NetInfo as u64 => sys_net_info(arg0),
+        value if value == Number::DnsStart as u64 => sys_dns_start(arg0, arg1),
+        value if value == Number::DnsPoll as u64 => sys_dns_poll(arg0, arg1),
+        value if value == Number::NetPeer as u64 => sys_net_peer(arg0),
+        value if value == Number::Dhcp as u64 => sys_dhcp(arg0),
+        value if value == Number::PingStart as u64 => sys_ping_start(arg0),
+        value if value == Number::PingPoll as u64 => sys_ping_poll(),
         _ => u64::MAX,
     };
 

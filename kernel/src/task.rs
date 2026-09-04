@@ -903,7 +903,9 @@ pub fn exec_current(program: userspace::UserProgram) -> ! {
     enter_user_context(context)
 }
 pub fn exit_current_process(exit_code: i32) -> ! {
-    crate::terminal::release_foreground(current_process_id());
+    let exiting_pid = current_process_id();
+    crate::terminal::release_foreground(exiting_pid);
+    crate::network::close_process_sockets(exiting_pid);
     x86_64::instructions::interrupts::disable();
     let (context_switch, address_space, memory_mappings) = {
         let mut scheduler = SCHEDULER.lock();

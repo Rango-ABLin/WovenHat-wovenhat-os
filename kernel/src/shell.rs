@@ -116,7 +116,7 @@ impl Shell {
                     console.clear();
                 }
             }
-            "version" | "ver" => console.println("WovenHat kernel 0.2.0 Stage 4"),
+            "version" | "ver" => console.println("WovenHat kernel 0.3.0 Stage 5"),
             "ticks" | "uptime" => {
                 if authorize(Capability::TimerRead, console) {
                     console.print("ticks: ");
@@ -134,6 +134,7 @@ impl Shell {
             "net" => cmd_net(console),
             "netstat" => cmd_netstat(console),
             "udpecho" => cmd_udpecho(arg, console),
+            "dhcp" => cmd_dhcp(arg, console),
             "userland" => {
                 if authorize(Capability::FileWrite, console) {
                     cmd_userland(console);
@@ -324,14 +325,14 @@ impl Shell {
 }
 
 fn print_help(console: &mut Console<'_>) {
-    console.println("WovenHat kernel shell 0.2.0 Stage 4");
+    console.println("WovenHat kernel shell 0.3.0 Stage 5");
     console.println("system:  help clear version ticks|uptime tasks|ps caps devices net netstat");
     console.println("         memory|mem heap paging bench fs mount persist sync syscall");
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
     console.println("nav:     cd [path]  pwd  echo <text>");
     console.println("process: run <elf>  sh  init  spawn  user|ring3  kill <pid> [sig]");
-    console.println("runtime: userland udpecho [port]   (real UDP echo service)");
+    console.println("runtime: userland udpecho [port] dhcp <on|off>   (Stage 5 networking)");
 }
 
 fn cmd_tasks(console: &mut Console<'_>) {
@@ -417,7 +418,13 @@ fn cmd_net(console: &mut Console<'_>) {
     }
     console.print("smoltcp: ");
     console.println(if network::initialized() { "online" } else { "offline" });
-    console.println("ipv4: 10.0.2.15/24  gateway: 10.0.2.2");
+    let info = network::net_info();
+    console.print("ipv4: "); print_ipv4(console, info.ipv4);
+    console.print("/"); print_u64(console, info.prefix as u64);
+    console.print("  gateway: "); print_ipv4(console, info.gateway);
+    console.print("  dns: "); print_ipv4(console, info.dns);
+    console.print("  config: ");
+    console.println(if info.using_dhcp != 0 { "dhcp" } else { "static-fallback" });
     console.print("rx="); print_u64(console, stats.rx_frames);
     console.print(" tx="); print_u64(console, stats.tx_frames);
     console.print(" rx_drop="); print_u64(console, stats.rx_dropped);
@@ -440,6 +447,13 @@ fn cmd_netstat(console: &mut Console<'_>) {
     } else {
         console.println("stopped");
     }
+    console.print("userspace sockets: "); print_u64(console, stats.user_sockets as u64); console.newline();
+    console.print("dhcp: ");
+    if stats.dhcp_enabled {
+        console.println(if stats.using_dhcp { "lease active" } else { "discovering / static fallback" });
+    } else {
+        console.println("disabled (static fallback)");
+    }
 }
 
 fn cmd_udpecho(arg: &str, console: &mut Console<'_>) {
@@ -459,6 +473,27 @@ fn cmd_udpecho(arg: &str, console: &mut Console<'_>) {
         Err(network::EchoError::AlreadyConfigured) => console.println("udpecho: already listening on another port"),
         Err(_) => console.println("udpecho: start failed"),
     }
+}
+
+fn cmd_dhcp(arg: &str, console: &mut Console<'_>) {
+    match arg.trim() {
+        "on" | "enable" | "1" => match network::set_dhcp(true) {
+            Ok(()) => console.println("dhcp: enabled; static configuration remains until a lease is acquired"),
+            Err(_) => console.println("dhcp: network offline"),
+        },
+        "off" | "disable" | "0" => match network::set_dhcp(false) {
+            Ok(()) => console.println("dhcp: disabled; using static QEMU fallback"),
+            Err(_) => console.println("dhcp: network offline"),
+        },
+        _ => console.println("usage: dhcp <on|off>"),
+    }
+}
+
+fn print_ipv4(console: &mut Console<'_>, ip: [u8; 4]) {
+    print_u64(console, ip[0] as u64); console.print(".");
+    print_u64(console, ip[1] as u64); console.print(".");
+    print_u64(console, ip[2] as u64); console.print(".");
+    print_u64(console, ip[3] as u64);
 }
 
 fn cmd_persist(arg: &str, console: &mut Console<'_>) {
@@ -495,7 +530,7 @@ fn ensure_program(path: &str, installer: fn() -> bool) -> bool {
 }
 
 fn install_userland() -> u64 {
-    let programs: [(&str, fn() -> bool); 11] = [
+    let programs: [(&str, fn() -> bool); 17] = [
         ("/bin/selftest", userspace::install_stub_executable),
         ("/bin/init", userspace::install_init_executable),
         ("/bin/sh", userspace::install_shell_executable),
@@ -507,6 +542,12 @@ fn install_userland() -> u64 {
         ("/bin/sleep", userspace::install_sleep_executable),
         ("/bin/pwd", userspace::install_pwd_executable),
         ("/bin/mkdir", userspace::install_mkdir_executable),
+        ("/bin/ip", userspace::install_ip_executable),
+        ("/bin/netstat", userspace::install_netstat_executable),
+        ("/bin/dns", userspace::install_dns_executable),
+        ("/bin/udp", userspace::install_udp_executable),
+        ("/bin/nc", userspace::install_nc_executable),
+        ("/bin/ping", userspace::install_ping_executable),
     ];
 
     let mut installed = 0u64;
@@ -525,15 +566,16 @@ fn cmd_userland(console: &mut Console<'_>) {
     let installed = install_userland();
     console.print("userland: ");
     print_u64(console, installed);
-    console.println("/12 programs ready");
-    if installed == 12 {
+    console.println("/18 programs ready");
+    if installed == 18 {
         console.println("/bin is ready; type 'sh' for the userspace shell");
     } else {
         console.println("userland: one or more built-in programs failed to install");
-        const EXPECTED: [&str; 12] = [
+        const EXPECTED: [&str; 18] = [
             "/bin/selftest", "/bin/init", "/bin/sh", "/bin/echo",
             "/bin/true", "/bin/false", "/bin/cat", "/bin/ls",
             "/bin/sleep", "/bin/pwd", "/bin/mkdir", "/bin/rm",
+            "/bin/ip", "/bin/netstat", "/bin/dns", "/bin/udp", "/bin/nc", "/bin/ping",
         ];
         for path in EXPECTED {
             if vfs::stat(path).is_err() {
@@ -897,10 +939,10 @@ fn cmd_run(path: &str, console: &mut Console<'_>) {
 
 fn cmd_sh(console: &mut Console<'_>) {
     let installed = install_userland();
-    if installed != 12 {
+    if installed != 18 {
         console.print("sh: userland incomplete (");
         print_u64(console, installed as u64);
-        console.println("/12)");
+        console.println("/18)");
         return;
     }
 

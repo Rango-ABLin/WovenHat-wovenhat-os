@@ -1,24 +1,29 @@
-//! WovenHat IPv4 network stack.
+//! WovenHat Stage 5 IPv4 network stack.
 //!
-//! The physical device is the real VirtIO-net transport in `virtio_net` and
-//! smoltcp supplies Ethernet/ARP/IPv4 processing. Stage 3 uses QEMU user-mode
-//! networking's conventional 10.0.2.0/24 topology so the OS has a usable
-//! standalone network without depending on DHCP yet.
+//! Stage 5 keeps the shell-first recovery path while exposing smoltcp sockets
+//! to Ring-3 processes through a small kernel ABI.  The implementation uses
+//! owned buffers so sockets can be created and destroyed dynamically without
+//! static-lifetime bookkeeping in user processes.
 
+use alloc::{vec, vec::Vec};
 use spin::{Mutex, Once};
 use smoltcp::{
-    iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage},
+    iface::{Config, Interface, SocketHandle, SocketSet},
     phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
-    socket::udp,
+    socket::{dhcpv4, dns, icmp, tcp, udp},
     time::Instant,
-    wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address},
+    wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address},
 };
 
 use crate::{timer, virtio_net::{self, MAX_FRAME}};
 
 pub const DEFAULT_IPV4: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 pub const DEFAULT_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+pub const DEFAULT_DNS: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
 pub const DEFAULT_PREFIX: u8 = 24;
+pub const MAX_USER_SOCKETS: usize = 16;
+pub const SOCKET_BUFFER_BYTES: usize = 4096;
+pub const UDP_META_SLOTS: usize = 8;
 
 pub fn default_cidr() -> IpCidr { IpCidr::new(IpAddress::Ipv4(DEFAULT_IPV4), DEFAULT_PREFIX) }
 
@@ -59,30 +64,57 @@ impl Device for VirtioSmolDevice {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketKind { Udp = 1, Tcp = 2 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketError {
+    Offline,
+    Invalid,
+    NoSlot,
+    WrongOwner,
+    WrongKind,
+    NotBound,
+    NotConnected,
+    WouldBlock,
+    BufferFull,
+    Address,
+}
+
+#[derive(Clone, Copy)]
+struct UserSocket {
+    owner: u64,
+    handle: SocketHandle,
+    kind: SocketKind,
+    peer: Option<IpEndpoint>,
+}
+
 struct Runtime {
     iface: Interface,
     device: VirtioSmolDevice,
     sockets: SocketSet<'static>,
+    user: [Option<UserSocket>; MAX_USER_SOCKETS],
     echo_handle: Option<SocketHandle>,
     echo_port: u16,
     echo_packets: u64,
+    dhcp_handle: Option<SocketHandle>,
+    dns_handle: Option<SocketHandle>,
+    dns_queries: [Option<dns::QueryHandle>; 4],
+    dhcp_enabled: bool,
+    using_dhcp: bool,
+    ipv4: Ipv4Address,
+    prefix: u8,
+    gateway: Ipv4Address,
+    dns_server: Ipv4Address,
+    next_ephemeral: u16,
+    ping_handle: Option<SocketHandle>,
+    ping_pending: Option<(Ipv4Address, u16, u64)>,
+    ping_sequence: u16,
 }
 static RUNTIME: Once<Mutex<Runtime>> = Once::new();
 
-const SOCKET_SLOTS: usize = 4;
-const UDP_META_SLOTS: usize = 4;
-const UDP_BUFFER_BYTES: usize = 2048;
-static mut SOCKET_STORAGE: [SocketStorage<'static>; SOCKET_SLOTS] =
-    [const { SocketStorage::EMPTY }; SOCKET_SLOTS];
-static mut ECHO_RX_META: [udp::PacketMetadata; UDP_META_SLOTS] =
-    [udp::PacketMetadata::EMPTY; UDP_META_SLOTS];
-static mut ECHO_TX_META: [udp::PacketMetadata; UDP_META_SLOTS] =
-    [udp::PacketMetadata::EMPTY; UDP_META_SLOTS];
-static mut ECHO_RX_DATA: [u8; UDP_BUFFER_BYTES] = [0; UDP_BUFFER_BYTES];
-static mut ECHO_TX_DATA: [u8; UDP_BUFFER_BYTES] = [0; UDP_BUFFER_BYTES];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EchoError { NetworkOffline, AlreadyConfigured, BindFailed, SocketTableFull }
+pub enum EchoError { NetworkOffline, AlreadyConfigured, BindFailed }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NetStats {
@@ -90,8 +122,24 @@ pub struct NetStats {
     pub echo_active: bool,
     pub echo_port: u16,
     pub echo_packets: u64,
+    pub user_sockets: usize,
+    pub dhcp_enabled: bool,
+    pub using_dhcp: bool,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NetInfo {
+    pub ipv4: [u8; 4],
+    pub gateway: [u8; 4],
+    pub dns: [u8; 4],
+    pub prefix: u8,
+    pub dhcp_enabled: u8,
+    pub using_dhcp: u8,
+    pub online: u8,
+    pub mac: [u8; 6],
+    pub _reserved: [u8; 2],
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitError { Transport(virtio_net::InitError), Route }
@@ -103,24 +151,50 @@ pub fn init() -> Result<(), InitError> {
     let mac = EthernetAddress(virtio_net::mac_address());
     let mut device = VirtioSmolDevice::new();
     let mut config = Config::new(mac.into());
-    config.random_seed = 0x5748_4f53_4e45_5433;
-    let now = now();
-    let mut iface = Interface::new(config, &mut device, now);
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(default_cidr());
-    });
+    config.random_seed = 0x5748_4f53_4e45_5435;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|addrs| { let _ = addrs.push(default_cidr()); });
     iface.routes_mut().add_default_ipv4_route(DEFAULT_GATEWAY).map_err(|_| InitError::Route)?;
-    let socket_storage: &'static mut [SocketStorage<'static>; SOCKET_SLOTS] = unsafe {
-        &mut *core::ptr::addr_of_mut!(SOCKET_STORAGE)
-    };
-    let sockets = SocketSet::new(&mut socket_storage[..]);
+
+    let mut sockets = SocketSet::new(Vec::new());
+
+    // Stage 5 DHCP client. We keep the known-good QEMU static address until a
+    // lease is actually acquired, so losing DHCP cannot take down recovery.
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+
+    // QEMU user networking provides DNS proxy 10.0.2.3. DNS queries are
+    // asynchronous and may be started/polled by the userspace ABI.
+    let dns_servers = [IpAddress::Ipv4(DEFAULT_DNS)];
+    let dns_queries = (0..4).map(|_| None).collect::<Vec<_>>();
+    let dns_handle = sockets.add(dns::Socket::new(&dns_servers, dns_queries));
+
+    let ping_rx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 1024]);
+    let ping_tx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 1024]);
+    let mut ping_socket = icmp::Socket::new(ping_rx, ping_tx);
+    ping_socket.bind(icmp::Endpoint::Ident(0x5748)).map_err(|_| InitError::Route)?;
+    let ping_handle = sockets.add(ping_socket);
+
     RUNTIME.call_once(|| Mutex::new(Runtime {
         iface,
         device,
         sockets,
+        user: [None; MAX_USER_SOCKETS],
         echo_handle: None,
         echo_port: 0,
         echo_packets: 0,
+        dhcp_handle: Some(dhcp_handle),
+        dns_handle: Some(dns_handle),
+        dns_queries: [None; 4],
+        dhcp_enabled: true,
+        using_dhcp: false,
+        ipv4: DEFAULT_IPV4,
+        prefix: DEFAULT_PREFIX,
+        gateway: DEFAULT_GATEWAY,
+        dns_server: DEFAULT_DNS,
+        next_ephemeral: 49152,
+        ping_handle: Some(ping_handle),
+        ping_pending: None,
+        ping_sequence: 0,
     }));
     Ok(())
 }
@@ -135,25 +209,61 @@ pub fn poll() {
         let _ = iface.poll(now(), device, sockets);
     }
 
+    // Apply DHCP only after a valid lease arrives. Deconfiguration falls back
+    // to the static QEMU topology so the diagnostic shell stays reachable.
+    if runtime.dhcp_enabled {
+        if let Some(handle) = runtime.dhcp_handle {
+            // Copy lease data out of the DHCP socket before mutating the rest
+            // of Runtime. This keeps the SocketSet mutable borrow tightly scoped.
+            let update = {
+                let socket = runtime.sockets.get_mut::<dhcpv4::Socket>(handle);
+                match socket.poll() {
+                    Some(dhcpv4::Event::Configured(config)) => {
+                        let dns = config.dns_servers.first().copied().unwrap_or(DEFAULT_DNS);
+                        Some(Some((config.address, config.router.unwrap_or(DEFAULT_GATEWAY), dns)))
+                    }
+                    Some(dhcpv4::Event::Deconfigured) => Some(None),
+                    None => None,
+                }
+            };
+
+            match update {
+                Some(Some((address, router, dns))) => {
+                    runtime.iface.update_ip_addrs(|addrs| {
+                        addrs.clear();
+                        let _ = addrs.push(IpCidr::Ipv4(address));
+                    });
+                    runtime.iface.routes_mut().remove_default_ipv4_route();
+                    let _ = runtime.iface.routes_mut().add_default_ipv4_route(router);
+                    runtime.ipv4 = address.address();
+                    runtime.prefix = address.prefix_len();
+                    runtime.gateway = router;
+                    runtime.dns_server = dns;
+                    runtime.using_dhcp = true;
+                    if let Some(dns_handle) = runtime.dns_handle {
+                        runtime.sockets.get_mut::<dns::Socket>(dns_handle)
+                            .update_servers(&[IpAddress::Ipv4(dns)]);
+                    }
+                }
+                Some(None) => {
+                    if runtime.using_dhcp { apply_static_locked(&mut runtime); }
+                }
+                None => {}
+            }
+        }
+    }
+
     if let Some(handle) = runtime.echo_handle {
         let mut reply = [0u8; 512];
         let received = {
             let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
-            match socket.recv() {
-                Ok((data, meta)) => {
-                    let len = core::cmp::min(data.len(), reply.len());
-                    reply[..len].copy_from_slice(&data[..len]);
-                    Some((len, meta.endpoint))
-                }
-                Err(_) => None,
-            }
+            socket.recv_slice(&mut reply).ok()
         };
         if let Some((len, remote)) = received {
-            let sent = {
-                let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
-                socket.send_slice(&reply[..len], remote).is_ok()
-            };
-            if sent { runtime.echo_packets = runtime.echo_packets.saturating_add(1); }
+            if runtime.sockets.get_mut::<udp::Socket>(handle)
+                .send_slice(&reply[..len], remote).is_ok() {
+                runtime.echo_packets = runtime.echo_packets.saturating_add(1);
+            }
         }
     }
 
@@ -163,6 +273,37 @@ pub fn poll() {
     }
 }
 
+fn apply_static_locked(runtime: &mut Runtime) {
+    runtime.iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        let _ = addrs.push(default_cidr());
+    });
+    runtime.iface.routes_mut().remove_default_ipv4_route();
+    let _ = runtime.iface.routes_mut().add_default_ipv4_route(DEFAULT_GATEWAY);
+    runtime.ipv4 = DEFAULT_IPV4;
+    runtime.prefix = DEFAULT_PREFIX;
+    runtime.gateway = DEFAULT_GATEWAY;
+    runtime.dns_server = DEFAULT_DNS;
+    runtime.using_dhcp = false;
+    if let Some(handle) = runtime.dns_handle {
+        runtime.sockets.get_mut::<dns::Socket>(handle)
+            .update_servers(&[IpAddress::Ipv4(DEFAULT_DNS)]);
+    }
+}
+
+pub fn set_dhcp(enabled: bool) -> Result<(), SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    runtime.dhcp_enabled = enabled;
+    if !enabled {
+        if let Some(handle) = runtime.dhcp_handle {
+            runtime.sockets.get_mut::<dhcpv4::Socket>(handle).reset();
+        }
+        apply_static_locked(&mut runtime);
+    }
+    Ok(())
+}
+
 pub fn start_udp_echo(port: u16) -> Result<(), EchoError> {
     if port == 0 { return Err(EchoError::BindFailed); }
     let Some(runtime) = RUNTIME.get() else { return Err(EchoError::NetworkOffline); };
@@ -170,28 +311,273 @@ pub fn start_udp_echo(port: u16) -> Result<(), EchoError> {
     if runtime.echo_handle.is_some() {
         return if runtime.echo_port == port { Ok(()) } else { Err(EchoError::AlreadyConfigured) };
     }
-
-    let rx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] = unsafe {
-        &mut *core::ptr::addr_of_mut!(ECHO_RX_META)
-    };
-    let tx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] = unsafe {
-        &mut *core::ptr::addr_of_mut!(ECHO_TX_META)
-    };
-    let rx_data: &'static mut [u8; UDP_BUFFER_BYTES] = unsafe {
-        &mut *core::ptr::addr_of_mut!(ECHO_RX_DATA)
-    };
-    let tx_data: &'static mut [u8; UDP_BUFFER_BYTES] = unsafe {
-        &mut *core::ptr::addr_of_mut!(ECHO_TX_DATA)
-    };
-
-    let rx = udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]);
-    let tx = udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]);
+    let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS], vec![0; SOCKET_BUFFER_BYTES]);
+    let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS], vec![0; SOCKET_BUFFER_BYTES]);
     let mut socket = udp::Socket::new(rx, tx);
     socket.bind(port).map_err(|_| EchoError::BindFailed)?;
     let handle = runtime.sockets.add(socket);
     runtime.echo_handle = Some(handle);
     runtime.echo_port = port;
     Ok(())
+}
+
+fn find_slot(runtime: &Runtime, owner: u64, id: u64) -> Result<UserSocket, SocketError> {
+    let index = usize::try_from(id).map_err(|_| SocketError::Invalid)?;
+    let socket = runtime.user.get(index).and_then(|slot| *slot).ok_or(SocketError::Invalid)?;
+    if socket.owner != owner { return Err(SocketError::WrongOwner); }
+    Ok(socket)
+}
+
+fn next_ephemeral(runtime: &mut Runtime) -> u16 {
+    let port = runtime.next_ephemeral;
+    runtime.next_ephemeral = if port >= 65534 { 49152 } else { port + 1 };
+    port
+}
+
+pub fn socket_open(owner: u64, kind: SocketKind) -> Result<u64, SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let slot = runtime.user.iter().position(Option::is_none).ok_or(SocketError::NoSlot)?;
+    let handle = match kind {
+        SocketKind::Udp => {
+            let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS], vec![0; SOCKET_BUFFER_BYTES]);
+            let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS], vec![0; SOCKET_BUFFER_BYTES]);
+            runtime.sockets.add(udp::Socket::new(rx, tx))
+        }
+        SocketKind::Tcp => {
+            let rx = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_BYTES]);
+            let tx = tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_BYTES]);
+            runtime.sockets.add(tcp::Socket::new(rx, tx))
+        }
+    };
+    runtime.user[slot] = Some(UserSocket { owner, handle, kind, peer: None });
+    Ok(slot as u64)
+}
+
+pub fn socket_bind(owner: u64, id: u64, port: u16) -> Result<(), SocketError> {
+    if port == 0 { return Err(SocketError::Address); }
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let entry = find_slot(&runtime, owner, id)?;
+    match entry.kind {
+        SocketKind::Udp => runtime.sockets.get_mut::<udp::Socket>(entry.handle).bind(port).map_err(|_| SocketError::Address),
+        SocketKind::Tcp => runtime.sockets.get_mut::<tcp::Socket>(entry.handle).listen(port).map_err(|_| SocketError::Address),
+    }
+}
+
+pub fn socket_connect(owner: u64, id: u64, endpoint: IpEndpoint) -> Result<(), SocketError> {
+    if endpoint.port == 0 { return Err(SocketError::Address); }
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let entry = find_slot(&runtime, owner, id)?;
+    match entry.kind {
+        SocketKind::Udp => {
+            runtime.user[id as usize].as_mut().unwrap().peer = Some(endpoint);
+            Ok(())
+        }
+        SocketKind::Tcp => {
+            let local_port = next_ephemeral(&mut runtime);
+            let Runtime { iface, sockets, .. } = &mut *runtime;
+            sockets.get_mut::<tcp::Socket>(entry.handle)
+                .connect(iface.context(), endpoint, local_port)
+                .map_err(|_| SocketError::Address)?;
+            runtime.user[id as usize].as_mut().unwrap().peer = Some(endpoint);
+            Ok(())
+        }
+    }
+}
+
+pub fn socket_send(owner: u64, id: u64, data: &[u8]) -> Result<usize, SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let entry = find_slot(&runtime, owner, id)?;
+    match entry.kind {
+        SocketKind::Udp => {
+            let peer = entry.peer.ok_or(SocketError::NotConnected)?;
+            runtime.sockets.get_mut::<udp::Socket>(entry.handle)
+                .send_slice(data, peer)
+                .map(|()| data.len())
+                .map_err(|_| SocketError::BufferFull)
+        }
+        SocketKind::Tcp => runtime.sockets.get_mut::<tcp::Socket>(entry.handle)
+            .send_slice(data).map_err(|_| SocketError::WouldBlock),
+    }
+}
+
+pub fn socket_recv(owner: u64, id: u64, out: &mut [u8]) -> Result<(usize, Option<IpEndpoint>), SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let entry = find_slot(&runtime, owner, id)?;
+    match entry.kind {
+        SocketKind::Udp => runtime.sockets.get_mut::<udp::Socket>(entry.handle)
+            .recv_slice(out)
+            .map(|(len, meta)| (len, Some(meta.endpoint)))
+            .map_err(|_| SocketError::WouldBlock),
+        SocketKind::Tcp => runtime.sockets.get_mut::<tcp::Socket>(entry.handle)
+            .recv_slice(out)
+            .map(|len| (len, entry.peer))
+            .map_err(|_| SocketError::WouldBlock),
+    }
+}
+
+pub fn socket_close(owner: u64, id: u64) -> Result<(), SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let entry = find_slot(&runtime, owner, id)?;
+    let _ = runtime.sockets.remove(entry.handle);
+    runtime.user[id as usize] = None;
+    Ok(())
+}
+
+pub fn close_process_sockets(owner: u64) {
+    let Some(runtime) = RUNTIME.get() else { return; };
+    let mut runtime = runtime.lock();
+    for index in 0..MAX_USER_SOCKETS {
+        if let Some(entry) = runtime.user[index] {
+            if entry.owner == owner {
+                let _ = runtime.sockets.remove(entry.handle);
+                runtime.user[index] = None;
+            }
+        }
+    }
+}
+
+pub fn socket_peer(owner: u64, id: u64) -> Result<Option<IpEndpoint>, SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let runtime = runtime.lock();
+    Ok(find_slot(&runtime, owner, id)?.peer)
+}
+
+pub fn net_info() -> NetInfo {
+    if let Some(runtime) = RUNTIME.get() {
+        let runtime = runtime.lock();
+        NetInfo {
+            ipv4: runtime.ipv4.octets(),
+            gateway: runtime.gateway.octets(),
+            dns: runtime.dns_server.octets(),
+            prefix: runtime.prefix,
+            dhcp_enabled: u8::from(runtime.dhcp_enabled),
+            using_dhcp: u8::from(runtime.using_dhcp),
+            online: u8::from(virtio_net::is_initialized()),
+            mac: virtio_net::mac_address(),
+            _reserved: [0; 2],
+        }
+    } else {
+        NetInfo {
+            ipv4: [0; 4], gateway: [0; 4], dns: [0; 4], prefix: 0,
+            dhcp_enabled: 0, using_dhcp: 0, online: 0, mac: [0; 6], _reserved: [0; 2],
+        }
+    }
+}
+
+pub fn dns_start(name: &str) -> Result<u64, SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let handle = runtime.dns_handle.ok_or(SocketError::Offline)?;
+    let slot = runtime.dns_queries.iter().position(Option::is_none).ok_or(SocketError::NoSlot)?;
+    let query = {
+        let Runtime { iface, sockets, .. } = &mut *runtime;
+        sockets.get_mut::<dns::Socket>(handle)
+            .start_query(iface.context(), name, smoltcp::wire::DnsQueryType::A)
+            .map_err(|_| SocketError::BufferFull)?
+    };
+    runtime.dns_queries[slot] = Some(query);
+    Ok(slot as u64)
+}
+
+pub fn dns_poll(id: u64) -> Result<Option<Ipv4Address>, SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let index = usize::try_from(id).map_err(|_| SocketError::Invalid)?;
+    let query = runtime.dns_queries.get(index).and_then(|q| *q).ok_or(SocketError::Invalid)?;
+    let handle = runtime.dns_handle.ok_or(SocketError::Offline)?;
+    match runtime.sockets.get_mut::<dns::Socket>(handle).get_query_result(query) {
+        Ok(addrs) => {
+            runtime.dns_queries[index] = None;
+            Ok(addrs.into_iter().next().map(|addr| match addr { IpAddress::Ipv4(v4) => v4 }))
+        }
+        Err(dns::GetQueryResultError::Pending) => Ok(None),
+        Err(_) => {
+            runtime.dns_queries[index] = None;
+            Err(SocketError::Address)
+        }
+    }
+}
+
+pub fn ping_start(ip: Ipv4Address) -> Result<(), SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    if runtime.ping_pending.is_some() { return Err(SocketError::WouldBlock); }
+    let handle = runtime.ping_handle.ok_or(SocketError::Offline)?;
+    runtime.ping_sequence = runtime.ping_sequence.wrapping_add(1);
+    let seq = runtime.ping_sequence;
+    let mut packet = [0u8; 24];
+    packet[0] = 8; // ICMPv4 echo request
+    packet[1] = 0;
+    packet[4..6].copy_from_slice(&0x5748u16.to_be_bytes());
+    packet[6..8].copy_from_slice(&seq.to_be_bytes());
+    packet[8..].copy_from_slice(b"WovenHatStage5!!!");
+    let checksum = internet_checksum(&packet);
+    packet[2..4].copy_from_slice(&checksum.to_be_bytes());
+    runtime.sockets.get_mut::<icmp::Socket>(handle)
+        .send_slice(&packet, IpAddress::Ipv4(ip))
+        .map_err(|_| SocketError::BufferFull)?;
+    runtime.ping_pending = Some((ip, seq, timer::ticks()));
+    Ok(())
+}
+
+/// Returns `Ok(None)` while awaiting a reply and `Ok(Some(rtt_ticks))` once
+/// the matching echo reply arrives.
+pub fn ping_poll() -> Result<Option<u64>, SocketError> {
+    let Some(runtime) = RUNTIME.get() else { return Err(SocketError::Offline); };
+    let mut runtime = runtime.lock();
+    let Some((target, seq, started)) = runtime.ping_pending else { return Err(SocketError::Invalid); };
+    if timer::ticks().saturating_sub(started) >= u64::from(timer::FREQUENCY_HZ) * 5 {
+        runtime.ping_pending = None;
+        return Err(SocketError::WouldBlock);
+    }
+    let handle = runtime.ping_handle.ok_or(SocketError::Offline)?;
+    let mut packet = [0u8; 256];
+    match runtime.sockets.get_mut::<icmp::Socket>(handle).recv_slice(&mut packet) {
+        Ok((len, source)) => {
+            if len >= 8
+                && source == IpAddress::Ipv4(target)
+                && packet[0] == 0
+                && u16::from_be_bytes([packet[4], packet[5]]) == 0x5748
+                && u16::from_be_bytes([packet[6], packet[7]]) == seq
+            {
+                runtime.ping_pending = None;
+                Ok(Some(timer::ticks().saturating_sub(started)))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut i = 0usize;
+    while i + 1 < data.len() {
+        sum = sum.wrapping_add(u16::from_be_bytes([data[i], data[i + 1]]) as u32);
+        i += 2;
+    }
+    if i < data.len() { sum = sum.wrapping_add((data[i] as u32) << 8); }
+    while (sum >> 16) != 0 { sum = (sum & 0xffff) + (sum >> 16); }
+    !(sum as u16)
+}
+
+pub fn endpoint_from_packed(value: u64) -> Result<IpEndpoint, SocketError> {
+    let ip = (value & 0xffff_ffff) as u32;
+    let port = ((value >> 32) & 0xffff) as u16;
+    if port == 0 { return Err(SocketError::Address); }
+    Ok(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::from_octets(ip.to_be_bytes())), port))
+}
+
+pub fn endpoint_to_packed(endpoint: IpEndpoint) -> u64 {
+    let IpAddress::Ipv4(ip) = endpoint.addr else { return 0; };
+    u64::from(u32::from_be_bytes(ip.octets())) | ((endpoint.port as u64) << 32)
 }
 
 pub fn stats() -> NetStats {
@@ -202,6 +588,9 @@ pub fn stats() -> NetStats {
         echo_active: runtime.echo_handle.is_some(),
         echo_port: runtime.echo_port,
         echo_packets: runtime.echo_packets,
+        user_sockets: runtime.user.iter().filter(|s| s.is_some()).count(),
+        dhcp_enabled: runtime.dhcp_enabled,
+        using_dhcp: runtime.using_dhcp,
     }
 }
 
@@ -210,6 +599,7 @@ pub fn initialized() -> bool { RUNTIME.get().is_some() && virtio_net::is_initial
 pub fn self_test() -> bool {
     default_cidr().prefix_len() == DEFAULT_PREFIX
         && DEFAULT_GATEWAY == Ipv4Address::new(10, 0, 2, 2)
+        && DEFAULT_DNS == Ipv4Address::new(10, 0, 2, 3)
         && virtio_net::self_test()
 }
 
