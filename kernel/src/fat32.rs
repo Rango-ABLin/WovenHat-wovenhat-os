@@ -554,6 +554,7 @@ fn allocate_cluster(device: &mut impl BlockDevice, volume: Volume) -> Result<u32
 /// Only the root directory is supported; the directory is not extended if full.
 /// Data larger than one cluster chain that fits in available free clusters is accepted
 /// up to the caller's buffer; allocation is sequential.
+#[allow(dead_code)]
 pub fn create_root_file(
     device: &mut impl BlockDevice,
     volume: Volume,

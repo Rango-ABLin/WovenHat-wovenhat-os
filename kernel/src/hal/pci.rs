@@ -95,6 +95,7 @@ pub fn device(index: usize) -> Option<Device> {
     INVENTORY.lock().devices.get(index).copied().flatten()
 }
 
+#[allow(dead_code)]
 pub fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     read_config(bus, device, function, offset)
 }

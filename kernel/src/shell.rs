@@ -116,7 +116,7 @@ impl Shell {
                     console.clear();
                 }
             }
-            "version" | "ver" => console.println("WovenHat kernel 0.4.0 Stage 6"),
+            "version" | "ver" => console.println("WovenHat kernel 0.7.0 Stage 9"),
             "ticks" | "uptime" => {
                 if authorize(Capability::TimerRead, console) {
                     console.print("ticks: ");
@@ -135,7 +135,7 @@ impl Shell {
             "netstat" => cmd_netstat(console),
             "udpecho" => cmd_udpecho(arg, console),
             "dhcp" => cmd_dhcp(arg, console),
-            "userland" => {
+            "userland" | "bin" => {
                 if authorize(Capability::FileWrite, console) {
                     cmd_userland(console);
                 }
@@ -307,9 +307,11 @@ impl Shell {
                 }
             }
             _ => {
-                console.print("unknown command: ");
-                console.println(verb);
-                console.println("type 'help' for a list");
+                if !cmd_userland_command(verb, arg, console) {
+                    console.print("unknown command: ");
+                    console.println(verb);
+                    console.println("type 'help' for a list");
+                }
             }
         }
 
@@ -325,14 +327,14 @@ impl Shell {
 }
 
 fn print_help(console: &mut Console<'_>) {
-    console.println("WovenHat kernel shell 0.4.0 Stage 6");
+    console.println("WovenHat kernel shell 0.7.0 Stage 9");
     console.println("system:  help clear version ticks|uptime tasks|ps caps devices net netstat");
     console.println("         memory|mem heap paging bench fs mount persist sync syscall");
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
     console.println("nav:     cd [path]  pwd  echo <text>");
     console.println("process: run <elf>  sh  init  spawn  user|ring3  kill <pid> [sig]");
-    console.println("runtime: userland udpecho [port] dhcp <on|off>   (Stage 6 networking + argv/PATH exec)");
+    console.println("runtime: userland udpecho [port] dhcp <on|off>   (Stage 9 runtime)");
 }
 
 fn cmd_tasks(console: &mut Console<'_>) {
@@ -530,7 +532,7 @@ fn ensure_program(path: &str, installer: fn() -> bool) -> bool {
 }
 
 fn install_userland() -> u64 {
-    let programs: [(&str, fn() -> bool); 17] = [
+    let programs: [(&str, fn() -> bool); 23] = [
         ("/bin/selftest", userspace::install_stub_executable),
         ("/bin/init", userspace::install_init_executable),
         ("/bin/sh", userspace::install_shell_executable),
@@ -548,6 +550,12 @@ fn install_userland() -> u64 {
         ("/bin/udp", userspace::install_udp_executable),
         ("/bin/nc", userspace::install_nc_executable),
         ("/bin/ping", userspace::install_ping_executable),
+        ("/bin/env", userspace::install_env_executable),
+        ("/bin/en", userspace::install_en_executable),
+        ("/bin/bin", userspace::install_bin_executable),
+        ("/bin/ps", userspace::install_ps_executable),
+        ("/bin/uptime", userspace::install_uptime_executable),
+        ("/bin/tcpd", userspace::install_tcpd_executable),
     ];
 
     let mut installed = 0u64;
@@ -566,16 +574,16 @@ fn cmd_userland(console: &mut Console<'_>) {
     let installed = install_userland();
     console.print("userland: ");
     print_u64(console, installed);
-    console.println("/18 programs ready");
-    if installed == 18 {
+    console.println("/24 programs ready");
+    if installed == 24 {
         console.println("/bin is ready; type 'sh' for the userspace shell");
     } else {
         console.println("userland: one or more built-in programs failed to install");
-        const EXPECTED: [&str; 18] = [
+        const EXPECTED: [&str; 24] = [
             "/bin/selftest", "/bin/init", "/bin/sh", "/bin/echo",
             "/bin/true", "/bin/false", "/bin/cat", "/bin/ls",
             "/bin/sleep", "/bin/pwd", "/bin/mkdir", "/bin/rm",
-            "/bin/ip", "/bin/netstat", "/bin/dns", "/bin/udp", "/bin/nc", "/bin/ping",
+            "/bin/ip", "/bin/netstat", "/bin/dns", "/bin/udp", "/bin/nc", "/bin/ping", "/bin/env", "/bin/en", "/bin/ps", "/bin/uptime", "/bin/tcpd", "/bin/bin",
         ];
         for path in EXPECTED {
             if vfs::stat(path).is_err() {
@@ -905,6 +913,50 @@ fn cmd_stat(path: &str, console: &mut Console<'_>) {
     }
 }
 
+fn cmd_userland_command(verb: &str, arg: &str, console: &mut Console<'_>) -> bool {
+    if verb.is_empty() || verb.len() > 64 {
+        return false;
+    }
+    let _ = install_userland();
+    let path = if verb.as_bytes().contains(&b'/') {
+        alloc::string::String::from(verb)
+    } else {
+        alloc::format!("/bin/{verb}")
+    };
+    if vfs::stat(&path).is_err() {
+        return false;
+    }
+    let mut image = [0u8; vfs::NODE_CAPACITY];
+    let Ok(len) = vfs::read_all(&path, &mut image) else {
+        console.println("command: read failed");
+        return true;
+    };
+    let program = if arg.is_empty() {
+        userspace::load_elf_with_argv(&image[..len], &[path.as_str()])
+    } else {
+        userspace::load_elf_with_argv(&image[..len], &[path.as_str(), arg])
+    };
+    let Some(program) = program else {
+        console.println("command: ELF load failed");
+        return true;
+    };
+    let (cursor_x, cursor_y) = console.cursor_position();
+    terminal::set_cursor_position(cursor_x, cursor_y);
+
+    match task::spawn_user_process("kcmd", program) {
+        Ok((pid, _)) => {
+            terminal::set_foreground(pid.as_u64());
+            while !task::process_exited(pid) {
+                task::yield_now();
+            }
+            let (cursor_x, cursor_y) = terminal::cursor_position();
+            console.set_cursor_position(cursor_x, cursor_y);
+        }
+        Err(_) => console.println("command: spawn failed"),
+    }
+    true
+}
+
 fn cmd_run(path: &str, console: &mut Console<'_>) {
     let Some(path) = shell_resolve(path) else {
         console.println("run: bad path");
@@ -939,10 +991,10 @@ fn cmd_run(path: &str, console: &mut Console<'_>) {
 
 fn cmd_sh(console: &mut Console<'_>) {
     let installed = install_userland();
-    if installed != 18 {
+    if installed != 24 {
         console.print("sh: userland incomplete (");
         print_u64(console, installed as u64);
-        console.println("/18)");
+        console.println("/24)");
         return;
     }
 
@@ -964,16 +1016,18 @@ fn cmd_sh(console: &mut Console<'_>) {
                 id.as_u64()
             ));
 
-            // Do not wait for a timer interrupt to happen to schedule the fresh
-            // Ring-3 process.  Yield here from a normal kernel context so the
-            // first userspace dispatch is deterministic and debuggable.
+            // Interactive userspace must NOT be waited on here. cmd_sh() is
+            // called from the kernel's main event loop; blocking here prevents
+            // the loop from continuing network polling, syscall servicing and
+            // scheduler preemption. Foreground ownership already prevents the
+            // diagnostic shell from consuming keyboard input, so return to the
+            // main loop immediately and let /bin/sh run asynchronously.
+            let (cursor_x, cursor_y) = console.cursor_position();
+            terminal::set_cursor_position(cursor_x, cursor_y);
             task::yield_now();
 
-            // Reaching here means another runnable task eventually scheduled
-            // the kernel task again.  The foreground flag remains owned by the
-            // userspace process until exit_current_process releases it.
             crate::serial::write_line(format_args!(
-                "[SH] kernel task resumed; foreground_active={}",
+                "[SH] userspace shell scheduled asynchronously; foreground_active={}",
                 terminal::foreground_active()
             ));
         }

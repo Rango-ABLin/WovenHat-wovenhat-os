@@ -396,6 +396,7 @@ pub fn map_user_range_in(
     Ok(())
 }
 /// Eager byte-copy clone (legacy). Prefer [`share_user_range_in`] for fork.
+#[allow(dead_code)]
 pub fn clone_user_range_in(
     source: AddressSpace,
     destination: AddressSpace,

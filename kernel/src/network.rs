@@ -1,6 +1,6 @@
-//! WovenHat Stage 6 IPv4 network stack.
+//! WovenHat Stage 9 IPv4 network stack.
 //!
-//! Stage 6 keeps the shell-first recovery path while exposing smoltcp sockets
+//! Stage 9 keeps the shell-first recovery path while exposing smoltcp sockets
 //! to Ring-3 processes through a small kernel ABI.  The implementation uses
 //! owned buffers so sockets can be created and destroyed dynamically without
 //! static-lifetime bookkeeping in user processes.
@@ -68,6 +68,7 @@ impl Device for VirtioSmolDevice {
 pub enum SocketKind { Udp = 1, Tcp = 2 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SocketError {
     Offline,
     Invalid,
@@ -151,7 +152,10 @@ pub fn init() -> Result<(), InitError> {
     let mac = EthernetAddress(virtio_net::mac_address());
     let mut device = VirtioSmolDevice::new();
     let mut config = Config::new(mac.into());
-    config.random_seed = 0x5748_4f53_4e45_5435;
+    // Previously a fixed constant (0x5748_4f53_4e45_5435), which made TCP
+    // initial sequence numbers and smoltcp's internal randomized choices
+    // predictable to a network attacker on every boot. See `entropy.rs`.
+    config.random_seed = crate::entropy::random_u64();
     let mut iface = Interface::new(config, &mut device, now());
     iface.update_ip_addrs(|addrs| { let _ = addrs.push(default_cidr()); });
     iface.routes_mut().add_default_ipv4_route(DEFAULT_GATEWAY).map_err(|_| InitError::Route)?;
@@ -576,7 +580,7 @@ pub fn endpoint_from_packed(value: u64) -> Result<IpEndpoint, SocketError> {
 }
 
 pub fn endpoint_to_packed(endpoint: IpEndpoint) -> u64 {
-    let IpAddress::Ipv4(ip) = endpoint.addr else { return 0; };
+    let IpAddress::Ipv4(ip) = endpoint.addr;
     u64::from(u32::from_be_bytes(ip.octets())) | ((endpoint.port as u64) << 32)
 }
 

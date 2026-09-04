@@ -2,7 +2,9 @@
 
 **Prepared**: September 2026
 **Based on**: direct review of the current source tree (`kernel/`, `docs/`, CI config) — not the aspirational docs
-**Supersedes**: `docs/os-improvement-roadmap.md` and `docs/COMPLETE-AI-DIRECTIVE.md`, which describe an earlier stage of the project than what actually exists in the repo today
+**Supersedes**: `docs/os-improvement-roadmap.md` and `docs/COMPLETE-AI-DIRECTIVE.md` (archived to `docs/archive/`), which describe an earlier stage of the project than what actually exists in the repo today
+
+**2026-09-04 correction**: an audit pass (`docs/AUDIT-2026-09-04.md`) found this document itself had drifted from the code by the time it was written — it claimed networking was "Absent" and guard pages "not found implemented," neither of which was true. Table below corrected accordingly. Treat the code as ground truth over this document; if you find another mismatch, fix the table in the same change rather than leaving it stale.
 
 ---
 
@@ -32,7 +34,7 @@ Corrected against source, not the stale docs:
 | ELF loading | Validating loader: segment overlap checks, W^X, address-limit clamping | `elf.rs` |
 | Audit | Privileged-syscall audit log | `audit.rs` |
 | GUI | Framebuffer + basic widget/window primitives, **no compositor, no real desktop shell** | `graphics.rs`, `gui.rs` |
-| Networking | **Absent** | — |
+| Networking | **Present** — virtio-net transport + smoltcp (DHCP, DNS, ICMP ping, UDP/TCP sockets) behind a capability-gated syscall ABI; corrected from an earlier "Absent" claim in this doc, see 2026-09-04 note above | `virtio_net.rs`, `network.rs` |
 | SMP | **Absent** — ACPI enumerates CPU count/LAPIC but no AP bring-up | `hal/acpi.rs` |
 | Drivers | Hard-coded to QEMU (serial, PS/2, PIT, ATA/PIO) | `ata.rs`, `keyboard.rs`, `timer.rs` |
 | CI | `cargo clippy -D warnings` + QEMU boot + exit-code validation | `.github/workflows/kernel.yml` |
@@ -89,9 +91,10 @@ The capability model is a strong foundation; it needs to grow from "static per-b
 
 - [ ] **Capability delegation & revocation** — right now capabilities are fixed at process creation (`kernel_bootstrap()` / `userspace()`). A mature model needs capabilities to be passed via IPC (classic seL4-style endpoint capabilities), narrowed, and revoked.
 - [ ] Per-file/per-resource capabilities instead of the current coarse `FileRead`/`FileWrite` bits — otherwise any process with `FileWrite` can write *any* file it can open.
-- [ ] Address Space Layout Randomization (ASLR) for user segments — your ELF loader already validates addresses carefully; randomizing `mapping_start` within the user address range is a natural next step.
-- [ ] Stack canaries / guard pages for both kernel and user stacks (guard pages were mentioned in your earlier roadmap doc but I did not find them implemented in `paging.rs`/`task.rs`).
-- [ ] W^X enforcement is already correct at ELF-load time — extend the same invariant check to `sys_mmap` (currently `sys_mmap` only validates a single writable-or-not flag bit; nothing stops a process from mapping writable+executable memory post-load).
+- [ ] Address Space Layout Randomization (ASLR) for user segments — your ELF loader already validates addresses carefully; randomizing `mapping_start` within the user address range is a natural next step. As of 2026-09-04, `kernel/src/entropy.rs` provides a real RDRAND-backed random source (previously RDRAND was detected but never used anywhere) — this was the missing prerequisite, not the ELF/mmap validation logic itself. See `docs/CHATGPT-MILESTONE-PROMPT.md` for a scoped implementation plan.
+- [x] User stack guard pages — implemented (`UserStack::guard_base` in `userspace.rs`, verified by a boot self-test). **Correction from an earlier version of this doc**, which claimed these weren't found in the code.
+- [ ] Kernel stack guard pages — user stacks have them (above); the kernel's own double-fault/privilege stacks (`gdt.rs`) do not yet. See `docs/CHATGPT-MILESTONE-PROMPT-2.md` Part 1.
+- [x] W^X enforcement — **already correct, and now regression-tested** for both paths: ELF loading rejects writable+executable segments at parse time (`elf::parse`, covered by `elf_loader_self_test`), and `sys_mmap`/`map_anonymous` hard-code every anonymous mapping to non-executable regardless of the writable flag (covered by the new `mmap_w_xor_x_self_test`, added 2026-09-04). **Correction from an earlier version of this doc**, which incorrectly claimed nothing stopped a writable+executable mmap.
 - [ ] Formal threat model document: what does WovenHat protect against (malicious userspace app, compromised driver, physical access, network attacker)? Write this down before Phase A4/A2 driver isolation decisions are finalized, not after.
 - [ ] Secure boot chain: measured boot via TPM if targeting real hardware, or at minimum a signed-kernel + signed-initrd verification step.
 - **Definition of done**: a compromised, capability-limited userspace process cannot escalate privilege, exfiltrate another process's file/IPC data, or execute injected code in a writable page — verified by an actual internal red-team pass, not just code review.

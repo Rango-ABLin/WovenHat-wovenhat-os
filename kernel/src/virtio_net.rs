@@ -35,7 +35,6 @@ const STATUS_DRIVER: u8 = 2;
 const STATUS_DRIVER_OK: u8 = 4;
 const STATUS_FAILED: u8 = 128;
 
-const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 const RX_QUEUE: u16 = 0;
 const TX_QUEUE: u16 = 1;
@@ -63,6 +62,7 @@ pub enum InitError {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub struct Stats {
     pub initialized: bool,
     pub rx_frames: u64,
@@ -110,6 +110,7 @@ static TX_PACKET: PacketMemory = PacketMemory::new();
 #[derive(Clone, Copy)]
 struct Transport {
     initialized: bool,
+    #[allow(dead_code)]
     location: PciLocation,
     io_base: u16,
     host_features: u32,

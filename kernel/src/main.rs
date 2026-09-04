@@ -15,6 +15,7 @@ mod config;
 mod console;
 mod device;
 mod elf;
+mod entropy;
 mod fat32;
 mod gdt;
 mod gpt;
@@ -109,7 +110,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("SECURE INTELLIGENCE PLATFORM");
     console.println("");
 
-    console.println("WOVENHAT KERNEL 0.4.0 STAGE 6");
+    console.println("WOVENHAT KERNEL 0.7.0 STAGE 9");
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
@@ -704,6 +705,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     serial::write_line(format_args!(
         "[BOOT] independent user roots, unmapped stack guards, and RW/NX stacks verified"
+    ));
+
+    if !userspace::mmap_w_xor_x_self_test(first_program.address_space) {
+        console.println("MMAP W^X INVARIANT: FAILED");
+        halt();
+    }
+    console.println("MMAP W^X INVARIANT: OK");
+    serial::write_line(format_args!(
+        "[BOOT] anonymous mmap W^X invariant verified (writable mapping is never executable)"
     ));
 
     let first_root = first_program.address_space.root_address();

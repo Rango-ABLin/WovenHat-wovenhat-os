@@ -442,6 +442,7 @@ fn map_persist_err(err: fat32::Error) -> PersistError {
     }
 }
 
+#[allow(dead_code)]
 pub fn fat32_writable() -> bool {
     true
 }

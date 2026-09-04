@@ -118,7 +118,7 @@ impl Registry {
         nodes[3] = Node::directory(b"/mnt");
         nodes[4] = Node::directory(b"/bin");
         nodes[5] = Node::with_data(b"/etc/motd", b"Welcome to WovenHat OS.\n", false);
-        nodes[6] = Node::with_data(b"/etc/version", b"WovenHat kernel 0.4.0 Stage 6\n", false);
+        nodes[6] = Node::with_data(b"/etc/version", b"WovenHat kernel 0.7.0 Stage 9\n", false);
         nodes[7] = Node::with_data(b"/tmp/vfs-self-test", b"", true);
         Self { nodes }
     }
@@ -458,6 +458,7 @@ static OPEN_FILES: Mutex<OpenFileTable> = Mutex::new(OpenFileTable::empty());
 
 /// Backwards-compatible alias used by older call sites during the transition.
 /// Prefer `OpenFileId` for new code.
+#[allow(dead_code)]
 pub type OpenFile = OpenFileId;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

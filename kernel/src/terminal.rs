@@ -198,11 +198,27 @@ pub fn init(buffer: &mut [u8], info: FrameBufferInfo) { TERMINAL.lock().init(buf
 
 pub fn write_bytes(bytes: &[u8]) { TERMINAL.lock().write(bytes); }
 
-pub fn clear() { TERMINAL.lock().clear(); }
+pub fn set_cursor_position(x: usize, y: usize) {
+    let mut terminal = TERMINAL.lock();
+    if !terminal.initialized {
+        return;
+    }
+    terminal.cursor_x = core::cmp::min(x, terminal.width.saturating_sub(1));
+    terminal.cursor_y = core::cmp::min(y, terminal.height.saturating_sub(1));
+}
+
+pub fn cursor_position() -> (usize, usize) {
+    let terminal = TERMINAL.lock();
+    (terminal.cursor_x, terminal.cursor_y)
+}
+
+#[allow(dead_code)]
+pub fn clear() {
+    TERMINAL.lock().clear();
+}
 
 pub fn set_foreground(pid: u64) {
     FOREGROUND_PID.store(pid, Ordering::Release);
-    clear();
 }
 
 pub fn release_foreground(pid: u64) {

@@ -35,6 +35,7 @@ impl<'a, D: BlockDevice, const N: usize> CachedDevice<'a, D, N> {
     }
 
     pub fn hits(&self) -> u64 { self.hits }
+    #[allow(dead_code)]
     pub fn misses(&self) -> u64 { self.misses }
 
     fn touch(&mut self, index: usize) {

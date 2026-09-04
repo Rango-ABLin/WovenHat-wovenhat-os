@@ -334,6 +334,54 @@ fn task_bootstrap() -> ! {
     entry.expect("scheduled task is missing its entry point")()
 }
 
+
+// Stage 7: bounded per-process environment. Entries are stored as KEY=VALUE
+// ASCII byte strings so fork inheritance is allocation-free and deterministic.
+pub const MAX_ENV_VARS: usize = 8;
+pub const MAX_ENV_ENTRY: usize = 96;
+
+#[derive(Clone, Copy)]
+struct ProcessEnvironment {
+    entries: [[u8; MAX_ENV_ENTRY]; MAX_ENV_VARS],
+    lengths: [u8; MAX_ENV_VARS],
+}
+
+impl ProcessEnvironment {
+    const fn empty() -> Self {
+        Self { entries: [[0; MAX_ENV_ENTRY]; MAX_ENV_VARS], lengths: [0; MAX_ENV_VARS] }
+    }
+
+    fn defaults() -> Self {
+        let mut env = Self::empty();
+        env.set_bytes(b"PATH", b"/bin");
+        env.set_bytes(b"HOME", b"/");
+        env.set_bytes(b"SHELL", b"/bin/sh");
+        env.set_bytes(b"TERM", b"wovenhat");
+        env
+    }
+
+    fn set_bytes(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if key.is_empty() || key.contains(&b'=') || !key.is_ascii() || !value.is_ascii() { return false; }
+        let Some(total) = key.len().checked_add(value.len()).and_then(|n| n.checked_add(1)) else { return false; };
+        if total > MAX_ENV_ENTRY { return false; }
+        let existing = (0..MAX_ENV_VARS).find(|&i| {
+            let len = self.lengths[i] as usize;
+            len > key.len() && &self.entries[i][..key.len()] == key && self.entries[i][key.len()] == b'='
+        });
+        let slot = existing.or_else(|| (0..MAX_ENV_VARS).find(|&i| self.lengths[i] == 0));
+        let Some(slot) = slot else { return false; };
+        self.entries[slot] = [0; MAX_ENV_ENTRY];
+        self.entries[slot][..key.len()].copy_from_slice(key);
+        self.entries[slot][key.len()] = b'=';
+        self.entries[slot][key.len()+1..total].copy_from_slice(value);
+        self.lengths[slot] = total as u8;
+        true
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EnvError { NoProcess, Invalid, Full, NotFound, BufferTooSmall }
+
 /// What a process file descriptor refers to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FdKind {
@@ -360,6 +408,7 @@ pub struct Process {
     pending_signal: u64,
     process_group: u64,
     signal_actions: [u64; 32],
+    environment: ProcessEnvironment,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -557,12 +606,14 @@ fn create_process(
     cwd[0] = b'/';
     let mut cwd_len = 1usize;
     let mut inherited_group = None;
+    let mut inherited_environment = ProcessEnvironment::defaults();
     {
         let processes = PROCESS_TABLE.lock();
         if let Some(parent_proc) = processes.iter().flatten().find(|p| p.id == parent) {
             cwd = parent_proc.cwd;
             cwd_len = parent_proc.cwd_len;
             inherited_group = Some(parent_proc.process_group);
+            inherited_environment = parent_proc.environment;
         }
     }
     let id = ProcessId(NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed));
@@ -581,6 +632,7 @@ fn create_process(
         pending_signal: 0,
         process_group: inherited_group.unwrap_or(id.as_u64()),
         signal_actions: [0; 32],
+        environment: inherited_environment,
     }
 }
 
@@ -638,7 +690,7 @@ pub fn spawn_user_process(
     }
 
     let parent = ProcessId(current_process_id());
-    let context = prepare_user_context(program.image.entry as usize, program.stack.top as usize);
+    let context = prepare_user_context(program.image.entry as usize, program.image.stack_top as usize);
     let mut scheduler = SCHEDULER.lock();
     scheduler.reap_dead();
     let Some(task_slot) = scheduler
@@ -854,13 +906,14 @@ pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, P
         pending_signal: 0,
         process_group: parent.process_group,
         signal_actions: parent.signal_actions,
+        environment: parent.environment,
     });
     Ok(child_id)
 }
 pub fn exec_current(program: userspace::UserProgram) -> ! {
     assert!(program.image.is_valid(), "exec received an invalid image");
     x86_64::instructions::interrupts::disable();
-    let context = prepare_user_context(program.image.entry as usize, program.stack.top as usize);
+    let context = prepare_user_context(program.image.entry as usize, program.image.stack_top as usize);
     let new_address_space = program.address_space;
     let task_id = current_task_id();
     let (old_address_space, old_mappings) = {
@@ -994,6 +1047,93 @@ pub fn zombie_count() -> usize {
         .filter(|process| process.state == ProcessState::Exited)
         .count()
 }
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ProcessInfo {
+    pub pid: u64,
+    pub ppid: u64,
+    pub pgrp: u64,
+    pub state: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub exit_code: i32,
+    pub reserved: u32,
+}
+
+pub fn process_count() -> usize { PROCESS_TABLE.lock().iter().flatten().count() }
+
+pub fn process_info(index: usize) -> Option<ProcessInfo> {
+    let processes = PROCESS_TABLE.lock();
+    let process = processes.iter().flatten().nth(index)?;
+    let state = match process.state {
+        ProcessState::Ready => 1,
+        ProcessState::Exited => 4,
+    };
+    Some(ProcessInfo {
+        pid: process.id.as_u64(),
+        ppid: process.parent.as_u64(),
+        pgrp: process.process_group,
+        state,
+        uid: process.credentials.uid,
+        gid: process.credentials.gid,
+        exit_code: process.exit_code,
+        reserved: 0,
+    })
+}
+
+pub fn env_get(key: &[u8], out: &mut [u8]) -> Result<usize, EnvError> {
+    if key.is_empty() || key.contains(&b'=') || !key.is_ascii() { return Err(EnvError::Invalid); }
+    let task_id = current_task_id();
+    let processes = PROCESS_TABLE.lock();
+    let process = processes.iter().flatten().find(|p| p.task_id == task_id).ok_or(EnvError::NoProcess)?;
+    for i in 0..MAX_ENV_VARS {
+        let len = process.environment.lengths[i] as usize;
+        let entry = &process.environment.entries[i][..len];
+        if len > key.len() && &entry[..key.len()] == key && entry[key.len()] == b'=' {
+            let value = &entry[key.len()+1..];
+            if value.len() > out.len() { return Err(EnvError::BufferTooSmall); }
+            out[..value.len()].copy_from_slice(value);
+            return Ok(value.len());
+        }
+    }
+    Err(EnvError::NotFound)
+}
+
+pub fn env_set(key: &[u8], value: &[u8]) -> Result<(), EnvError> {
+    let task_id = current_task_id();
+    let mut processes = PROCESS_TABLE.lock();
+    let process = processes.iter_mut().flatten().find(|p| p.task_id == task_id).ok_or(EnvError::NoProcess)?;
+    if key.is_empty() || key.contains(&b'=') || !key.is_ascii() || !value.is_ascii() { return Err(EnvError::Invalid); }
+    if key.len().saturating_add(value.len()).saturating_add(1) > MAX_ENV_ENTRY { return Err(EnvError::Invalid); }
+    if process.environment.set_bytes(key, value) { Ok(()) } else { Err(EnvError::Full) }
+}
+
+pub fn env_count() -> usize {
+    let task_id = current_task_id();
+    PROCESS_TABLE.lock().iter().flatten().find(|p| p.task_id == task_id)
+        .map(|p| p.environment.lengths.iter().filter(|&&len| len != 0).count()).unwrap_or(0)
+}
+
+pub fn env_entry(index: usize, out: &mut [u8]) -> Result<usize, EnvError> {
+    let task_id = current_task_id();
+    let processes = PROCESS_TABLE.lock();
+    let process = processes.iter().flatten().find(|p| p.task_id == task_id).ok_or(EnvError::NoProcess)?;
+    let mut seen = 0usize;
+    for i in 0..MAX_ENV_VARS {
+        let len = process.environment.lengths[i] as usize;
+        if len == 0 { continue; }
+        if seen == index {
+            if len > out.len() { return Err(EnvError::BufferTooSmall); }
+            out[..len].copy_from_slice(&process.environment.entries[i][..len]);
+            return Ok(len);
+        }
+        seen += 1;
+    }
+    Err(EnvError::NotFound)
+}
+
 pub fn mmap_current(length: u64, writable: bool) -> Result<u64, MemoryError> {
     let length = usize::try_from(length).map_err(|_| MemoryError::InvalidLength)?;
     let size = length
@@ -1097,11 +1237,25 @@ pub fn open_current(path: &str) -> Result<u64, FileError> {
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let descriptor = (0..MAX_FILE_DESCRIPTORS)
+    let descriptor = (3..MAX_FILE_DESCRIPTORS)
         .find(|descriptor| process.files[*descriptor].is_none())
         .ok_or(FileError::TooManyFiles)?;
     process.files[descriptor] = Some(FdKind::File(file));
     Ok(descriptor as u64)
+}
+
+pub fn descriptor_is_open(descriptor: u64) -> bool {
+    let Ok(descriptor) = usize::try_from(descriptor) else {
+        return false;
+    };
+    let task_id = current_task_id();
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+        .and_then(|process| process.files.get(descriptor))
+        .is_some_and(Option::is_some)
 }
 
 pub fn read_current(descriptor: u64, buffer: &mut [u8]) -> Result<usize, FileError> {
@@ -1183,7 +1337,7 @@ pub fn dup_current(descriptor: u64) -> Result<u64, FileError> {
             FdKind::PipeWrite(id)
         }
     };
-    let new_descriptor = (0..MAX_FILE_DESCRIPTORS)
+    let new_descriptor = (3..MAX_FILE_DESCRIPTORS)
         .find(|slot| process.files[*slot].is_none())
         .ok_or(FileError::TooManyFiles)?;
     process.files[new_descriptor] = Some(cloned);
@@ -1241,11 +1395,11 @@ pub fn pipe_current() -> Result<(u64, u64), FileError> {
         .flatten()
         .find(|process| process.task_id == task_id)
         .ok_or(FileError::NoProcess)?;
-    let read_fd = (0..MAX_FILE_DESCRIPTORS)
+    let read_fd = (3..MAX_FILE_DESCRIPTORS)
         .find(|slot| process.files[*slot].is_none())
         .ok_or(FileError::TooManyFiles)?;
     process.files[read_fd] = Some(FdKind::PipeRead(pipe_id));
-    let write_fd = (0..MAX_FILE_DESCRIPTORS)
+    let write_fd = (3..MAX_FILE_DESCRIPTORS)
         .find(|slot| process.files[*slot].is_none())
         .ok_or(FileError::TooManyFiles)?;
     process.files[write_fd] = Some(FdKind::PipeWrite(pipe_id));
@@ -1438,15 +1592,6 @@ fn normalize_absolute(path: &str) -> Result<alloc::string::String, FileError> {
     Ok(out)
 }
 
-pub fn process_count() -> usize {
-    PROCESS_TABLE
-        .lock()
-        .iter()
-        .flatten()
-        .filter(|process| process.state != ProcessState::Exited)
-        .count()
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct UserTaskContext {
     pub entry: u64,
@@ -1457,11 +1602,15 @@ pub struct UserTaskContext {
 
 pub fn prepare_user_context(entry: usize, stack_top: usize) -> UserTaskContext {
     let (code_segment, data_segment) = gdt::user_segments();
+    // The GDT entries are DPL3 user descriptors, but SegmentSelector values
+    // returned by GDT::append carry RPL0 unless the requestor privilege bits
+    // are set explicitly.  iretq validates both DPL and RPL when crossing
+    // from CPL0 to CPL3, so pass selectors with RPL3 (low two bits = 3).
     UserTaskContext {
         entry: entry as u64,
         stack_top: stack_top as u64,
-        code_segment: code_segment.0,
-        data_segment: data_segment.0,
+        code_segment: code_segment.0 | 3,
+        data_segment: data_segment.0 | 3,
     }
 }
 

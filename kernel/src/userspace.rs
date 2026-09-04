@@ -183,19 +183,16 @@ global_asm!(
     ".global wovenhat_sh_program_start",
     ".global wovenhat_sh_program_end",
     "wovenhat_sh_program_start:",
-    // mmap(4096, writable=1) -> line buffer in r14
-    "mov eax, 8",
-    "mov edi, 4096",
-    "mov esi, 1",
-    "int 0x80",
-    "cmp rax, -1",
-    "je wovenhat_sh_die",
-    "mov r14, rax",
+    // Reserve a writable 4 KiB line/scratch buffer on the existing user stack.
+    // This avoids making /bin/sh depend on mmap before it can print its banner.
+    "sub rsp, 4096",
+    "and rsp, -16",
+    "mov r14, rsp",
     // banner
     "mov eax, 1",
     "mov edi, 1",
     "lea rsi, [rip + wovenhat_sh_banner]",
-    "mov edx, 29",
+    "mov edx, 26",
     "int 0x80",
     "wovenhat_sh_loop:",
     // prompt
@@ -207,7 +204,7 @@ global_asm!(
     // read line into [r14], max 120 chars, r15 = length
     "xor r15, r15",
     "wovenhat_sh_read:",
-    // use byte at [r14+200] as scratch (writable mmap page)
+    // use byte at [r14+200] as scratch in the writable stack buffer
     "mov eax, 0",
     "xor edi, edi",
     "lea rsi, [r14 + 200]",
@@ -1646,16 +1643,18 @@ global_asm!(
     "int 0x80",
     "jmp wovenhat_sh_loop",
     "wovenhat_sh_do_exec:",
-    // fork
-    "mov eax, 16",
+    // Reliable simple-command path: ask the kernel to parse /bin + argv and
+    // spawn a fresh process directly. This avoids making every command depend
+    // on fork/COW correctness. Pipelines/redirection still use fork where
+    // descriptor inheritance is required.
+    "mov eax, 57",
+    "mov rdi, r14",
+    "mov rsi, r15",
     "int 0x80",
     "cmp rax, -1",
     "je wovenhat_sh_exec_fail",
-    "test rax, rax",
-    "jz wovenhat_sh_child",
-    // parent: if background, print pid and continue
     "cmp byte ptr [r14 + 600], 1",
-    "jne wovenhat_sh_fg_wait",
+    "jne wovenhat_sh_fg_wait_direct",
     "mov r12, rax",
     "mov rax, r12",
     "call wovenhat_sh_print_u",
@@ -1665,9 +1664,9 @@ global_asm!(
     "mov edx, 1",
     "int 0x80",
     "jmp wovenhat_sh_loop",
-    "wovenhat_sh_fg_wait:",
+    "wovenhat_sh_fg_wait_direct:",
     "mov r12, rax",
-    "wovenhat_sh_wait:",
+    "wovenhat_sh_wait_direct:",
     "mov eax, 5",
     "mov rdi, r12",
     "int 0x80",
@@ -1675,17 +1674,7 @@ global_asm!(
     "jne wovenhat_sh_loop",
     "mov eax, 7",
     "int 0x80",
-    "jmp wovenhat_sh_wait",
-    "wovenhat_sh_child:",
-    // exec(path=r14, len=r15)
-    "mov eax, 50",
-    "mov rdi, r14",
-    "mov rsi, r15",
-    "int 0x80",
-    // exec failed
-    "mov edi, 1",
-    "mov eax, 3",
-    "int 0x80",
+    "jmp wovenhat_sh_wait_direct",
     "wovenhat_sh_exec_fail:",
     "mov eax, 1",
     "mov edi, 1",
@@ -2455,33 +2444,34 @@ global_asm!(
 );
 
 
-// /bin/ls — list directory (argv[1] or ".")
+// /bin/ls — list directory (argv[1] or cwd). All mutable buffers live on
+// the writable user stack; generated ELF code pages remain RX.
 global_asm!(
     ".section .rodata.wovenhat_ls_stub, \"a\"",
     ".global wovenhat_ls_program_start",
     ".global wovenhat_ls_program_end",
     "wovenhat_ls_program_start:",
-    "mov r12, [rsp]",
+    "sub rsp, 256",
+    "mov r12, qword ptr [rsp + 256]",
     "cmp r12, 2",
-    "jb wovenhat_ls_dot",
-    "mov r13, [rsp + 16]",
+    "jb wovenhat_ls_cwd",
+    "mov r13, qword ptr [rsp + 272]",
     "xor r14, r14",
     "1:",
     "cmp byte ptr [r13 + r14], 0",
-    "je 2f",
+    "je wovenhat_ls_go",
     "inc r14",
-    "jmp 1b",
-    "2:",
-    "jmp wovenhat_ls_go",
-    "wovenhat_ls_dot:",
-    // getcwd into buffer
-    "lea r13, [rip + wovenhat_ls_cwd]",
+    "cmp r14, 255",
+    "jb 1b",
+    "jmp wovenhat_ls_fail",
+    "wovenhat_ls_cwd:",
+    "lea r13, [rsp]",
     "mov eax, 21",
     "mov rdi, r13",
     "mov esi, 120",
     "int 0x80",
     "cmp rax, -1",
-    "je wovenhat_ls_done",
+    "je wovenhat_ls_fail",
     "mov r14, rax",
     "wovenhat_ls_go:",
     "xor r15, r15",
@@ -2492,17 +2482,16 @@ global_asm!(
     "or rsi, rax",
     "mov eax, 18",
     "mov rdi, r13",
-    "lea rdx, [rip + wovenhat_ls_name]",
+    "lea rdx, [rsp + 128]",
     "int 0x80",
     "cmp rax, -1",
     "je wovenhat_ls_done",
     "mov rbx, rax",
-    "and edx, 0xff",
     "mov rdx, rbx",
     "and edx, 0xff",
     "mov eax, 1",
     "mov edi, 1",
-    "lea rsi, [rip + wovenhat_ls_name]",
+    "lea rsi, [rsp + 128]",
     "int 0x80",
     "mov eax, 1",
     "mov edi, 1",
@@ -2513,18 +2502,21 @@ global_asm!(
     "cmp r15, 64",
     "jb wovenhat_ls_loop",
     "wovenhat_ls_done:",
+    "add rsp, 256",
     "xor edi, edi",
     "mov eax, 3",
     "int 0x80",
-    "wovenhat_ls_cwd:",
-    ".space 128",
+    "wovenhat_ls_fail:",
+    "add rsp, 256",
+    "mov edi, 1",
+    "mov eax, 3",
+    "int 0x80",
     "wovenhat_ls_nl:",
     ".ascii \"\\n\"",
-    "wovenhat_ls_name:",
-    ".space 64",
     "wovenhat_ls_program_end:",
     ".previous",
 );
+
 
 // /bin/sleep — sleep argv[1] ticks
 global_asm!(
@@ -2740,6 +2732,9 @@ global_asm!(
     "cmp rax, -1",
     "je 8f",
     "mov r12, rax",
+    "mov eax, 31",
+    "int 0x80",
+    "mov r13, rax",
     "sub rsp, 16",
     "3:",
     "mov eax, 45",             // DnsPoll
@@ -2750,6 +2745,11 @@ global_asm!(
     "je 8f",
     "cmp rax, 1",
     "je 4f",
+    "mov eax, 31",
+    "int 0x80",
+    "sub rax, r13",
+    "cmp rax, 500",            // 5 seconds at 100 Hz
+    "jae 8f",
     "mov eax, 7",              // Yield while DNS progresses
     "int 0x80",
     "jmp 3b",
@@ -2890,6 +2890,9 @@ global_asm!(
     "int 0x80",
     "cmp rax, -1",
     "je 8f",
+    "mov eax, 31",
+    "int 0x80",
+    "mov r12, rax",
     "1:",
     "mov eax, 49",              // PingPoll
     "int 0x80",
@@ -2897,6 +2900,11 @@ global_asm!(
     "je 8f",
     "test rax, rax",
     "jnz 2f",
+    "mov eax, 31",
+    "int 0x80",
+    "sub rax, r12",
+    "cmp rax, 600",
+    "jae 8f",
     "mov eax, 7",
     "int 0x80",
     "jmp 1b",
@@ -2924,6 +2932,151 @@ global_asm!(
     ".ascii \"ping: failed\\n\"",
     "wovenhat_ping_program_end:",
     ".previous",
+);
+
+
+global_asm!(
+    ".section .rodata.wovenhat_bin_stub, \"a\"",
+    ".global wovenhat_bin_program_start",
+    ".global wovenhat_bin_program_end",
+    "wovenhat_bin_program_start:",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + 1f]",
+    "mov edx, 112",
+    "int 0x80",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "1:",
+    ".ascii \"selftest init sh echo true false cat ls sleep pwd mkdir rm ip netstat dns udp nc ping env en ps uptime tcpd bin\\n\"",
+    "wovenhat_bin_program_end:",
+    ".previous",
+);
+
+global_asm!(
+    ".section .rodata.wovenhat_env_stub, \"a\"",
+    ".global wovenhat_env_program_start",
+    ".global wovenhat_env_program_end",
+    "wovenhat_env_program_start:",
+    "sub rsp, 128",
+    "mov eax, 53",
+    "int 0x80",
+    "mov r12, rax",
+    "xor r13d, r13d",
+    "1:",
+    "cmp r13, r12",
+    "jae 3f",
+    "mov eax, 54",
+    "mov rdi, r13",
+    "mov rsi, rsp",
+    "mov edx, 96",
+    "int 0x80",
+    "cmp rax, -1",
+    "je 2f",
+    "mov rdx, rax",
+    "mov eax, 1",
+    "mov edi, 1",
+    "mov rsi, rsp",
+    "int 0x80",
+    "mov eax, 1",
+    "mov edi, 1",
+    "lea rsi, [rip + 4f]",
+    "mov edx, 1",
+    "int 0x80",
+    "2:",
+    "inc r13",
+    "jmp 1b",
+    "3:",
+    "add rsp, 128",
+    "xor edi, edi",
+    "mov eax, 3",
+    "int 0x80",
+    "4:",
+    ".ascii \"\\n\"",
+    "wovenhat_env_program_end:",
+    ".previous",
+);
+
+
+global_asm!(
+    ".section .rodata.wovenhat_ps_stub, \"a\"",
+    ".global wovenhat_ps_program_start",
+    ".global wovenhat_ps_program_end",
+    "wovenhat_ps_program_start:",
+    "sub rsp, 128",
+    "mov eax, 1", "mov edi, 1", "lea rsi, [rip + 8f]", "mov edx, 15", "int 0x80",
+    "mov eax, 55", "int 0x80", "mov r12, rax", "xor r13d, r13d",
+    "1:", "cmp r13, r12", "jae 7f",
+    "mov eax, 56", "mov rdi, r13", "mov rsi, rsp", "int 0x80", "cmp rax, -1", "je 6f",
+    "mov rax, qword ptr [rsp]", "call wovenhat_ps_print_u",
+    "mov eax, 1", "mov edi, 1", "lea rsi, [rip + 9f]", "mov edx, 1", "int 0x80",
+    "mov rax, qword ptr [rsp + 8]", "call wovenhat_ps_print_u",
+    "mov eax, 1", "mov edi, 1", "lea rsi, [rip + 9f]", "mov edx, 1", "int 0x80",
+    "mov rax, qword ptr [rsp + 24]", "call wovenhat_ps_print_u",
+    "mov eax, 1", "mov edi, 1", "lea rsi, [rip + 10f]", "mov edx, 1", "int 0x80",
+    "6:", "inc r13", "jmp 1b",
+    "7:", "add rsp, 128", "xor edi, edi", "mov eax, 3", "int 0x80",
+    "wovenhat_ps_print_u:",
+    "push rbx", "push rcx", "push rdx", "push rsi", "push rdi",
+    "lea rsi, [rsp - 32]", "sub rsp, 32", "lea rdi, [rsp + 31]", "mov byte ptr [rdi], 0", "mov ebx, 10", "xor ecx, ecx",
+    "2:", "xor edx, edx", "div rbx", "add dl, 48", "dec rdi", "mov [rdi], dl", "inc ecx", "test rax, rax", "jnz 2b",
+    "mov eax, 1", "mov edx, ecx", "mov rsi, rdi", "mov edi, 1", "int 0x80",
+    "add rsp, 32", "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx", "ret",
+    "8:", ".ascii \"PID PPID STATE\\n\"",
+    "9:", ".ascii \" \"",
+    "10:", ".ascii \"\\n\"",
+    "wovenhat_ps_program_end:", ".previous",
+);
+
+global_asm!(
+    ".section .rodata.wovenhat_uptime_stub, \"a\"",
+    ".global wovenhat_uptime_program_start",
+    ".global wovenhat_uptime_program_end",
+    "wovenhat_uptime_program_start:",
+    "mov eax, 31", "int 0x80", "mov r12, rax",
+    "mov eax, 1", "mov edi, 1", "lea rsi, [rip + 4f]", "mov edx, 13", "int 0x80",
+    "mov rax, r12", "call wovenhat_uptime_print_u",
+    "mov eax, 1", "mov edi, 1", "lea rsi, [rip + 5f]", "mov edx, 1", "int 0x80",
+    "xor edi, edi", "mov eax, 3", "int 0x80",
+    "wovenhat_uptime_print_u:",
+    "push rbx", "push rcx", "push rdx", "push rsi", "push rdi", "sub rsp, 32", "lea rdi, [rsp + 31]", "mov ebx, 10", "xor ecx, ecx",
+    "2:", "xor edx, edx", "div rbx", "add dl, 48", "dec rdi", "mov [rdi], dl", "inc ecx", "test rax, rax", "jnz 2b",
+    "mov eax, 1", "mov edx, ecx", "mov rsi, rdi", "mov edi, 1", "int 0x80", "add rsp, 32",
+    "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx", "ret",
+    "4:", ".ascii \"uptime ticks=\"",
+    "5:", ".ascii \"\\n\"",
+    "wovenhat_uptime_program_end:", ".previous",
+);
+
+
+global_asm!(
+    ".section .rodata.wovenhat_tcpd_stub, \"a\"",
+    ".global wovenhat_tcpd_program_start",
+    ".global wovenhat_tcpd_program_end",
+    "wovenhat_tcpd_program_start:",
+    "mov r12, 8080",
+    "mov rax, [rsp]", "cmp rax, 2", "jb 2f",
+    "mov rsi, [rsp + 16]", "xor r12d, r12d",
+    "1:", "movzx eax, byte ptr [rsi]", "test al, al", "jz 2f", "cmp al, 48", "jb 9f", "cmp al, 57", "ja 9f",
+    "imul r12, r12, 10", "sub eax, 48", "add r12, rax", "inc rsi", "cmp r12, 65535", "ja 9f", "jmp 1b",
+    "2:",
+    "mov eax, 37", "mov edi, 2", "int 0x80", "cmp rax, -1", "je 9f", "mov r13, rax",
+    "mov eax, 38", "mov rdi, r13", "mov rsi, r12", "int 0x80", "cmp rax, -1", "je 8f",
+    "mov eax, 1", "mov edi, 1", "lea rsi, [rip + 6f]", "mov edx, 23", "int 0x80",
+    "sub rsp, 544",
+    "3:",
+    "mov eax, 41", "mov rdi, r13", "mov rsi, rsp", "mov edx, 512", "int 0x80",
+    "cmp rax, -1", "je 5f", "test rax, rax", "jz 5f", "mov r14, rax",
+    "mov eax, 40", "mov rdi, r13", "mov rsi, rsp", "mov rdx, r14", "int 0x80",
+    "mov eax, 1", "mov edi, 1", "mov rsi, rsp", "mov rdx, r14", "int 0x80",
+    "jmp 3b",
+    "5:", "mov eax, 7", "int 0x80", "jmp 3b",
+    "6:", ".ascii \"tcpd: listening (echo)\\n\"",
+    "8:", "mov eax, 42", "mov rdi, r13", "int 0x80",
+    "9:", "mov eax, 1", "mov edi, 2", "lea rsi, [rip + 10f]", "mov edx, 29", "int 0x80", "mov edi, 1", "mov eax, 3", "int 0x80",
+    "10:", ".ascii \"usage: tcpd [1-65535] failed\\n\"",
+    "wovenhat_tcpd_program_end:", ".previous",
 );
 
 unsafe extern "C" {
@@ -2965,6 +3118,16 @@ unsafe extern "C" {
     static wovenhat_nc_program_end: u8;
     static wovenhat_ping_program_start: u8;
     static wovenhat_ping_program_end: u8;
+    static wovenhat_bin_program_start: u8;
+    static wovenhat_bin_program_end: u8;
+    static wovenhat_env_program_start: u8;
+    static wovenhat_env_program_end: u8;
+    static wovenhat_ps_program_start: u8;
+    static wovenhat_ps_program_end: u8;
+    static wovenhat_uptime_program_start: u8;
+    static wovenhat_uptime_program_end: u8;
+    static wovenhat_tcpd_program_start: u8;
+    static wovenhat_tcpd_program_end: u8;
 }
 #[derive(Clone, Copy, Debug)]
 pub struct UserImage {
@@ -3214,6 +3377,47 @@ pub fn elf_loader_self_test() -> bool {
         && crate::elf::parse(&bad_magic).is_err()
         && crate::elf::parse(&writable_executable).is_err()
 }
+/// Regression test for the mmap W^X invariant.
+///
+/// `map_anonymous` already hard-codes the executable flag to `false` for
+/// every anonymous mapping, regardless of the caller-requested `writable`
+/// flag — a process can never get a writable+executable page through
+/// `sys_mmap`. That invariant was previously enforced only by inspection
+/// (see `docs/AUDIT-2026-09-04.md`); this pins it down as a boot self-test
+/// so a future change to `map_anonymous` (for example, adding a real
+/// executable parameter for JIT support) cannot silently reintroduce a
+/// writable+executable user mapping without a self-test catching it.
+///
+/// Takes an already-created `address_space` so callers can reuse one of
+/// the address spaces boot-time self-tests already set up (see `main.rs`)
+/// rather than creating and tearing down a dedicated one. Uses the last
+/// valid mmap slot so it cannot collide with mappings a real process
+/// creates later in the same address space, and leaves the address space
+/// exactly as it found it (the test mapping is unmapped before returning).
+pub fn mmap_w_xor_x_self_test(address_space: AddressSpace) -> bool {
+    const TEST_SIZE: usize = 4096;
+    let test_slot = MAX_ANONYMOUS_MAPPINGS - 1;
+
+    let Some(mapping) = map_anonymous(address_space, test_slot, TEST_SIZE, true) else {
+        return false;
+    };
+
+    let protected_correctly = paging::user_range_has_protection_in(
+        address_space.paging(),
+        mapping.address,
+        TEST_SIZE,
+        true,  // writable: this test specifically requests a writable mapping
+        false, // executable: must be false — this is the W^X invariant under test
+    );
+
+    // Always attempt cleanup, even if the assertion above failed, so a
+    // failing self-test doesn't also leak a stale mapping into an address
+    // space the caller is about to hand to a real process.
+    let unmapped = unmap_anonymous(address_space, mapping);
+
+    protected_correctly && unmapped
+}
+
 pub fn create_stub_process() -> Option<UserProgram> {
     let stub = unsafe {
         let start = &wovenhat_user_program_start as *const u8;
@@ -3654,6 +3858,38 @@ pub fn install_ping_executable() -> bool {
     stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/ping", &elf).is_ok())
 }
 
+
+
+pub fn install_bin_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_bin_program_start), core::ptr::addr_of!(wovenhat_bin_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/bin", &elf).is_ok())
+}
+
+pub fn install_en_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_env_program_start), core::ptr::addr_of!(wovenhat_env_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/en", &elf).is_ok())
+}
+
+pub fn install_env_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_env_program_start), core::ptr::addr_of!(wovenhat_env_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/env", &elf).is_ok())
+}
+
+
+pub fn install_ps_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_ps_program_start), core::ptr::addr_of!(wovenhat_ps_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/ps", &elf).is_ok())
+}
+pub fn install_uptime_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_uptime_program_start), core::ptr::addr_of!(wovenhat_uptime_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/uptime", &elf).is_ok())
+}
+
+
+pub fn install_tcpd_executable() -> bool {
+    let stub = stage5_program(core::ptr::addr_of!(wovenhat_tcpd_program_start), core::ptr::addr_of!(wovenhat_tcpd_program_end));
+    stub.and_then(build_stub_elf).is_some_and(|elf| crate::vfs::create_read_only("/bin/tcpd", &elf).is_ok())
+}
 
 fn build_stub_elf(stub: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     const PAYLOAD_OFFSET: usize = 4096;

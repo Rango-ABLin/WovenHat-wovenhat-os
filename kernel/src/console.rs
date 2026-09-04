@@ -81,6 +81,15 @@ impl<'a> Console<'a> {
         self.cursor_y += 9 * self.scale;
     }
 
+    pub fn cursor_position(&self) -> (usize, usize) {
+        (self.cursor_x, self.cursor_y)
+    }
+
+    pub fn set_cursor_position(&mut self, x: usize, y: usize) {
+        self.cursor_x = core::cmp::min(x, self.info.width.saturating_sub(1));
+        self.cursor_y = core::cmp::min(y, self.info.height.saturating_sub(1));
+    }
+
     pub fn backspace(&mut self) {
         let char_width = 6 * self.scale;
 

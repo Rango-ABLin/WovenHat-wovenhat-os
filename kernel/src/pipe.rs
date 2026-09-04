@@ -303,6 +303,7 @@ pub fn self_test() -> bool {
     ok && eof
 }
 
+#[allow(dead_code)]
 pub const fn buffer_size() -> usize {
     PIPE_BUFFER
 }
