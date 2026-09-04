@@ -116,7 +116,7 @@ impl Shell {
                     console.clear();
                 }
             }
-            "version" | "ver" => console.println("WovenHat kernel 0.1.0"),
+            "version" | "ver" => console.println("WovenHat kernel 0.2.0 Stage 4"),
             "ticks" | "uptime" => {
                 if authorize(Capability::TimerRead, console) {
                     console.print("ticks: ");
@@ -132,6 +132,8 @@ impl Shell {
             "caps" => cmd_caps(console),
             "devices" | "dev" => cmd_devices(console),
             "net" => cmd_net(console),
+            "netstat" => cmd_netstat(console),
+            "udpecho" => cmd_udpecho(arg, console),
             "userland" => {
                 if authorize(Capability::FileWrite, console) {
                     cmd_userland(console);
@@ -293,6 +295,16 @@ impl Shell {
                     cmd_mount(console);
                 }
             }
+            "persist" => {
+                if authorize(Capability::FileWrite, console) {
+                    cmd_persist(arg, console);
+                }
+            }
+            "sync" => {
+                if authorize(Capability::FileWrite, console) {
+                    cmd_sync(console);
+                }
+            }
             _ => {
                 console.print("unknown command: ");
                 console.println(verb);
@@ -312,14 +324,14 @@ impl Shell {
 }
 
 fn print_help(console: &mut Console<'_>) {
-    console.println("WovenHat kernel shell 0.1.0");
-    console.println("system:  help clear version ticks|uptime tasks|ps caps devices net");
-    console.println("         memory|mem heap paging bench fs mount syscall");
+    console.println("WovenHat kernel shell 0.2.0 Stage 4");
+    console.println("system:  help clear version ticks|uptime tasks|ps caps devices net netstat");
+    console.println("         memory|mem heap paging bench fs mount persist sync syscall");
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
     console.println("nav:     cd [path]  pwd  echo <text>");
     console.println("process: run <elf>  sh  init  spawn  user|ring3  kill <pid> [sig]");
-    console.println("runtime: userland   (install /bin programs on demand)");
+    console.println("runtime: userland udpecho [port]   (real UDP echo service)");
 }
 
 fn cmd_tasks(console: &mut Console<'_>) {
@@ -411,6 +423,71 @@ fn cmd_net(console: &mut Console<'_>) {
     console.print(" rx_drop="); print_u64(console, stats.rx_dropped);
     console.print(" tx_busy="); print_u64(console, stats.tx_busy);
     console.newline();
+}
+
+
+fn cmd_netstat(console: &mut Console<'_>) {
+    let stats = network::stats();
+    console.print("network: ");
+    console.println(if stats.online { "online" } else { "offline" });
+    console.print("udp echo: ");
+    if stats.echo_active {
+        console.print("listening port=");
+        print_u64(console, stats.echo_port as u64);
+        console.print(" packets=");
+        print_u64(console, stats.echo_packets);
+        console.newline();
+    } else {
+        console.println("stopped");
+    }
+}
+
+fn cmd_udpecho(arg: &str, console: &mut Console<'_>) {
+    let port = if arg.trim().is_empty() { 7 } else {
+        match arg.trim().parse::<u16>() {
+            Ok(port) if port != 0 => port,
+            _ => { console.println("usage: udpecho [1..65535]"); return; }
+        }
+    };
+    match network::start_udp_echo(port) {
+        Ok(()) => {
+            console.print("udp echo listening on 10.0.2.15:");
+            print_u64(console, port as u64);
+            console.newline();
+        }
+        Err(network::EchoError::NetworkOffline) => console.println("udpecho: network offline"),
+        Err(network::EchoError::AlreadyConfigured) => console.println("udpecho: already listening on another port"),
+        Err(_) => console.println("udpecho: start failed"),
+    }
+}
+
+fn cmd_persist(arg: &str, console: &mut Console<'_>) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        console.println("usage: persist </mnt/path>");
+        return;
+    }
+    let Some(path) = shell_resolve(arg) else { console.println("persist: bad path"); return; };
+    let result = match vfs::stat(&path) {
+        Ok(stat) if stat.kind == vfs::NodeKind::Directory => storage::persist_directory(&path),
+        Ok(_) => storage::persist_path(&path),
+        Err(_) => { console.println("persist: not found"); return; }
+    };
+    match result {
+        Ok(()) => console.println("persist: written to FAT32"),
+        Err(storage::PersistError::NotSupported) => console.println("persist: path must be under /mnt"),
+        Err(storage::PersistError::NoDevice) => console.println("persist: no ATA disk"),
+        Err(storage::PersistError::BadName) => console.println("persist: FAT 8.3 path required"),
+        Err(storage::PersistError::TooLarge) => console.println("persist: no space or file too large"),
+        Err(_) => console.println("persist: write failed"),
+    }
+}
+
+fn cmd_sync(console: &mut Console<'_>) {
+    let count = storage::sync_all_mounted();
+    console.print("sync: persisted ");
+    print_u64(console, count as u64);
+    console.println(" file(s) under /mnt");
 }
 
 fn ensure_program(path: &str, installer: fn() -> bool) -> bool {

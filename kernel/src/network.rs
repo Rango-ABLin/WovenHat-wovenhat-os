@@ -7,8 +7,9 @@
 
 use spin::{Mutex, Once};
 use smoltcp::{
-    iface::{Config, Interface, SocketSet, SocketStorage},
+    iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage},
     phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    socket::udp,
     time::Instant,
     wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address},
 };
@@ -58,8 +59,39 @@ impl Device for VirtioSmolDevice {
     }
 }
 
-struct Runtime { iface: Interface, device: VirtioSmolDevice }
+struct Runtime {
+    iface: Interface,
+    device: VirtioSmolDevice,
+    sockets: SocketSet<'static>,
+    echo_handle: Option<SocketHandle>,
+    echo_port: u16,
+    echo_packets: u64,
+}
 static RUNTIME: Once<Mutex<Runtime>> = Once::new();
+
+const SOCKET_SLOTS: usize = 4;
+const UDP_META_SLOTS: usize = 4;
+const UDP_BUFFER_BYTES: usize = 2048;
+static mut SOCKET_STORAGE: [SocketStorage<'static>; SOCKET_SLOTS] =
+    [const { SocketStorage::EMPTY }; SOCKET_SLOTS];
+static mut ECHO_RX_META: [udp::PacketMetadata; UDP_META_SLOTS] =
+    [udp::PacketMetadata::EMPTY; UDP_META_SLOTS];
+static mut ECHO_TX_META: [udp::PacketMetadata; UDP_META_SLOTS] =
+    [udp::PacketMetadata::EMPTY; UDP_META_SLOTS];
+static mut ECHO_RX_DATA: [u8; UDP_BUFFER_BYTES] = [0; UDP_BUFFER_BYTES];
+static mut ECHO_TX_DATA: [u8; UDP_BUFFER_BYTES] = [0; UDP_BUFFER_BYTES];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EchoError { NetworkOffline, AlreadyConfigured, BindFailed, SocketTableFull }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetStats {
+    pub online: bool,
+    pub echo_active: bool,
+    pub echo_port: u16,
+    pub echo_packets: u64,
+}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitError { Transport(virtio_net::InitError), Route }
@@ -78,7 +110,18 @@ pub fn init() -> Result<(), InitError> {
         let _ = addrs.push(default_cidr());
     });
     iface.routes_mut().add_default_ipv4_route(DEFAULT_GATEWAY).map_err(|_| InitError::Route)?;
-    RUNTIME.call_once(|| Mutex::new(Runtime { iface, device }));
+    let socket_storage: &'static mut [SocketStorage<'static>; SOCKET_SLOTS] = unsafe {
+        &mut *core::ptr::addr_of_mut!(SOCKET_STORAGE)
+    };
+    let sockets = SocketSet::new(&mut socket_storage[..]);
+    RUNTIME.call_once(|| Mutex::new(Runtime {
+        iface,
+        device,
+        sockets,
+        echo_handle: None,
+        echo_port: 0,
+        echo_packets: 0,
+    }));
     Ok(())
 }
 
@@ -86,10 +129,80 @@ pub fn poll() {
     virtio_net::poll();
     let Some(runtime) = RUNTIME.get() else { return; };
     let mut runtime = runtime.lock();
-    let mut storage = [const { SocketStorage::EMPTY }; 1];
-    let mut sockets = SocketSet::new(&mut storage[..]);
-    let Runtime { iface, device } = &mut *runtime;
-    let _ = iface.poll(now(), device, &mut sockets);
+
+    {
+        let Runtime { iface, device, sockets, .. } = &mut *runtime;
+        let _ = iface.poll(now(), device, sockets);
+    }
+
+    if let Some(handle) = runtime.echo_handle {
+        let mut reply = [0u8; 512];
+        let received = {
+            let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
+            match socket.recv() {
+                Ok((data, meta)) => {
+                    let len = core::cmp::min(data.len(), reply.len());
+                    reply[..len].copy_from_slice(&data[..len]);
+                    Some((len, meta.endpoint))
+                }
+                Err(_) => None,
+            }
+        };
+        if let Some((len, remote)) = received {
+            let sent = {
+                let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
+                socket.send_slice(&reply[..len], remote).is_ok()
+            };
+            if sent { runtime.echo_packets = runtime.echo_packets.saturating_add(1); }
+        }
+    }
+
+    {
+        let Runtime { iface, device, sockets, .. } = &mut *runtime;
+        let _ = iface.poll(now(), device, sockets);
+    }
+}
+
+pub fn start_udp_echo(port: u16) -> Result<(), EchoError> {
+    if port == 0 { return Err(EchoError::BindFailed); }
+    let Some(runtime) = RUNTIME.get() else { return Err(EchoError::NetworkOffline); };
+    let mut runtime = runtime.lock();
+    if runtime.echo_handle.is_some() {
+        return if runtime.echo_port == port { Ok(()) } else { Err(EchoError::AlreadyConfigured) };
+    }
+
+    let rx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] = unsafe {
+        &mut *core::ptr::addr_of_mut!(ECHO_RX_META)
+    };
+    let tx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] = unsafe {
+        &mut *core::ptr::addr_of_mut!(ECHO_TX_META)
+    };
+    let rx_data: &'static mut [u8; UDP_BUFFER_BYTES] = unsafe {
+        &mut *core::ptr::addr_of_mut!(ECHO_RX_DATA)
+    };
+    let tx_data: &'static mut [u8; UDP_BUFFER_BYTES] = unsafe {
+        &mut *core::ptr::addr_of_mut!(ECHO_TX_DATA)
+    };
+
+    let rx = udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]);
+    let tx = udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]);
+    let mut socket = udp::Socket::new(rx, tx);
+    socket.bind(port).map_err(|_| EchoError::BindFailed)?;
+    let handle = runtime.sockets.add(socket);
+    runtime.echo_handle = Some(handle);
+    runtime.echo_port = port;
+    Ok(())
+}
+
+pub fn stats() -> NetStats {
+    let Some(runtime) = RUNTIME.get() else { return NetStats::default(); };
+    let runtime = runtime.lock();
+    NetStats {
+        online: virtio_net::is_initialized(),
+        echo_active: runtime.echo_handle.is_some(),
+        echo_port: runtime.echo_port,
+        echo_packets: runtime.echo_packets,
+    }
 }
 
 pub fn initialized() -> bool { RUNTIME.get().is_some() && virtio_net::is_initialized() }

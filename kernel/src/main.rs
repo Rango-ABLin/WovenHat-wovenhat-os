@@ -108,7 +108,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("SECURE INTELLIGENCE PLATFORM");
     console.println("");
 
-    console.println("WOVENHAT KERNEL 0.1.0");
+    console.println("WOVENHAT KERNEL 0.2.0 STAGE 4");
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
@@ -267,6 +267,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pic::unmask(timer::IRQ);
         pic::unmask(keyboard::IRQ);
         x86_64::instructions::interrupts::enable();
+
+        let ata_sectors = ata::init();
+        if let Some(sectors) = ata_sectors {
+            serial::write_line(format_args!("[ATA] primary-master online: {} sectors", sectors));
+        } else {
+            serial::write_line(format_args!("[ATA] primary-master not detected"));
+        }
+
+        match storage::mount_ata_root() {
+            storage::MountStatus::Mounted(count) => {
+                let _ = device::register(device::Device { name: "ata0", kind: device::DeviceKind::Block, irq: None });
+                serial::write_line(format_args!("[FS] FAT32 mounted at /mnt; imported {} entries", count));
+            }
+            storage::MountStatus::NoDevice => serial::write_line(format_args!("[FS] no ATA disk; continuing with RAM VFS")),
+            storage::MountStatus::NotFat32 => serial::write_line(format_args!("[FS] ATA disk present but no FAT32 root")),
+            storage::MountStatus::Failed => serial::write_line(format_args!("[FS] FAT32 mount failed; continuing with RAM VFS")),
+        }
+
+        for dir in ["/etc", "/var", "/home", "/tmp"] {
+            let _ = vfs::mkdir(dir);
+        }
 
         match network::init() {
             Ok(()) => serial::write_line(format_args!("[NET] virtio-net + smoltcp online at 10.0.2.15/24")),
