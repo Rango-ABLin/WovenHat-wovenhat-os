@@ -116,7 +116,7 @@ impl Shell {
                     console.clear();
                 }
             }
-            "version" | "ver" => console.println("WovenHat kernel 0.3.0 Stage 5"),
+            "version" | "ver" => console.println("WovenHat kernel 0.4.0 Stage 6"),
             "ticks" | "uptime" => {
                 if authorize(Capability::TimerRead, console) {
                     console.print("ticks: ");
@@ -325,14 +325,14 @@ impl Shell {
 }
 
 fn print_help(console: &mut Console<'_>) {
-    console.println("WovenHat kernel shell 0.3.0 Stage 5");
+    console.println("WovenHat kernel shell 0.4.0 Stage 6");
     console.println("system:  help clear version ticks|uptime tasks|ps caps devices net netstat");
     console.println("         memory|mem heap paging bench fs mount persist sync syscall");
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
     console.println("nav:     cd [path]  pwd  echo <text>");
     console.println("process: run <elf>  sh  init  spawn  user|ring3  kill <pid> [sig]");
-    console.println("runtime: userland udpecho [port] dhcp <on|off>   (Stage 5 networking)");
+    console.println("runtime: userland udpecho [port] dhcp <on|off>   (Stage 6 networking + argv/PATH exec)");
 }
 
 fn cmd_tasks(console: &mut Console<'_>) {

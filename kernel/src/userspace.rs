@@ -1061,7 +1061,7 @@ global_asm!(
     "mov rdi, r12",
     "int 0x80",
     "mov byte ptr [r14 + r9], 0",
-    "mov eax, 15",
+    "mov eax, 50",
     "mov rdi, r14",
     "mov rsi, r9",
     "int 0x80",
@@ -1195,7 +1195,7 @@ global_asm!(
     "mov rdi, r12",
     "int 0x80",
     "mov byte ptr [r14 + r9], 0",
-    "mov eax, 15",
+    "mov eax, 50",
     "mov rdi, r14",
     "mov rsi, r9",
     "int 0x80",
@@ -1247,7 +1247,7 @@ global_asm!(
     "mov rdi, r12",
     "int 0x80",
     "mov byte ptr [r14 + r9], 0",
-    "mov eax, 15",
+    "mov eax, 50",
     "mov rdi, r14",
     "mov rsi, r9",
     "int 0x80",
@@ -1391,7 +1391,7 @@ global_asm!(
     "mov rdi, r11",
     "int 0x80",
     "mov byte ptr [r14 + r9], 0",
-    "mov eax, 15",
+    "mov eax, 50",
     "mov rdi, r14",
     "mov rsi, r9",
     "int 0x80",
@@ -1438,7 +1438,7 @@ global_asm!(
     "mov rsi, r10",
     "add rsi, r14",
     "sub rsi, rdi",
-    "mov eax, 15",
+    "mov eax, 50",
     "int 0x80",
     "mov edi, 1",
     "mov eax, 3",
@@ -1478,7 +1478,7 @@ global_asm!(
     "mov rsi, r14",
     "add rsi, r15",
     "sub rsi, rdi",
-    "mov eax, 15",
+    "mov eax, 50",
     "int 0x80",
     "mov edi, 1",
     "mov eax, 3",
@@ -1573,7 +1573,7 @@ global_asm!(
     "int 0x80",
     // NUL-terminate left in place
     "mov byte ptr [r14 + r9], 0",
-    "mov eax, 15",
+    "mov eax, 50",
     "mov rdi, r14",
     "mov rsi, r9",
     "int 0x80",
@@ -1600,7 +1600,7 @@ global_asm!(
     "mov eax, 6",
     "mov rdi, r13",
     "int 0x80",
-    "mov eax, 15",
+    "mov eax, 50",
     "mov rdi, r10",
     "mov rsi, r11",
     "int 0x80",
@@ -1678,7 +1678,7 @@ global_asm!(
     "jmp wovenhat_sh_wait",
     "wovenhat_sh_child:",
     // exec(path=r14, len=r15)
-    "mov eax, 15",
+    "mov eax, 50",
     "mov rdi, r14",
     "mov rsi, r15",
     "int 0x80",
@@ -1846,11 +1846,11 @@ global_asm!(
     ".previous",
 );
 
-/// Minimal freestanding "libc" — C-callable syscall stubs for userspace.
-///
-/// Calling convention: System V AMD64 (args in rdi, rsi, rdx…).
-/// These symbols are embedded for documentation and future static linking;
-/// the interactive shell uses the same syscall numbers directly.
+// Minimal freestanding "libc" — C-callable syscall stubs for userspace.
+//
+// Calling convention: System V AMD64 (args in rdi, rsi, rdx…).
+// These symbols are embedded for documentation and future static linking;
+// the interactive shell uses the same syscall numbers directly.
 global_asm!(
     ".section .rodata.wovenhat_libc, \"a\"",
     ".global wovenhat_libc_start",
@@ -1904,6 +1904,11 @@ global_asm!(
     ".global wovenhat_sys_exec",
     "wovenhat_sys_exec:",
     "mov eax, 15",
+    "int 0x80",
+    "ret",
+    ".global wovenhat_sys_exec_command",
+    "wovenhat_sys_exec_command:",
+    "mov eax, 50",
     "int 0x80",
     "ret",
     ".global wovenhat_sys_pipe",
@@ -2658,7 +2663,7 @@ global_asm!(
 );
 
 
-// Stage 5 network utilities. These tiny freestanding programs exercise the
+// Stage 6 userspace utilities. These tiny freestanding programs exercise the
 // Ring-3 networking ABI directly; they intentionally avoid linking a C runtime.
 global_asm!(
     ".section .rodata.wovenhat_ip_stub, \"a\"",
@@ -2713,10 +2718,23 @@ global_asm!(
     ".global wovenhat_dns_program_start",
     ".global wovenhat_dns_program_end",
     "wovenhat_dns_program_start:",
-    // The current Stage-5 exec ABI passes the executable path as argv[0].
-    // Keep this standalone probe deterministic until argv-bearing exec lands.
+    // Stage 6 receives a real argc/argv stack. Resolve argv[1] when present,
+    // otherwise keep example.com as a deterministic default.
+    "cmp qword ptr [rsp], 2",
+    "jb 1f",
+    "mov rdi, qword ptr [rsp + 16]",
+    "xor esi, esi",
+    "0:",
+    "cmp byte ptr [rdi + rsi], 0",
+    "je 2f",
+    "inc rsi",
+    "cmp esi, 253",
+    "jb 0b",
+    "jmp 8f",
+    "1:",
     "lea rdi, [rip + 6f]",
     "mov esi, 11",             // strlen("example.com")
+    "2:",
     "mov eax, 44",             // DnsStart
     "int 0x80",
     "cmp rax, -1",

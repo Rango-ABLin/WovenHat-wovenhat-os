@@ -1,6 +1,6 @@
-//! WovenHat Stage 5 IPv4 network stack.
+//! WovenHat Stage 6 IPv4 network stack.
 //!
-//! Stage 5 keeps the shell-first recovery path while exposing smoltcp sockets
+//! Stage 6 keeps the shell-first recovery path while exposing smoltcp sockets
 //! to Ring-3 processes through a small kernel ABI.  The implementation uses
 //! owned buffers so sockets can be created and destroyed dynamically without
 //! static-lifetime bookkeeping in user processes.
@@ -158,7 +158,7 @@ pub fn init() -> Result<(), InitError> {
 
     let mut sockets = SocketSet::new(Vec::new());
 
-    // Stage 5 DHCP client. We keep the known-good QEMU static address until a
+    // Stage 6 DHCP client. We keep the known-good QEMU static address until a
     // lease is actually acquired, so losing DHCP cannot take down recovery.
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
 

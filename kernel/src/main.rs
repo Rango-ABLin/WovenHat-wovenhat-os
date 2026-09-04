@@ -70,6 +70,7 @@ static FAIR_TASK_A_RUNS: AtomicU64 = AtomicU64::new(0);
 static FAIR_TASK_B_RUNS: AtomicU64 = AtomicU64::new(0);
 static FAIR_TASKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
+#[allow(unreachable_code)]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let memory_init = memory::init(&boot_info.memory_regions);
     let physical_memory_offset = match &boot_info.physical_memory_offset {
@@ -108,7 +109,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("SECURE INTELLIGENCE PLATFORM");
     console.println("");
 
-    console.println("WOVENHAT KERNEL 0.2.0 STAGE 4");
+    console.println("WOVENHAT KERNEL 0.4.0 STAGE 6");
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");

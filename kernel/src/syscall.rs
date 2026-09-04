@@ -187,6 +187,8 @@ pub enum Number {
     PingStart = 48,
     /// 0 pending, otherwise RTT ticks + 1
     PingPoll = 49,
+    /// command-line pointer + byte length; parses argv and resolves bare names via /bin
+    ExecCommand = 50,
 }
 
 pub fn entry_address() -> u64 {
@@ -795,6 +797,98 @@ fn sys_exec(user_path: u64, length: u64) -> u64 {
     crate::task::exec_current(program)
 }
 
+/// Execute a whitespace-delimited command line from userspace.
+///
+/// Stage 6 keeps the existing `exec(path,len)` ABI intact and adds this
+/// argument-bearing form for the interactive shell. Bare command names are
+/// resolved under `/bin`; paths containing `/` are used verbatim. The parser
+/// intentionally supports simple ASCII whitespace only for now (no quoting or
+/// environment expansion), bounded by userspace::MAX_ARGV/MAX_ARGV_BYTES.
+fn sys_exec_command(user_line: u64, length: u64) -> u64 {
+    let actor = crate::task::current_process_id();
+    if !crate::task::current_has(crate::capability::Capability::FileRead)
+        || !crate::task::current_has(crate::capability::Capability::ProcessCreate)
+    {
+        crate::audit::record(actor, crate::audit::Action::ProcessExec, length, false);
+        return SYSCALL_ERROR;
+    }
+
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > crate::userspace::MAX_ARGV_BYTES {
+        return SYSCALL_ERROR;
+    }
+
+    let mut command = [0_u8; crate::userspace::MAX_ARGV_BYTES];
+    if crate::paging::copy_from_current_user(user_line, &mut command[..length]).is_err() {
+        return SYSCALL_ERROR;
+    }
+    if !command[..length].is_ascii() {
+        return SYSCALL_ERROR;
+    }
+
+    let mut ranges = [(0_usize, 0_usize); crate::userspace::MAX_ARGV];
+    let mut argc = 0_usize;
+    let mut cursor = 0_usize;
+    while cursor < length {
+        while cursor < length && command[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == length {
+            break;
+        }
+        if argc == crate::userspace::MAX_ARGV {
+            return SYSCALL_ERROR;
+        }
+        let start = cursor;
+        while cursor < length && !command[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        ranges[argc] = (start, cursor);
+        argc += 1;
+    }
+    if argc == 0 {
+        return SYSCALL_ERROR;
+    }
+
+    let Ok(command_name) = core::str::from_utf8(&command[ranges[0].0..ranges[0].1]) else {
+        return SYSCALL_ERROR;
+    };
+    let resolved = if command_name.as_bytes().contains(&b'/') {
+        alloc::string::String::from(command_name)
+    } else {
+        alloc::format!("/bin/{command_name}")
+    };
+    if resolved.len() > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
+
+    let mut argv = [""; crate::userspace::MAX_ARGV];
+    argv[0] = resolved.as_str();
+    for index in 1..argc {
+        let (start, end) = ranges[index];
+        let Ok(argument) = core::str::from_utf8(&command[start..end]) else {
+            return SYSCALL_ERROR;
+        };
+        argv[index] = argument;
+    }
+
+    let mut image = alloc::vec![0_u8; crate::vfs::NODE_CAPACITY];
+    let Ok(image_length) = crate::vfs::read_all(resolved.as_str(), &mut image) else {
+        crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, false);
+        return SYSCALL_ERROR;
+    };
+    let Some(program) = crate::userspace::load_elf_with_argv(&image[..image_length], &argv[..argc]) else {
+        crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, false);
+        return SYSCALL_ERROR;
+    };
+    drop(image);
+    IO_COMPLETIONS.fetch_or(IO_EXEC, Ordering::Release);
+    crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, true);
+    crate::task::exec_current(program)
+}
+
 fn sys_socket(kind: u64) -> u64 {
     let kind = match kind {
         1 => crate::network::SocketKind::Udp,
@@ -935,6 +1029,7 @@ pub extern "C" fn wovenhat_syscall_dispatch(
         value if value == Number::Open as u64 => sys_open(arg0, arg1),
         value if value == Number::Close as u64 => sys_close(arg0),
         value if value == Number::Exec as u64 => sys_exec(arg0, arg1),
+        value if value == Number::ExecCommand as u64 => sys_exec_command(arg0, arg1),
         value if value == Number::Fork as u64 => sys_fork(frame),
         value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),
         value if value == Number::MessageReceive as u64 => sys_message_receive(arg0, arg1, arg2),
