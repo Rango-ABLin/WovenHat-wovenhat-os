@@ -646,14 +646,23 @@ fn clone_file_table(
         match entry {
             Some(FdKind::File(id)) => {
                 child_files[index] =
-                    Some(FdKind::File(vfs::clone_open_file(*id).map_err(|_| ProcessError::Full)?));
+                    Some(FdKind::File(vfs::clone_open_file(*id).map_err(|_| {
+                        release_file_table(&mut child_files);
+                        ProcessError::Full
+                    })?));
             }
             Some(FdKind::PipeRead(id)) => {
-                crate::pipe::clone_reader(*id).map_err(|_| ProcessError::Full)?;
+                crate::pipe::clone_reader(*id).map_err(|_| {
+                    release_file_table(&mut child_files);
+                    ProcessError::Full
+                })?;
                 child_files[index] = Some(FdKind::PipeRead(*id));
             }
             Some(FdKind::PipeWrite(id)) => {
-                crate::pipe::clone_writer(*id).map_err(|_| ProcessError::Full)?;
+                crate::pipe::clone_writer(*id).map_err(|_| {
+                    release_file_table(&mut child_files);
+                    ProcessError::Full
+                })?;
                 child_files[index] = Some(FdKind::PipeWrite(*id));
             }
             None => {}
@@ -874,6 +883,7 @@ pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, P
     let child_files = match clone_file_table(&parent.files) {
         Ok(files) => files,
         Err(err) => {
+            let _ = ipc::unregister(child_id.as_u64());
             drop(processes);
             drop(scheduler);
             let _ = userspace::destroy_process_address_space(
@@ -960,7 +970,7 @@ pub fn exit_current_process(exit_code: i32) -> ! {
     crate::terminal::release_foreground(exiting_pid);
     crate::network::close_process_sockets(exiting_pid);
     x86_64::instructions::interrupts::disable();
-    let (context_switch, address_space, memory_mappings) = {
+    let context_switch_result = {
         let mut scheduler = SCHEDULER.lock();
         let slot = scheduler.current_slot;
         let task_id = scheduler.tasks[slot].id;
@@ -969,7 +979,7 @@ pub fn exit_current_process(exit_code: i32) -> ! {
             "kernel task cannot exit as a process"
         );
 
-        let (address_space, memory_mappings) = PROCESS_TABLE
+        let address_space_result = PROCESS_TABLE
             .lock()
             .iter_mut()
             .flatten()
@@ -987,28 +997,34 @@ pub fn exit_current_process(exit_code: i32) -> ! {
                     );
                     (address_space, memory_mappings)
                 })
-            })
-            .expect("exiting process has no owned address space");
+            });
 
         scheduler.tasks[slot].state = TaskState::Dead;
         scheduler.tasks[slot].name = "exited";
         scheduler.task_count = scheduler.task_count.saturating_sub(1);
-        (scheduler.prepare_switch(), address_space, memory_mappings)
+
+        address_space_result.map(|(address_space, memory_mappings)| {
+            (scheduler.prepare_switch(), address_space, memory_mappings)
+        })
     };
 
-    if let Some(context_switch) = context_switch {
-        paging::switch_to(context_switch.next_address_space);
-        for mapping in memory_mappings.into_iter().flatten() {
+    if let Some((context_switch, address_space, memory_mappings)) = context_switch_result {
+        if let Some(context_switch) = context_switch {
+            paging::switch_to(context_switch.next_address_space);
+            for mapping in memory_mappings.into_iter().flatten() {
+                assert!(
+                    userspace::unmap_anonymous(address_space, mapping),
+                    "failed to release exiting process mapping"
+                );
+            }
             assert!(
-                userspace::unmap_anonymous(address_space, mapping),
-                "failed to release anonymous process mapping"
+                userspace::destroy(address_space),
+                "failed to release exiting process address space"
             );
+            unsafe { switch_stacks(context_switch) };
         }
-        assert!(
-            userspace::destroy(address_space),
-            "failed to release exiting process address space"
-        );
-        unsafe { switch_stacks(context_switch) };
+    } else {
+        crate::serial::write_line(format_args!("[TASK] exiting process without address space; entering idle"));
     }
 
     loop {
@@ -1966,6 +1982,7 @@ pub fn kill_process(pid: u64, sig: u64) -> Result<(), FileError> {
     let signed = pid as i64;
     let target_group = if pid == 0 { Some(current_group) } else if signed < 0 { Some(signed.wrapping_neg() as u64) } else { None };
     let mut matched = false;
+    let mut killed_task_ids = alloc::vec::Vec::new();
     for process in processes.iter_mut().flatten() {
         let selected = if let Some(group) = target_group { process.process_group == group } else { process.id.as_u64() == pid };
         if !selected { continue; }
@@ -1984,10 +2001,26 @@ pub fn kill_process(pid: u64, sig: u64) -> Result<(), FileError> {
                 process.state = ProcessState::Exited;
                 process.exit_code = 128 + sig as i32;
                 release_file_table(&mut process.files);
+                killed_task_ids.push(process.task_id);
             }
         } else {
             process.pending_signal = sig;
         }
+    }
+    drop(processes);
+    if !killed_task_ids.is_empty() {
+        let mut scheduler = SCHEDULER.lock();
+        let mut killed_count = 0u64;
+        for task_id in &killed_task_ids {
+            for task in scheduler.tasks.iter_mut() {
+                if task.id == *task_id && task.state != TaskState::Dead {
+                    task.state = TaskState::Dead;
+                    task.name = "killed";
+                    killed_count += 1;
+                }
+            }
+        }
+        scheduler.task_count = scheduler.task_count.saturating_sub(killed_count as usize);
     }
     if matched { Ok(()) } else { Err(FileError::NotFound) }
 }

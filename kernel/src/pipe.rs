@@ -9,7 +9,7 @@ use crate::task::{self, TaskId};
 
 const PIPE_BUFFER: usize = 2048;
 const MAX_PIPES: usize = 32;
-const MAX_WAITERS: usize = 8;
+const MAX_WAITERS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -183,6 +183,17 @@ pub fn write(id: usize, buf: &[u8]) -> Result<usize, Error> {
             break;
         }
         if block {
+            let still_block = {
+                let table = TABLE.lock();
+                table
+                    .pipes
+                    .get(id)
+                    .map(|p| p.occupied && p.readers > 0 && p.len >= PIPE_BUFFER)
+                    .unwrap_or(false)
+            };
+            if !still_block {
+                continue;
+            }
             task::block_current();
             continue;
         }
@@ -231,6 +242,17 @@ pub fn read(id: usize, buf: &mut [u8]) -> Result<usize, Error> {
             return Ok(0);
         }
         if block {
+            let still_block = {
+                let table = TABLE.lock();
+                table
+                    .pipes
+                    .get(id)
+                    .map(|p| p.occupied && p.len == 0 && p.writers > 0)
+                    .unwrap_or(false)
+            };
+            if !still_block {
+                continue;
+            }
             task::block_current();
             continue;
         }
