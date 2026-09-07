@@ -513,8 +513,9 @@ pub fn open(path: &str) -> Result<OpenFileId, Error> {
         .iter()
         .position(|node| node.matches(path) && node.kind == NodeKind::File)
         .ok_or(Error::NotFound)?;
+    let mut open_files = OPEN_FILES.lock();
     drop(registry);
-    OPEN_FILES.lock().alloc(node)
+    open_files.alloc(node)
 }
 
 /// Increase the reference count of an existing open-file description.

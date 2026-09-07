@@ -4,6 +4,7 @@
 //! the current task's capability set) and operates directly on the VFS,
 //! scheduler, and hardware status helpers.
 
+use spin::Once;
 use crate::{
     benchmark, capability::Capability, console::Console, heap, keyboard::Key, memory, paging,
     device, storage, syscall, task, terminal, timer, userspace, vfs, virtio_net, network,
@@ -42,11 +43,10 @@ impl ShellState {
     }
 }
 
-static mut STATE: ShellState = ShellState::new();
+static STATE: Once<spin::Mutex<ShellState>> = Once::new();
 
-fn state() -> &'static mut ShellState {
-    // SAFETY: console shell is driven from a single kernel task.
-    unsafe { &mut *core::ptr::addr_of_mut!(STATE) }
+fn state() -> spin::MutexGuard<'static, ShellState> {
+    STATE.call_once(|| spin::Mutex::new(ShellState::new())).lock()
 }
 
 pub struct Shell {
@@ -174,8 +174,10 @@ impl Shell {
             }
             "ls" => {
                 if authorize(Capability::FileRead, console) {
+                    let path_buf;
                     let path = if arg.is_empty() {
-                        state().cwd_str()
+                        path_buf = alloc::string::String::from(state().cwd_str());
+                        path_buf.as_str()
                     } else {
                         arg
                     };
@@ -658,6 +660,8 @@ fn cmd_heap(console: &mut Console<'_>) {
     print_u64(console, stats.size as u64);
     console.print("  used: ");
     print_u64(console, stats.allocated_bytes as u64);
+    console.print("  free: ");
+    print_u64(console, stats.free_bytes as u64);
     console.print("  allocs: ");
     print_u64(console, stats.allocations as u64);
     console.newline();
@@ -926,7 +930,7 @@ fn cmd_userland_command(verb: &str, arg: &str, console: &mut Console<'_>) -> boo
     if vfs::stat(&path).is_err() {
         return false;
     }
-    let mut image = [0u8; vfs::NODE_CAPACITY];
+    let mut image = alloc::vec![0u8; vfs::NODE_CAPACITY];
     let Ok(len) = vfs::read_all(&path, &mut image) else {
         console.println("command: read failed");
         return true;
@@ -968,7 +972,7 @@ fn cmd_run(path: &str, console: &mut Console<'_>) {
             return;
         }
     }
-    let mut image = [0u8; vfs::NODE_CAPACITY];
+    let mut image = alloc::vec![0u8; vfs::NODE_CAPACITY];
     let Ok(len) = vfs::read_all(&path, &mut image) else {
         console.println("run: read failed");
         return;
@@ -1086,13 +1090,13 @@ fn shell_resolve(path: &str) -> Option<alloc::string::String> {
     let absolute = if path.starts_with('/') {
         alloc::string::String::from(path)
     } else {
-        let cwd = state().cwd_str();
+        let cwd = alloc::string::String::from(state().cwd_str());
         let mut joined = alloc::string::String::new();
         if cwd == "/" {
             joined.push('/');
             joined.push_str(path);
         } else {
-            joined.push_str(cwd);
+            joined.push_str(&cwd);
             joined.push('/');
             joined.push_str(path);
         }
