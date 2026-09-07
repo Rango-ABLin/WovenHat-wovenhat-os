@@ -50,6 +50,40 @@ impl<'a> Console<'a> {
         self.cursor_y = 40;
     }
 
+    fn ensure_room(&mut self) {
+        let line_height = 9 * self.scale;
+        if self.cursor_y + 8 * self.scale < self.info.height {
+            return;
+        }
+        self.scroll(line_height);
+        self.cursor_y = self.cursor_y.saturating_sub(line_height);
+    }
+
+    fn scroll(&mut self, rows: usize) {
+        if rows == 0 || rows >= self.info.height || self.info.bytes_per_pixel == 0 {
+            self.clear();
+            return;
+        }
+        let row_bytes = self.info.stride.saturating_mul(self.info.bytes_per_pixel);
+        let move_bytes = (self.info.height - rows).saturating_mul(row_bytes);
+        let src_offset = rows.saturating_mul(row_bytes);
+        if src_offset + move_bytes > self.buffer.len() {
+            return;
+        }
+        unsafe {
+            core::ptr::copy(
+                self.buffer[src_offset..].as_ptr(),
+                self.buffer[..move_bytes].as_mut_ptr(),
+                move_bytes,
+            );
+        }
+        for y in self.info.height - rows..self.info.height {
+            for x in 0..self.info.width {
+                self.pixel(x, y, BG_R, BG_G, BG_B);
+            }
+        }
+    }
+
     pub fn print(&mut self, text: &str) {
         for c in text.chars() {
             self.put_char(c);
@@ -66,6 +100,7 @@ impl<'a> Console<'a> {
             self.newline();
             return;
         }
+        self.ensure_room();
 
         self.draw_char(self.cursor_x, self.cursor_y, character);
 
@@ -78,7 +113,8 @@ impl<'a> Console<'a> {
 
     pub fn newline(&mut self) {
         self.cursor_x = self.start_x;
-        self.cursor_y += 9 * self.scale;
+        self.cursor_y = self.cursor_y.saturating_add(9 * self.scale);
+        self.ensure_room();
     }
 
     pub fn cursor_position(&self) -> (usize, usize) {
@@ -141,7 +177,11 @@ impl<'a> Console<'a> {
             return;
         }
 
-        let offset = (y * self.info.stride + x) * self.info.bytes_per_pixel;
+        let offset = y
+            .checked_mul(self.info.stride)
+            .and_then(|v| v.checked_add(x))
+            .and_then(|v| v.checked_mul(self.info.bytes_per_pixel))
+            .unwrap_or(usize::MAX);
 
         if offset + self.info.bytes_per_pixel > self.buffer.len() {
             return;
