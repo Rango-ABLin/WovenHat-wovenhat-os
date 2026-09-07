@@ -66,3 +66,12 @@ disk page loading until it is persisted and imported from disk.
   rename also returned the correct contents.
 - Target-specific Clippy still reports the same 16 existing errors elsewhere;
   no diagnostics in page_cache.rs, storage.rs, or vfs.rs. `git diff --check` passed.
+
+
+Follow-up: read-only private file snapshots are now available via syscall 58;
+see `file-mmap.md`. Syscalls 60/61 now load private pages on first access.
+FAT32 faults use the file-page cache; shared writable mappings and msync are now available through 62/63.
+
+Physical mapping aliases now use file_frames.rs with reference-counted frames,
+shared write coherence, and unpinned LRU reclamation. The original FAT32 byte
+cache remains below the backing loader. See file-mmap.md for current limits.

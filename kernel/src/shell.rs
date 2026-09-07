@@ -4,11 +4,11 @@
 //! the current task's capability set) and operates directly on the VFS,
 //! scheduler, and hardware status helpers.
 
-use spin::Once;
 use crate::{
-    benchmark, capability::Capability, console::Console, heap, keyboard::Key, memory, paging,
-    device, storage, syscall, task, terminal, timer, userspace, vfs, virtio_net, network,
+    benchmark, capability::Capability, console::Console, device, heap, keyboard::Key, memory,
+    network, paging, storage, syscall, task, terminal, timer, userspace, vfs, virtio_net,
 };
+use spin::Once;
 
 const PROMPT_PREFIX: &str = "wovenhat:";
 const COMMAND_CAPACITY: usize = 128;
@@ -46,7 +46,9 @@ impl ShellState {
 static STATE: Once<spin::Mutex<ShellState>> = Once::new();
 
 fn state() -> spin::MutexGuard<'static, ShellState> {
-    STATE.call_once(|| spin::Mutex::new(ShellState::new())).lock()
+    STATE
+        .call_once(|| spin::Mutex::new(ShellState::new()))
+        .lock()
 }
 
 pub struct Shell {
@@ -250,14 +252,23 @@ impl Shell {
                     console.println(state().cwd_str());
                 }
             }
+            "msynctest" => {
+                if authorize(Capability::FileRead, console) && authorize(Capability::FileWrite, console) {
+                    let passed = userspace::shared_disk_mmap_self_test() && userspace::disk_unlink_mmap_self_test();
+                    console.println(if passed { "MSYNC DISK: PASS" } else { "MSYNC DISK: FAIL (check ATA disk or existing /mnt/vmsync.txt)" });
+                    crate::serial::write_line(format_args!("[MSYNC DISK] {}", if passed { "PASSED" } else { "FAILED" }));
+                }
+            }
             "mmaptest" => {
                 if authorize(Capability::FileRead, console)
                     && authorize(Capability::TaskControl, console)
                     && authorize(Capability::ProcessCreate, console)
                 {
                     if ensure_program("/bin/mmaptest", userspace::install_file_mmap_test) {
-                        cmd_run("/bin/mmaptest", console);
-                    } else { console.println("mmaptest: install failed"); }
+                        cmd_run("/bin/mmaptest", console, true);
+                    } else {
+                        console.println("mmaptest: install failed");
+                    }
                 }
             }
             "run" => {
@@ -267,7 +278,7 @@ impl Shell {
                     if arg.is_empty() {
                         console.println("usage: run <path>");
                     } else {
-                        cmd_run(arg, console);
+                        cmd_run(arg, console, false);
                     }
                 }
             }
@@ -350,7 +361,7 @@ fn print_help(console: &mut Console<'_>) {
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
     console.println("         rename|mv <old> <new>");
-    console.println("test:    mmaptest (read-only private file mappings)");
+    console.println("test:    mmaptest (private/shared mappings, fork, msync), msynctest (disk)");
     console.println("nav:     cd [path]  pwd  echo <text>");
     console.println("process: run <elf>  sh  init  spawn  user|ring3  kill <pid> [sig]");
     console.println("runtime: userland udpecho [port] dhcp <on|off>   (Stage 9 runtime)");
@@ -431,28 +442,47 @@ fn cmd_net(console: &mut Console<'_>) {
 
     let stats = virtio_net::stats();
     console.print("transport: ");
-    console.println(if stats.initialized { "legacy virtqueue DMA online" } else { "not initialized" });
+    console.println(if stats.initialized {
+        "legacy virtqueue DMA online"
+    } else {
+        "not initialized"
+    });
     if !stats.initialized {
         console.println("QEMU: -device virtio-net-pci,netdev=net0,disable-modern=on");
         console.println("      -netdev user,id=net0");
         return;
     }
     console.print("smoltcp: ");
-    console.println(if network::initialized() { "online" } else { "offline" });
+    console.println(if network::initialized() {
+        "online"
+    } else {
+        "offline"
+    });
     let info = network::net_info();
-    console.print("ipv4: "); print_ipv4(console, info.ipv4);
-    console.print("/"); print_u64(console, info.prefix as u64);
-    console.print("  gateway: "); print_ipv4(console, info.gateway);
-    console.print("  dns: "); print_ipv4(console, info.dns);
+    console.print("ipv4: ");
+    print_ipv4(console, info.ipv4);
+    console.print("/");
+    print_u64(console, info.prefix as u64);
+    console.print("  gateway: ");
+    print_ipv4(console, info.gateway);
+    console.print("  dns: ");
+    print_ipv4(console, info.dns);
     console.print("  config: ");
-    console.println(if info.using_dhcp != 0 { "dhcp" } else { "static-fallback" });
-    console.print("rx="); print_u64(console, stats.rx_frames);
-    console.print(" tx="); print_u64(console, stats.tx_frames);
-    console.print(" rx_drop="); print_u64(console, stats.rx_dropped);
-    console.print(" tx_busy="); print_u64(console, stats.tx_busy);
+    console.println(if info.using_dhcp != 0 {
+        "dhcp"
+    } else {
+        "static-fallback"
+    });
+    console.print("rx=");
+    print_u64(console, stats.rx_frames);
+    console.print(" tx=");
+    print_u64(console, stats.tx_frames);
+    console.print(" rx_drop=");
+    print_u64(console, stats.rx_dropped);
+    console.print(" tx_busy=");
+    print_u64(console, stats.tx_busy);
     console.newline();
 }
-
 
 fn cmd_netstat(console: &mut Console<'_>) {
     let stats = network::stats();
@@ -468,20 +498,31 @@ fn cmd_netstat(console: &mut Console<'_>) {
     } else {
         console.println("stopped");
     }
-    console.print("userspace sockets: "); print_u64(console, stats.user_sockets as u64); console.newline();
+    console.print("userspace sockets: ");
+    print_u64(console, stats.user_sockets as u64);
+    console.newline();
     console.print("dhcp: ");
     if stats.dhcp_enabled {
-        console.println(if stats.using_dhcp { "lease active" } else { "discovering / static fallback" });
+        console.println(if stats.using_dhcp {
+            "lease active"
+        } else {
+            "discovering / static fallback"
+        });
     } else {
         console.println("disabled (static fallback)");
     }
 }
 
 fn cmd_udpecho(arg: &str, console: &mut Console<'_>) {
-    let port = if arg.trim().is_empty() { 7 } else {
+    let port = if arg.trim().is_empty() {
+        7
+    } else {
         match arg.trim().parse::<u16>() {
             Ok(port) if port != 0 => port,
-            _ => { console.println("usage: udpecho [1..65535]"); return; }
+            _ => {
+                console.println("usage: udpecho [1..65535]");
+                return;
+            }
         }
     };
     match network::start_udp_echo(port) {
@@ -491,7 +532,9 @@ fn cmd_udpecho(arg: &str, console: &mut Console<'_>) {
             console.newline();
         }
         Err(network::EchoError::NetworkOffline) => console.println("udpecho: network offline"),
-        Err(network::EchoError::AlreadyConfigured) => console.println("udpecho: already listening on another port"),
+        Err(network::EchoError::AlreadyConfigured) => {
+            console.println("udpecho: already listening on another port")
+        }
         Err(_) => console.println("udpecho: start failed"),
     }
 }
@@ -499,7 +542,8 @@ fn cmd_udpecho(arg: &str, console: &mut Console<'_>) {
 fn cmd_dhcp(arg: &str, console: &mut Console<'_>) {
     match arg.trim() {
         "on" | "enable" | "1" => match network::set_dhcp(true) {
-            Ok(()) => console.println("dhcp: enabled; static configuration remains until a lease is acquired"),
+            Ok(()) => console
+                .println("dhcp: enabled; static configuration remains until a lease is acquired"),
             Err(_) => console.println("dhcp: network offline"),
         },
         "off" | "disable" | "0" => match network::set_dhcp(false) {
@@ -511,9 +555,12 @@ fn cmd_dhcp(arg: &str, console: &mut Console<'_>) {
 }
 
 fn print_ipv4(console: &mut Console<'_>, ip: [u8; 4]) {
-    print_u64(console, ip[0] as u64); console.print(".");
-    print_u64(console, ip[1] as u64); console.print(".");
-    print_u64(console, ip[2] as u64); console.print(".");
+    print_u64(console, ip[0] as u64);
+    console.print(".");
+    print_u64(console, ip[1] as u64);
+    console.print(".");
+    print_u64(console, ip[2] as u64);
+    console.print(".");
     print_u64(console, ip[3] as u64);
 }
 
@@ -523,18 +570,28 @@ fn cmd_persist(arg: &str, console: &mut Console<'_>) {
         console.println("usage: persist </mnt/path>");
         return;
     }
-    let Some(path) = shell_resolve(arg) else { console.println("persist: bad path"); return; };
+    let Some(path) = shell_resolve(arg) else {
+        console.println("persist: bad path");
+        return;
+    };
     let result = match vfs::stat(&path) {
         Ok(stat) if stat.kind == vfs::NodeKind::Directory => storage::persist_directory(&path),
         Ok(_) => storage::persist_path(&path),
-        Err(_) => { console.println("persist: not found"); return; }
+        Err(_) => {
+            console.println("persist: not found");
+            return;
+        }
     };
     match result {
         Ok(()) => console.println("persist: written to FAT32"),
-        Err(storage::PersistError::NotSupported) => console.println("persist: path must be under /mnt"),
+        Err(storage::PersistError::NotSupported) => {
+            console.println("persist: path must be under /mnt")
+        }
         Err(storage::PersistError::NoDevice) => console.println("persist: no ATA disk"),
         Err(storage::PersistError::BadName) => console.println("persist: FAT 8.3 path required"),
-        Err(storage::PersistError::TooLarge) => console.println("persist: no space or file too large"),
+        Err(storage::PersistError::TooLarge) => {
+            console.println("persist: no space or file too large")
+        }
         Err(_) => console.println("persist: write failed"),
     }
 }
@@ -602,10 +659,30 @@ fn cmd_userland(console: &mut Console<'_>) {
     } else {
         console.println("userland: one or more built-in programs failed to install");
         const EXPECTED: [&str; 24] = [
-            "/bin/selftest", "/bin/init", "/bin/sh", "/bin/echo",
-            "/bin/true", "/bin/false", "/bin/cat", "/bin/ls",
-            "/bin/sleep", "/bin/pwd", "/bin/mkdir", "/bin/rm",
-            "/bin/ip", "/bin/netstat", "/bin/dns", "/bin/udp", "/bin/nc", "/bin/ping", "/bin/env", "/bin/en", "/bin/ps", "/bin/uptime", "/bin/tcpd", "/bin/bin",
+            "/bin/selftest",
+            "/bin/init",
+            "/bin/sh",
+            "/bin/echo",
+            "/bin/true",
+            "/bin/false",
+            "/bin/cat",
+            "/bin/ls",
+            "/bin/sleep",
+            "/bin/pwd",
+            "/bin/mkdir",
+            "/bin/rm",
+            "/bin/ip",
+            "/bin/netstat",
+            "/bin/dns",
+            "/bin/udp",
+            "/bin/nc",
+            "/bin/ping",
+            "/bin/env",
+            "/bin/en",
+            "/bin/ps",
+            "/bin/uptime",
+            "/bin/tcpd",
+            "/bin/bin",
         ];
         for path in EXPECTED {
             if vfs::stat(path).is_err() {
@@ -730,24 +807,36 @@ fn cmd_bench(console: &mut Console<'_>) {
 
 fn cmd_fs(console: &mut Console<'_>) {
     if let Some(stats) = crate::ata::with_primary_master(|disk| disk.stats()) {
-        console.print("buffer cache: hits="); print_u64(console, stats.hits);
-        console.print(" misses="); print_u64(console, stats.misses);
-        console.print(" writebacks="); print_u64(console, stats.writebacks);
-        console.print(" evictions="); print_u64(console, stats.evictions);
+        console.print("buffer cache: hits=");
+        print_u64(console, stats.hits);
+        console.print(" misses=");
+        print_u64(console, stats.misses);
+        console.print(" writebacks=");
+        print_u64(console, stats.writebacks);
+        console.print(" evictions=");
+        print_u64(console, stats.evictions);
         console.newline();
-        console.print("sectors: resident="); print_u64(console, stats.resident as u64);
-        console.print(" dirty="); print_u64(console, stats.dirty as u64);
-        console.print(" capacity="); print_u64(console, stats.capacity as u64);
+        console.print("sectors: resident=");
+        print_u64(console, stats.resident as u64);
+        console.print(" dirty=");
+        print_u64(console, stats.dirty as u64);
+        console.print(" capacity=");
+        print_u64(console, stats.capacity as u64);
         console.newline();
     } else {
         console.println("buffer cache: no ATA device");
     }
     let pages = storage::page_cache_stats();
-    console.print("file pages: hits="); print_u64(console, pages.hits);
-    console.print(" misses="); print_u64(console, pages.misses);
-    console.print(" evictions="); print_u64(console, pages.evictions);
-    console.print(" resident="); print_u64(console, pages.resident as u64);
-    console.print(" capacity="); print_u64(console, pages.capacity as u64);
+    console.print("file pages: hits=");
+    print_u64(console, pages.hits);
+    console.print(" misses=");
+    print_u64(console, pages.misses);
+    console.print(" evictions=");
+    print_u64(console, pages.evictions);
+    console.print(" resident=");
+    print_u64(console, pages.resident as u64);
+    console.print(" capacity=");
+    print_u64(console, pages.capacity as u64);
     console.newline();
     console.print("vfs nodes: ");
     print_u64(console, vfs::node_count() as u64);
@@ -914,7 +1003,9 @@ fn cmd_rename(args: &str, console: &mut Console<'_>) {
     };
     match vfs::rename(&old, &new) {
         Ok(()) => console.println("renamed"),
-        Err(vfs::Error::NotFound) => console.println("rename: source or destination parent missing"),
+        Err(vfs::Error::NotFound) => {
+            console.println("rename: source or destination parent missing")
+        }
         Err(vfs::Error::AlreadyExists) => console.println("rename: destination exists"),
         Err(vfs::Error::InvalidPath) => console.println("rename: invalid path or destination"),
         Err(vfs::Error::ReadOnly) => console.println("rename: refused"),
@@ -1021,7 +1112,7 @@ fn cmd_userland_command(verb: &str, arg: &str, console: &mut Console<'_>) -> boo
     true
 }
 
-fn cmd_run(path: &str, console: &mut Console<'_>) {
+fn cmd_run(path: &str, console: &mut Console<'_>, foreground: bool) {
     let Some(path) = shell_resolve(path) else {
         console.println("run: bad path");
         return;
@@ -1041,8 +1132,22 @@ fn cmd_run(path: &str, console: &mut Console<'_>) {
         console.println("run: elf load failed");
         return;
     };
+    if foreground {
+        let (x, y) = console.cursor_position();
+        terminal::set_cursor_position(x, y);
+    }
     match task::spawn_user_process("run", program) {
         Ok((id, context)) => {
+            if foreground {
+                terminal::set_foreground(id.as_u64());
+                while !task::process_exited(id) {
+                    task::yield_now();
+                }
+                let (x, y) = terminal::cursor_position();
+                console.set_cursor_position(x, y);
+                let _ = task::wait_process(id.as_u64());
+                return;
+            }
             console.print("running pid=");
             print_u64(console, id.as_u64());
             console.print(" entry=");
@@ -1104,7 +1209,8 @@ fn cmd_sh(console: &mut Console<'_>) {
 
 fn serial_user_shell_start(pid: u64, entry: u64) {
     crate::serial::write_line(format_args!(
-        "[TTY] userspace shell foreground pid={} entry={:#x}", pid, entry
+        "[TTY] userspace shell foreground pid={} entry={:#x}",
+        pid, entry
     ));
 }
 

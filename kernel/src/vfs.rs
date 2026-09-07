@@ -118,6 +118,8 @@ impl DirEntry {
 }
 
 struct Registry {
+    versions: [u64; MAX_NODES],
+    generations: [u64; MAX_NODES],
     nodes: [Node; MAX_NODES],
 }
 
@@ -133,12 +135,14 @@ impl Registry {
         nodes[5] = Node::with_data(b"/etc/motd", b"Welcome to WovenHat OS.\n", false);
         nodes[6] = Node::with_data(b"/etc/version", b"WovenHat kernel 0.7.0 Stage 9\n", false);
         nodes[7] = Node::with_data(b"/tmp/vfs-self-test", b"", true);
-        Self { nodes }
+        Self { nodes, versions: [0; MAX_NODES], generations: [0; MAX_NODES] }
     }
 
     const fn empty() -> Self {
         Self {
             nodes: [Node::empty(); MAX_NODES],
+            versions: [0; MAX_NODES],
+            generations: [0; MAX_NODES],
         }
     }
 
@@ -204,7 +208,7 @@ impl Registry {
     }
 
     fn count(&self) -> usize {
-        self.nodes.iter().filter(|node| node.occupied).count()
+        self.nodes.iter().filter(|node| node.occupied && node.path_length != 0).count()
     }
 
     fn remove(&mut self, path: &str) -> Result<(), Error> {
@@ -227,7 +231,15 @@ impl Registry {
                 }
             }
         }
-        self.nodes[index] = Node::empty();
+        self.generations[index] = self.generations[index].checked_add(1).ok_or(Error::Full)?;
+        let node = &mut self.nodes[index];
+        node.occupied = false;
+        node.path_length = 0;
+        node.length = 0;
+        node.backing = None;
+        node.writable = false;
+        node.data.fill(0);
+        node.path.fill(0);
         Ok(())
     }
 
@@ -295,6 +307,8 @@ impl Registry {
             }
             node.data[..data.len()].copy_from_slice(data);
             node.length = data.len();
+            self.versions[index] = self.versions[index].wrapping_add(1);
+            crate::file_frames::replace(index, self.generations[index], data);
             return Ok(());
         }
         // Create new writable file (parent must exist).
@@ -424,6 +438,7 @@ pub struct OpenFileId(usize);
 
 struct OpenFileDescription {
     node: usize,
+    generation: u64,
     offset: usize,
     refcount: u32,
     occupied: bool,
@@ -433,6 +448,7 @@ impl OpenFileDescription {
     const fn empty() -> Self {
         Self {
             node: 0,
+            generation: 0,
             offset: 0,
             refcount: 0,
             occupied: false,
@@ -451,7 +467,7 @@ impl OpenFileTable {
         }
     }
 
-    fn alloc(&mut self, node: usize) -> Result<OpenFileId, Error> {
+    fn alloc(&mut self, node: usize, generation: u64) -> Result<OpenFileId, Error> {
         let slot = self
             .entries
             .iter()
@@ -459,6 +475,7 @@ impl OpenFileTable {
             .ok_or(Error::Full)?;
         self.entries[slot] = OpenFileDescription {
             node,
+            generation,
             offset: 0,
             refcount: 1,
             occupied: true,
@@ -475,7 +492,7 @@ impl OpenFileTable {
 
     fn clone_id(&mut self, id: OpenFileId) -> Result<OpenFileId, Error> {
         let entry = self.get_mut(id)?;
-        entry.refcount = entry.refcount.saturating_add(1);
+        entry.refcount = entry.refcount.checked_add(1).ok_or(Error::Full)?;
         Ok(id)
     }
 
@@ -545,7 +562,20 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), Error> {
 
 /// Remove a file or empty directory.
 pub fn remove(path: &str) -> Result<(), Error> {
-    REGISTRY.lock().remove(path)
+    validate_absolute_path(path)?;
+    let files = OPEN_FILES.lock();
+    let mut registry = REGISTRY.lock();
+    let index = registry.nodes.iter().position(|node| node.matches(path)).ok_or(Error::NotFound)?;
+    if registry.nodes[index].kind == NodeKind::File
+        && files.entries.iter().any(|entry| entry.occupied && entry.node == index) {
+        // FAT32 backing is path-based. Preserve its bytes before releasing the
+        // name so persisting a replacement cannot redirect an older open inode.
+        materialize_disk_node(&mut registry.nodes[index])?;
+        // An unnamed occupied node remains addressable through its open references.
+        registry.nodes[index].path_length = 0;
+        registry.nodes[index].path.fill(0);
+        Ok(())
+    } else { registry.remove(path) }
 }
 
 pub fn rename(old: &str, new: &str) -> Result<(), Error> {
@@ -571,15 +601,16 @@ pub fn readdir(path: &str, index: usize) -> Result<DirEntry, Error> {
 /// Directories cannot be opened for read/write; use `readdir` / `stat` instead.
 pub fn open(path: &str) -> Result<OpenFileId, Error> {
     validate_absolute_path(path)?;
+    let mut open_files = OPEN_FILES.lock();
     let registry = REGISTRY.lock();
     let node = registry
         .nodes
         .iter()
         .position(|node| node.matches(path) && node.kind == NodeKind::File)
         .ok_or(Error::NotFound)?;
-    let mut open_files = OPEN_FILES.lock();
+    let generation = registry.generations[node];
     drop(registry);
-    open_files.alloc(node)
+    open_files.alloc(node, generation)
 }
 
 /// Increase the reference count of an existing open-file description.
@@ -590,7 +621,89 @@ pub fn clone_open_file(id: OpenFileId) -> Result<OpenFileId, Error> {
 
 /// Decrease the reference count. Frees the description when it reaches zero.
 pub fn close_open_file(id: OpenFileId) -> Result<(), Error> {
-    OPEN_FILES.lock().drop_id(id)
+    let mut files = OPEN_FILES.lock();
+    let node = files.get_mut(id)?.node;
+    files.drop_id(id)?;
+    if !files.entries.iter().any(|entry| entry.occupied && entry.node == node) {
+        let mut registry = REGISTRY.lock();
+        if registry.nodes[node].occupied && registry.nodes[node].path_length == 0 {
+            registry.generations[node] = registry.generations[node].checked_add(1).ok_or(Error::Full)?;
+            registry.nodes[node].occupied = false;
+            registry.nodes[node].length = 0;
+            registry.nodes[node].backing = None;
+            registry.nodes[node].data.fill(0);
+        }
+    }
+    Ok(())
+}
+
+/// Capture node identity so a lazy fault cannot read a reused VFS slot.
+pub fn file_identity(id: OpenFileId) -> Result<(usize, u64, u64), Error> {
+    let mut table = OPEN_FILES.lock();
+    let entry = table.get_mut(id)?;
+    let registry = REGISTRY.lock();
+    if !registry.nodes[entry.node].occupied || registry.generations[entry.node] != entry.generation { return Err(Error::InvalidDescriptor); }
+    Ok((entry.node, entry.generation, registry.versions[entry.node]))
+}
+fn materialize_disk_node(node: &mut Node) -> Result<(), Error> {
+    if let Some(backing) = node.backing {
+        let count = crate::task::file_fault_io(|| crate::storage::read_disk_file(backing.as_str(), 0, &mut node.data[..node.length])).map_err(|_| Error::Io)?;
+        if count != node.length { return Err(Error::Io); }
+        node.backing = None;
+    }
+    Ok(())
+}
+/// Writable shared disk mappings keep a RAM inode image for bounded writeback.
+/// The capability check is performed by the syscall before reaching this API.
+pub fn prepare_shared_file(id: OpenFileId) -> Result<(), Error> {
+    let mut table = OPEN_FILES.lock();
+    let entry = table.get_mut(id)?;
+    let mut registry = REGISTRY.lock();
+    let node = &mut registry.nodes[entry.node];
+    if !node.occupied { return Err(Error::InvalidDescriptor); }
+    if !node.writable {
+        if node.backing.is_none() { return Err(Error::ReadOnly); }
+        materialize_disk_node(node)?;
+        node.writable = true;
+    }
+    Ok(())
+}
+pub fn write_mapping_at(id: OpenFileId, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+    let mut table = OPEN_FILES.lock();
+    let entry = table.get_mut(id)?;
+    let mut registry = REGISTRY.lock();
+    let node = &mut registry.nodes[entry.node];
+    if !node.occupied || !node.writable { return Err(Error::ReadOnly); }
+    if offset.checked_add(bytes.len()).is_none_or(|end| end > node.length) { return Err(Error::Full); }
+    node.data[offset..offset+bytes.len()].copy_from_slice(bytes);
+    registry.versions[entry.node] = registry.versions[entry.node].wrapping_add(1);
+    crate::file_frames::update(entry.node, entry.generation, offset, bytes);
+    Ok(())
+}
+pub fn persist_mapping(id: OpenFileId) -> Result<(), Error> {
+    let mut path = [0; PATH_CAPACITY];
+    let length = {
+        let mut files = OPEN_FILES.lock();
+        let entry = files.get_mut(id)?;
+        let registry = REGISTRY.lock();
+        let node = &registry.nodes[entry.node];
+        path[..node.path_length].copy_from_slice(&node.path[..node.path_length]);
+        node.path_length
+    };
+    let path = core::str::from_utf8(&path[..length]).map_err(|_| Error::InvalidPath)?;
+    if path.starts_with("/mnt/") { crate::storage::persist_path(path).map_err(|_| Error::Io)?; }
+    Ok(())
+}
+
+pub fn file_generation(id: OpenFileId) -> Result<u64, Error> {
+    let mut table = OPEN_FILES.lock();
+    let entry = table.get_mut(id)?;
+    let registry = REGISTRY.lock();
+    if !registry.nodes[entry.node].occupied || registry.generations[entry.node] != entry.generation { return Err(Error::InvalidDescriptor); }
+    Ok(entry.generation)
+}
+pub fn read_mapping_at(id: OpenFileId, generation: u64, offset: usize, buffer: &mut [u8]) -> Result<usize, Error> {
+    read_from(id, Some(offset), buffer, Some(generation))
 }
 
 pub fn file_size(id: OpenFileId) -> Result<usize, Error> {
@@ -602,20 +715,21 @@ pub fn file_size(id: OpenFileId) -> Result<usize, Error> {
 
 /// Positional reads do not alter the shared open-file offset.
 pub fn read_at(id: OpenFileId, offset: usize, buffer: &mut [u8]) -> Result<usize, Error> {
-    read_from(id, Some(offset), buffer)
+    read_from(id, Some(offset), buffer, None)
 }
 
 pub fn read(id: OpenFileId, buffer: &mut [u8]) -> Result<usize, Error> {
-    read_from(id, None, buffer)
+    read_from(id, None, buffer, None)
 }
 
-fn read_from(id: OpenFileId, position: Option<usize>, buffer: &mut [u8]) -> Result<usize, Error> {
+fn read_from(id: OpenFileId, position: Option<usize>, buffer: &mut [u8], generation: Option<u64>) -> Result<usize, Error> {
     let mut table = OPEN_FILES.lock();
     let entry = table.get_mut(id)?;
     let node_index = entry.node;
     let offset = position.unwrap_or(entry.offset);
 
     let registry = REGISTRY.lock();
+    if generation.is_some_and(|value| registry.generations[node_index] != value) { return Err(Error::InvalidDescriptor); }
     let node = registry
         .nodes
         .get(node_index)
@@ -635,32 +749,21 @@ fn read_from(id: OpenFileId, position: Option<usize>, buffer: &mut [u8]) -> Resu
         drop(registry);
     }
 
+    crate::file_frames::overlay(node_index, entry.generation, offset, &mut buffer[..count]);
     let entry = table.get_mut(id)?;
     if position.is_none() { entry.offset = offset + count; }
     Ok(count)
 }
 
 pub fn read_all(path: &str, buffer: &mut [u8]) -> Result<usize, Error> {
-    validate_absolute_path(path)?;
-    let registry = REGISTRY.lock();
-    let node = registry
-        .nodes
-        .iter()
-        .find(|node| node.matches(path))
-        .ok_or(Error::NotFound)?;
-    if node.length > buffer.len() {
-        return Err(Error::Full);
-    }
-    let length = node.length;
-    if let Some(backing) = node.backing {
-        drop(registry);
-        let read = crate::storage::read_disk_file(backing.as_str(), 0, &mut buffer[..length])
-            .map_err(|_| Error::Io)?;
-        if read != length { return Err(Error::Io); }
-    } else {
-        buffer[..length].copy_from_slice(&node.data[..length]);
-    }
-    Ok(length)
+    let file = open(path)?;
+    let result = (|| {
+        let size = file_size(file)?;
+        if size > buffer.len() { return Err(Error::Full); }
+        read_at(file, 0, &mut buffer[..size])
+    })();
+    let _ = close_open_file(file);
+    result
 }
 
 pub fn seek(id: OpenFileId, offset: usize) -> Result<usize, Error> {
@@ -699,6 +802,8 @@ pub fn write(id: OpenFileId, buffer: &[u8]) -> Result<usize, Error> {
     let new_offset = offset + count;
     node.length = core::cmp::max(node.length, new_offset);
     let short_write = count < buffer.len();
+    registry.versions[node_index] = registry.versions[node_index].wrapping_add(1);
+    crate::file_frames::update(node_index, entry.generation, offset, &buffer[..count]);
     drop(registry);
 
     let entry = table.get_mut(id)?;

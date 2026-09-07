@@ -67,3 +67,33 @@ descriptor tables and do not overcommit memory.
 Fork uses copy-on-write page sharing; open-file descriptions are reference-counted so
 offsets are shared across parent and child. There is no `argv`/environment transfer yet.
 Directories are first-class VFS nodes; `stat`, `readdir`, and `mkdir` are available.
+
+
+## Read-only private file mapping
+
+Syscall 58 (`MmapFile`): fd, byte length, page-aligned file offset -> mapped
+address or `u64::MAX`. Length is 1–65536 bytes and must fit inside the file.
+The mapping is a read-only, NX private snapshot; syscall 9 unmaps it.
+Existing anonymous mmap (8) is unchanged. See `file-mmap.md` for the contract
+and run `mmaptest` in the diagnostic shell for the Ring-3 regression.
+
+Syscall 59 (`MmapFileWritable`) takes the same fd, length, and file-offset
+arguments as syscall 58. It creates a writable NX private snapshot; writes do
+not modify the file. FileRead capability is sufficient. Fork uses copy-on-write
+for these mappings. See `file-mmap.md` for bounds and lifecycle semantics.
+
+Demand paging: syscall 60 (`MmapFileLazy`, read-only) and 61
+(`MmapFileLazyWritable`, writable) take fd, length, and page-aligned offset.
+They reserve private NX mappings and populate pages on first access, including
+kernel buffer copies. The descriptor may be closed immediately. Absent pages
+read the backing file when faulted; these are not creation-time snapshots.
+Bounds and error sentinel match 58/59. See `file-mmap.md` for lifetime rules.
+
+Shared mappings: syscall 62 (`MmapFileShared`) takes fd, length, page-aligned
+offset and requires FileRead plus FileWrite. Length must be page aligned or
+end at EOF. Aliases and fork children share writable NX physical file pages.
+Syscall 63 (`Msync`) takes the mapping base and a length rounding to its full
+allocation, requires FileWrite, and returns zero or the error sentinel. It
+updates the RAM inode and persists named /mnt backing files through ATA flush.
+Unlink retains referenced inodes. See `file-mmap.md` for truncation, reclaim,
+writeback errors, and the current single-CPU concurrency boundary.

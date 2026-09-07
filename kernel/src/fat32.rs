@@ -417,8 +417,12 @@ pub fn read_file_at(
     offset: usize,
     buffer: &mut [u8],
 ) -> Result<usize, Error> {
-    let target = (entry.size as usize).saturating_sub(offset).min(buffer.len());
-    if target == 0 { return Ok(0); }
+    let target = (entry.size as usize)
+        .saturating_sub(offset)
+        .min(buffer.len());
+    if target == 0 {
+        return Ok(0);
+    }
     let mut cluster = entry.first_cluster;
     let mut visited = [0_u32; MAX_READ_CLUSTERS];
     let mut visited_count = 0;
@@ -426,15 +430,23 @@ pub fn read_file_at(
     let mut copied = 0;
     let mut sector = [0_u8; SECTOR_SIZE];
     while copied < target {
-        if visited_count == visited.len() { return Err(Error::ChainTooLong); }
-        if visited[..visited_count].contains(&cluster) { return Err(Error::ChainLoop); }
+        if visited_count == visited.len() {
+            return Err(Error::ChainTooLong);
+        }
+        if visited[..visited_count].contains(&cluster) {
+            return Err(Error::ChainLoop);
+        }
         visited[visited_count] = cluster;
         visited_count += 1;
         let cluster_lba = volume.cluster_lba(cluster)?;
         for sector_index in 0..volume.sectors_per_cluster as u64 {
-            if copied == target { break; }
+            if copied == target {
+                break;
+            }
             if position + SECTOR_SIZE > offset {
-                device.read_sector(cluster_lba + sector_index, &mut sector).map_err(Error::Block)?;
+                device
+                    .read_sector(cluster_lba + sector_index, &mut sector)
+                    .map_err(Error::Block)?;
                 let start = offset.saturating_sub(position);
                 let count = (SECTOR_SIZE - start).min(target - copied);
                 buffer[copied..copied + count].copy_from_slice(&sector[start..start + count]);
@@ -442,7 +454,9 @@ pub fn read_file_at(
             }
             position += SECTOR_SIZE;
         }
-        if copied == target { return Ok(copied); }
+        if copied == target {
+            return Ok(copied);
+        }
         cluster = match next_cluster(device, volume, cluster)? {
             ClusterLink::Next(next) => next,
             ClusterLink::End => return Err(Error::TruncatedFile),
@@ -619,7 +633,9 @@ pub fn create_file_in_directory(
                 entry_name.copy_from_slice(&sector[offset..offset + 11]);
                 if entry_name == short {
                     // Never replace a directory with file data.
-                    if attributes & 0x10 != 0 { return Err(Error::WriteFailed); }
+                    if attributes & 0x10 != 0 {
+                        return Err(Error::WriteFailed);
+                    }
                     // Overwrite existing file entry.
                     let high = read_u16(&sector, offset + 20) as u32;
                     let low = read_u16(&sector, offset + 26) as u32;
@@ -736,7 +752,11 @@ pub fn create_file_in_directory(
         }
     }
     write_u16(&mut sector, slot_offset + 20, (first_cluster >> 16) as u16);
-    write_u16(&mut sector, slot_offset + 26, (first_cluster & 0xffff) as u16);
+    write_u16(
+        &mut sector,
+        slot_offset + 26,
+        (first_cluster & 0xffff) as u16,
+    );
     write_u32(&mut sector, slot_offset + 28, data.len() as u32);
     device
         .write_sector(slot_sector_lba, &sector)
@@ -746,7 +766,6 @@ pub fn create_file_in_directory(
     Ok(())
 }
 
-
 fn resolve_parent_cluster(
     device: &mut impl BlockDevice,
     volume: Volume,
@@ -754,18 +773,28 @@ fn resolve_parent_cluster(
     create_missing: bool,
 ) -> Result<(u32, [u8; 13], usize), Error> {
     let path = path.trim_matches('/');
-    if path.is_empty() { return Err(Error::NameTooLong); }
+    if path.is_empty() {
+        return Err(Error::NameTooLong);
+    }
     let mut parts = [""; 16];
     let mut count = 0usize;
     for part in path.split('/') {
-        if part.is_empty() || part == "." { continue; }
-        if part == ".." || count == parts.len() { return Err(Error::NameTooLong); }
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || count == parts.len() {
+            return Err(Error::NameTooLong);
+        }
         parts[count] = part;
         count += 1;
     }
-    if count == 0 { return Err(Error::NameTooLong); }
+    if count == 0 {
+        return Err(Error::NameTooLong);
+    }
     let leaf = parts[count - 1];
-    if encode_short_name(leaf).is_none() { return Err(Error::NameTooLong); }
+    if encode_short_name(leaf).is_none() {
+        return Err(Error::NameTooLong);
+    }
     let mut leaf_buf = [0u8; 13];
     leaf_buf[..leaf.len()].copy_from_slice(leaf.as_bytes());
 
@@ -800,8 +829,12 @@ fn find_directory_slot(
     let mut deleted: Option<(u64, usize)> = None;
     let mut sector = [0u8; SECTOR_SIZE];
     loop {
-        if visited_count == visited.len() { return Err(Error::ChainTooLong); }
-        if visited[..visited_count].contains(&cluster) { return Err(Error::ChainLoop); }
+        if visited_count == visited.len() {
+            return Err(Error::ChainTooLong);
+        }
+        if visited[..visited_count].contains(&cluster) {
+            return Err(Error::ChainLoop);
+        }
         visited[visited_count] = cluster;
         visited_count += 1;
         let base = volume.cluster_lba(cluster)?;
@@ -812,26 +845,44 @@ fn find_directory_slot(
                 let off = i * DIRECTORY_ENTRY_SIZE;
                 let first = sector[off];
                 if first == 0 {
-                    let (l,o) = deleted.unwrap_or((lba, off));
-                    return Ok((l,o,None));
+                    let (l, o) = deleted.unwrap_or((lba, off));
+                    return Ok((l, o, None));
                 }
                 if first == 0xe5 {
-                    if deleted.is_none() { deleted = Some((lba, off)); }
+                    if deleted.is_none() {
+                        deleted = Some((lba, off));
+                    }
                     continue;
                 }
                 let attr = sector[off + 11];
-                if attr == 0x0f || attr & 0x08 != 0 { continue; }
+                if attr == 0x0f || attr & 0x08 != 0 {
+                    continue;
+                }
                 let mut found = [0u8; 11];
-                found.copy_from_slice(&sector[off..off+11]);
+                found.copy_from_slice(&sector[off..off + 11]);
                 if &found == short {
-                    let first_cluster = ((read_u16(&sector, off+20) as u32) << 16) | read_u16(&sector, off+26) as u32;
-                    return Ok((lba, off, Some(DirectoryEntry { short_name: found, first_cluster, size: read_u32(&sector, off+28), attributes: attr })));
+                    let first_cluster = ((read_u16(&sector, off + 20) as u32) << 16)
+                        | read_u16(&sector, off + 26) as u32;
+                    return Ok((
+                        lba,
+                        off,
+                        Some(DirectoryEntry {
+                            short_name: found,
+                            first_cluster,
+                            size: read_u32(&sector, off + 28),
+                            attributes: attr,
+                        }),
+                    ));
                 }
             }
         }
         cluster = match next_cluster(device, volume, cluster)? {
             ClusterLink::Next(n) => n,
-            ClusterLink::End => return deleted.map(|(l,o)| (l,o,None)).ok_or(Error::DirectoryFull),
+            ClusterLink::End => {
+                return deleted
+                    .map(|(l, o)| (l, o, None))
+                    .ok_or(Error::DirectoryFull);
+            }
         };
     }
 }
@@ -847,12 +898,14 @@ fn write_directory_entry(
 ) -> Result<(), Error> {
     let mut sector = [0u8; SECTOR_SIZE];
     device.read_sector(lba, &mut sector).map_err(Error::Block)?;
-    for b in &mut sector[offset..offset + DIRECTORY_ENTRY_SIZE] { *b = 0; }
-    sector[offset..offset+11].copy_from_slice(short);
-    sector[offset+11] = attributes;
-    write_u16(&mut sector, offset+20, (first_cluster >> 16) as u16);
-    write_u16(&mut sector, offset+26, first_cluster as u16);
-    write_u32(&mut sector, offset+28, size);
+    for b in &mut sector[offset..offset + DIRECTORY_ENTRY_SIZE] {
+        *b = 0;
+    }
+    sector[offset..offset + 11].copy_from_slice(short);
+    sector[offset + 11] = attributes;
+    write_u16(&mut sector, offset + 20, (first_cluster >> 16) as u16);
+    write_u16(&mut sector, offset + 26, first_cluster as u16);
+    write_u32(&mut sector, offset + 28, size);
     device.write_sector(lba, &sector).map_err(Error::Block)
 }
 
@@ -863,16 +916,19 @@ fn create_directory_in(
     name: &str,
 ) -> Result<u32, Error> {
     let short = encode_short_name(name).ok_or(Error::NameTooLong)?;
-    let (slot_lba, slot_offset, existing) = find_directory_slot(device, volume, parent_cluster, &short)?;
+    let (slot_lba, slot_offset, existing) =
+        find_directory_slot(device, volume, parent_cluster, &short)?;
     if let Some(entry) = existing {
-        if entry.attributes & 0x10 != 0 && entry.first_cluster >= 2 { return Ok(entry.first_cluster); }
+        if entry.attributes & 0x10 != 0 && entry.first_cluster >= 2 {
+            return Ok(entry.first_cluster);
+        }
         return Err(Error::WriteFailed);
     }
     let cluster = allocate_cluster(device, volume)?;
     let base = volume.cluster_lba(cluster)?;
     let zero = [0u8; SECTOR_SIZE];
     for s in 0..volume.sectors_per_cluster as u64 {
-        device.write_sector(base+s, &zero).map_err(Error::Block)?;
+        device.write_sector(base + s, &zero).map_err(Error::Block)?;
     }
     // Dot entries make directories interoperable with other FAT32 implementations.
     let mut first = [0u8; SECTOR_SIZE];
@@ -882,9 +938,13 @@ fn create_directory_in(
     write_u16(&mut first, 26, cluster as u16);
     first[32..43].copy_from_slice(b"..         ");
     first[43] = 0x10;
-    let dotdot = if parent_cluster == volume.root_cluster { volume.root_cluster } else { parent_cluster };
-    write_u16(&mut first, 32+20, (dotdot >> 16) as u16);
-    write_u16(&mut first, 32+26, dotdot as u16);
+    let dotdot = if parent_cluster == volume.root_cluster {
+        volume.root_cluster
+    } else {
+        parent_cluster
+    };
+    write_u16(&mut first, 32 + 20, (dotdot >> 16) as u16);
+    write_u16(&mut first, 32 + 26, dotdot as u16);
     device.write_sector(base, &first).map_err(Error::Block)?;
     write_directory_entry(device, slot_lba, slot_offset, &short, 0x10, cluster, 0)?;
     Ok(cluster)
@@ -893,14 +953,22 @@ fn create_directory_in(
 /// Create a FAT32 directory path, creating any missing 8.3 components.
 pub fn mkdir_path(device: &mut impl BlockDevice, volume: Volume, path: &str) -> Result<(), Error> {
     let path = path.trim_matches('/');
-    if path.is_empty() { return Ok(()); }
+    if path.is_empty() {
+        return Ok(());
+    }
     let mut cluster = volume.root_cluster;
     for component in path.split('/') {
-        if component.is_empty() || component == "." { continue; }
-        if component == ".." { return Err(Error::NameTooLong); }
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            return Err(Error::NameTooLong);
+        }
         let short = encode_short_name(component).ok_or(Error::NameTooLong)?;
         cluster = match find_in_directory(device, volume, cluster, &short) {
-            Ok(entry) if entry.attributes & 0x10 != 0 && entry.first_cluster >= 2 => entry.first_cluster,
+            Ok(entry) if entry.attributes & 0x10 != 0 && entry.first_cluster >= 2 => {
+                entry.first_cluster
+            }
             Ok(_) => return Err(Error::WriteFailed),
             Err(Error::NotFound) => create_directory_in(device, volume, cluster, component)?,
             Err(err) => return Err(err),
@@ -1075,16 +1143,27 @@ pub fn self_test() -> bool {
 }
 
 fn range_self_test() -> bool {
-    let mut disk = TestDisk { valid_signature: true, cyclic_chain: false };
-    let Ok(volume) = mount(&mut disk) else { return false; };
-    let Ok(entry) = find_root(&mut disk, volume, b"KERNEL  BIN") else { return false; };
+    let mut disk = TestDisk {
+        valid_signature: true,
+        cyclic_chain: false,
+    };
+    let Ok(volume) = mount(&mut disk) else {
+        return false;
+    };
+    let Ok(entry) = find_root(&mut disk, volume, b"KERNEL  BIN") else {
+        return false;
+    };
     let mut data = [0; 32];
     if read_file_at(&mut disk, volume, entry, 500, &mut data) != Ok(32)
-        || data[..12] != [b'A'; 12] || data[12..] != [b'B'; 20]
-    { return false; }
+        || data[..12] != [b'A'; 12]
+        || data[12..] != [b'B'; 20]
+    {
+        return false;
+    }
     data.fill(0);
     read_file_at(&mut disk, volume, entry, 590, &mut data) == Ok(10)
-        && data[..10] == [b'B'; 10] && data[10..] == [0; 22]
+        && data[..10] == [b'B'; 10]
+        && data[10..] == [0; 22]
         && read_file_at(&mut disk, volume, entry, 600, &mut data) == Ok(0)
         && read_file_at(&mut disk, volume, entry, usize::MAX, &mut data) == Ok(0)
 }
@@ -1092,7 +1171,11 @@ fn range_self_test() -> bool {
 #[cfg(test)]
 mod range_tests {
     #[test]
-    fn unaligned_range_and_eof() { assert!(super::range_self_test()); }
+    fn unaligned_range_and_eof() {
+        assert!(super::range_self_test());
+    }
     #[test]
-    fn existing_fat32_regressions() { assert!(super::self_test()); }
+    fn existing_fat32_regressions() {
+        assert!(super::self_test());
+    }
 }

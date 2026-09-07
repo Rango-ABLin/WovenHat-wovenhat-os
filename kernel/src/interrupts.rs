@@ -149,6 +149,15 @@ extern "x86-interrupt" fn page_fault_handler(
     let address = Cr2::read();
     let fault_address = address.ok().map(|addr| addr.as_u64());
 
+    if error_code.contains(PageFaultErrorCode::USER_MODE)
+        && !error_code.intersects(PageFaultErrorCode::PROTECTION_VIOLATION
+            | PageFaultErrorCode::INSTRUCTION_FETCH | PageFaultErrorCode::MALFORMED_TABLE)
+    {
+        if let Some(addr) = fault_address {
+            if task::try_handle_file_fault(addr, error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)) { return; }
+        }
+    }
+
     // Copy-on-write: user write to a present read-only page that is
     // logically writable in the process mapping tables.
     if error_code.contains(PageFaultErrorCode::USER_MODE)

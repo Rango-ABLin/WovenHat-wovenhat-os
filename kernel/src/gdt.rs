@@ -35,7 +35,10 @@ struct PrivilegeStack(UnsafeCell<[u8; PRIVILEGE_STACK_SIZE]>);
 unsafe impl Sync for PrivilegeStack {}
 
 static PRIVILEGE_STACK: PrivilegeStack = PrivilegeStack(UnsafeCell::new([0; PRIVILEGE_STACK_SIZE]));
-static TSS: Once<TaskStateSegment> = Once::new();
+struct RuntimeTss(UnsafeCell<TaskStateSegment>);
+// Only the bootstrap CPU runs tasks. Updates occur with interrupts disabled.
+unsafe impl Sync for RuntimeTss {}
+static TSS: Once<RuntimeTss> = Once::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
 struct Selectors {
@@ -55,7 +58,7 @@ pub fn init() {
 
         let privilege_stack_start = VirtAddr::from_ptr(PRIVILEGE_STACK.0.get());
         tss.privilege_stack_table[0] = privilege_stack_start + PRIVILEGE_STACK_SIZE as u64;
-        tss
+        RuntimeTss(UnsafeCell::new(tss))
     });
 
     let (gdt, selectors) = GDT.call_once(|| {
@@ -65,7 +68,7 @@ pub fn init() {
             data: gdt.append(Descriptor::kernel_data_segment()),
             user_code: gdt.append(Descriptor::user_code_segment()),
             user_data: gdt.append(Descriptor::user_data_segment()),
-            tss: gdt.append(Descriptor::tss_segment(tss)),
+            tss: gdt.append(Descriptor::tss_segment(unsafe { &*tss.0.get() })),
         };
         (gdt, selectors)
     });
@@ -89,4 +92,19 @@ pub fn user_segments() -> (SegmentSelector, SegmentSelector) {
         .get()
         .expect("GDT must be initialized before user mode is configured");
     (selectors.user_code, selectors.user_data)
+}
+
+/// Select the next task's syscall/interrupt entry stack before returning to it.
+pub fn set_privilege_stack(top: u64) {
+    assert!(!x86_64::instructions::interrupts::are_enabled());
+    let tss = TSS
+        .get()
+        .expect("TSS must be initialized before scheduling");
+    // TSS fields are packed; never form an aligned mutable reference. The CPU
+    // reads RSP0 on the next ring transition, after this interrupt-masked switch.
+    unsafe {
+        core::ptr::addr_of_mut!((*tss.0.get()).privilege_stack_table)
+            .cast::<VirtAddr>()
+            .write_unaligned(VirtAddr::new(top));
+    }
 }

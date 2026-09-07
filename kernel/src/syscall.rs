@@ -131,7 +131,7 @@ pub enum Number {
     Fork = 16,
     /// path ptr, path len → packs kind|size|writable into return value
     Stat = 17,
-    /// path ptr, path len, entry index → writes DirEntry to user buffer in RSI... 
+    /// path ptr, path len, entry index → writes DirEntry to user buffer in RSI...
     /// Actually: arg0=path, arg1=path_len, arg2=index; entry copied via a side channel is awkward.
     /// Convention: arg0=path ptr, arg1=path len | (index<<32), arg2=user buffer for name (MAX_DIR_NAME).
     /// Return: name length | (kind<<16), or error.
@@ -205,6 +205,12 @@ pub enum Number {
     SpawnCommand = 57,
     /// fd, byte length, page-aligned file offset: read-only private snapshot.
     MmapFile = 58,
+    /// fd, byte length, page-aligned file offset: writable private snapshot.
+    MmapFileWritable = 59,
+    MmapFileLazy = 60,
+    MmapFileLazyWritable = 61,
+    MmapFileShared = 62,
+    Msync = 63,
 }
 
 pub fn entry_address() -> u64 {
@@ -447,7 +453,6 @@ fn sys_readdir(user_path: u64, path_len_and_index: u64, user_name_buf: u64) -> u
         Err(_) => SYSCALL_ERROR,
     }
 }
-
 
 fn sys_chdir(user_path: u64, length: u64) -> u64 {
     let Ok(length) = usize::try_from(length) else {
@@ -692,7 +697,9 @@ fn sys_getticks() -> u64 {
 }
 
 fn sys_sync() -> u64 {
-    crate::storage::sync_all_mounted().map(|count| count as u64).unwrap_or(SYSCALL_ERROR)
+    crate::storage::sync_all_mounted()
+        .map(|count| count as u64)
+        .unwrap_or(SYSCALL_ERROR)
 }
 
 fn sys_ioctl(_fd: u64, _req: u64, _arg: u64) -> u64 {
@@ -759,17 +766,28 @@ fn sys_sigaction(sig: u64, handler: u64) -> u64 {
 }
 
 fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
-    match crate::task::set_process_group(pid, pgid) { Ok(()) => 0, Err(_) => SYSCALL_ERROR }
+    match crate::task::set_process_group(pid, pgid) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
 }
 
 /// Arrange a caught signal to enter its userspace handler after this syscall.
 /// The handler receives `sig` in RDI and a normal `ret` resumes the interrupted RIP.
 fn prepare_signal_delivery(frame: *const UserForkFrame) {
-    let Some((sig, handler)) = crate::task::take_pending_signal_current() else { return; };
-    if frame.is_null() { return; }
+    let Some((sig, handler)) = crate::task::take_pending_signal_current() else {
+        return;
+    };
+    if frame.is_null() {
+        return;
+    }
     let frame = unsafe { &mut *(frame as *mut UserForkFrame) };
-    let Some(new_rsp) = frame.rsp.checked_sub(8) else { return; };
-    if crate::paging::copy_to_current_user(new_rsp, &frame.rip.to_le_bytes()).is_err() { return; }
+    let Some(new_rsp) = frame.rsp.checked_sub(8) else {
+        return;
+    };
+    if crate::paging::copy_to_current_user(new_rsp, &frame.rip.to_le_bytes()).is_err() {
+        return;
+    }
     frame.rsp = new_rsp;
     frame.rip = handler;
     frame.rdi = sig;
@@ -806,8 +824,7 @@ fn sys_exec(user_path: u64, length: u64) -> u64 {
         );
         return SYSCALL_ERROR;
     };
-    let Some(program) =
-        crate::userspace::load_elf_with_argv(&image[..image_length], &[path])
+    let Some(program) = crate::userspace::load_elf_with_argv(&image[..image_length], &[path])
     else {
         crate::audit::record(
             actor,
@@ -907,19 +924,34 @@ fn sys_exec_command(user_line: u64, length: u64) -> u64 {
 
     let mut image = alloc::vec![0_u8; crate::vfs::NODE_CAPACITY];
     let Ok(image_length) = crate::vfs::read_all(resolved.as_str(), &mut image) else {
-        crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, false);
+        crate::audit::record(
+            actor,
+            crate::audit::Action::ProcessExec,
+            length as u64,
+            false,
+        );
         return SYSCALL_ERROR;
     };
-    let Some(program) = crate::userspace::load_elf_with_argv(&image[..image_length], &argv[..argc]) else {
-        crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, false);
+    let Some(program) = crate::userspace::load_elf_with_argv(&image[..image_length], &argv[..argc])
+    else {
+        crate::audit::record(
+            actor,
+            crate::audit::Action::ProcessExec,
+            length as u64,
+            false,
+        );
         return SYSCALL_ERROR;
     };
     drop(image);
     IO_COMPLETIONS.fetch_or(IO_EXEC, Ordering::Release);
-    crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, true);
+    crate::audit::record(
+        actor,
+        crate::audit::Action::ProcessExec,
+        length as u64,
+        true,
+    );
     crate::task::exec_current(program)
 }
-
 
 /// Spawn a simple command as a new userspace process without requiring the
 /// userspace shell to fork first. This is the reliable fast path for ordinary
@@ -932,99 +964,174 @@ fn sys_spawn_command(user_line: u64, length: u64) -> u64 {
     {
         return SYSCALL_ERROR;
     }
-    let Ok(length) = usize::try_from(length) else { return SYSCALL_ERROR; };
-    if length == 0 || length > crate::userspace::MAX_ARGV_BYTES { return SYSCALL_ERROR; }
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > crate::userspace::MAX_ARGV_BYTES {
+        return SYSCALL_ERROR;
+    }
     let mut command = [0_u8; crate::userspace::MAX_ARGV_BYTES];
     if crate::paging::copy_from_current_user(user_line, &mut command[..length]).is_err()
         || !command[..length].is_ascii()
-    { return SYSCALL_ERROR; }
+    {
+        return SYSCALL_ERROR;
+    }
 
     let mut ranges = [(0_usize, 0_usize); crate::userspace::MAX_ARGV];
     let mut argc = 0_usize;
     let mut cursor = 0_usize;
     while cursor < length {
-        while cursor < length && command[cursor].is_ascii_whitespace() { cursor += 1; }
-        if cursor == length { break; }
-        if argc == crate::userspace::MAX_ARGV { return SYSCALL_ERROR; }
+        while cursor < length && command[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == length {
+            break;
+        }
+        if argc == crate::userspace::MAX_ARGV {
+            return SYSCALL_ERROR;
+        }
         let start = cursor;
-        while cursor < length && !command[cursor].is_ascii_whitespace() { cursor += 1; }
+        while cursor < length && !command[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
         ranges[argc] = (start, cursor);
         argc += 1;
     }
-    if argc == 0 { return SYSCALL_ERROR; }
-    let Ok(command_name) = core::str::from_utf8(&command[ranges[0].0..ranges[0].1]) else { return SYSCALL_ERROR; };
+    if argc == 0 {
+        return SYSCALL_ERROR;
+    }
+    let Ok(command_name) = core::str::from_utf8(&command[ranges[0].0..ranges[0].1]) else {
+        return SYSCALL_ERROR;
+    };
     let resolved = if command_name.as_bytes().contains(&b'/') {
         alloc::string::String::from(command_name)
     } else {
         alloc::format!("/bin/{command_name}")
     };
-    if resolved.len() > MAX_PATH_SIZE { return SYSCALL_ERROR; }
+    if resolved.len() > MAX_PATH_SIZE {
+        return SYSCALL_ERROR;
+    }
     let mut argv = [""; crate::userspace::MAX_ARGV];
     argv[0] = resolved.as_str();
     for index in 1..argc {
         let (start, end) = ranges[index];
-        let Ok(argument) = core::str::from_utf8(&command[start..end]) else { return SYSCALL_ERROR; };
+        let Ok(argument) = core::str::from_utf8(&command[start..end]) else {
+            return SYSCALL_ERROR;
+        };
         argv[index] = argument;
     }
     let mut image = alloc::vec![0_u8; crate::vfs::NODE_CAPACITY];
     let Ok(image_length) = crate::vfs::read_all(resolved.as_str(), &mut image) else {
-        crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, false);
+        crate::audit::record(
+            actor,
+            crate::audit::Action::ProcessExec,
+            length as u64,
+            false,
+        );
         return SYSCALL_ERROR;
     };
-    let Some(program) = crate::userspace::load_elf_with_argv(&image[..image_length], &argv[..argc]) else {
-        crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, false);
+    let Some(program) = crate::userspace::load_elf_with_argv(&image[..image_length], &argv[..argc])
+    else {
+        crate::audit::record(
+            actor,
+            crate::audit::Action::ProcessExec,
+            length as u64,
+            false,
+        );
         return SYSCALL_ERROR;
     };
     drop(image);
     match crate::task::spawn_user_process("cmd", program) {
         Ok((pid, _)) => {
-            crate::audit::record(actor, crate::audit::Action::ProcessExec, length as u64, true);
+            crate::audit::record(
+                actor,
+                crate::audit::Action::ProcessExec,
+                length as u64,
+                true,
+            );
             pid.as_u64()
         }
         Err(_) => SYSCALL_ERROR,
     }
 }
 
-
 fn sys_env_get(user_key: u64, key_len: u64, user_out: u64) -> u64 {
-    let Ok(key_len) = usize::try_from(key_len) else { return SYSCALL_ERROR; };
-    if key_len == 0 || key_len >= crate::task::MAX_ENV_ENTRY { return SYSCALL_ERROR; }
+    let Ok(key_len) = usize::try_from(key_len) else {
+        return SYSCALL_ERROR;
+    };
+    if key_len == 0 || key_len >= crate::task::MAX_ENV_ENTRY {
+        return SYSCALL_ERROR;
+    }
     let mut key = [0u8; crate::task::MAX_ENV_ENTRY];
-    if crate::paging::copy_from_current_user(user_key, &mut key[..key_len]).is_err() { return SYSCALL_ERROR; }
+    if crate::paging::copy_from_current_user(user_key, &mut key[..key_len]).is_err() {
+        return SYSCALL_ERROR;
+    }
     let mut value = [0u8; crate::task::MAX_ENV_ENTRY];
-    let Ok(len) = crate::task::env_get(&key[..key_len], &mut value) else { return SYSCALL_ERROR; };
-    if crate::paging::copy_to_current_user(user_out, &value[..len]).is_err() { return SYSCALL_ERROR; }
+    let Ok(len) = crate::task::env_get(&key[..key_len], &mut value) else {
+        return SYSCALL_ERROR;
+    };
+    if crate::paging::copy_to_current_user(user_out, &value[..len]).is_err() {
+        return SYSCALL_ERROR;
+    }
     len as u64
 }
 
 fn sys_env_set(user_key: u64, packed_lengths: u64, user_value: u64) -> u64 {
     let key_len = (packed_lengths & 0xffff_ffff) as usize;
     let value_len = (packed_lengths >> 32) as usize;
-    if key_len == 0 || key_len >= crate::task::MAX_ENV_ENTRY || value_len >= crate::task::MAX_ENV_ENTRY { return SYSCALL_ERROR; }
+    if key_len == 0
+        || key_len >= crate::task::MAX_ENV_ENTRY
+        || value_len >= crate::task::MAX_ENV_ENTRY
+    {
+        return SYSCALL_ERROR;
+    }
     let mut key = [0u8; crate::task::MAX_ENV_ENTRY];
     let mut value = [0u8; crate::task::MAX_ENV_ENTRY];
     if crate::paging::copy_from_current_user(user_key, &mut key[..key_len]).is_err()
-        || crate::paging::copy_from_current_user(user_value, &mut value[..value_len]).is_err() { return SYSCALL_ERROR; }
+        || crate::paging::copy_from_current_user(user_value, &mut value[..value_len]).is_err()
+    {
+        return SYSCALL_ERROR;
+    }
     crate::task::env_set(&key[..key_len], &value[..value_len]).map_or(SYSCALL_ERROR, |()| 0)
 }
 
 fn sys_env_entry(index: u64, user_out: u64, capacity: u64) -> u64 {
-    let Ok(index) = usize::try_from(index) else { return SYSCALL_ERROR; };
-    let Ok(capacity) = usize::try_from(capacity) else { return SYSCALL_ERROR; };
+    let Ok(index) = usize::try_from(index) else {
+        return SYSCALL_ERROR;
+    };
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return SYSCALL_ERROR;
+    };
     let capacity = core::cmp::min(capacity, crate::task::MAX_ENV_ENTRY);
-    if capacity == 0 { return SYSCALL_ERROR; }
+    if capacity == 0 {
+        return SYSCALL_ERROR;
+    }
     let mut entry = [0u8; crate::task::MAX_ENV_ENTRY];
-    let Ok(len) = crate::task::env_entry(index, &mut entry[..capacity]) else { return SYSCALL_ERROR; };
-    if crate::paging::copy_to_current_user(user_out, &entry[..len]).is_err() { return SYSCALL_ERROR; }
+    let Ok(len) = crate::task::env_entry(index, &mut entry[..capacity]) else {
+        return SYSCALL_ERROR;
+    };
+    if crate::paging::copy_to_current_user(user_out, &entry[..len]).is_err() {
+        return SYSCALL_ERROR;
+    }
     len as u64
 }
 
-
 fn sys_process_info(index: u64, user_out: u64) -> u64 {
-    let Ok(index) = usize::try_from(index) else { return SYSCALL_ERROR; };
-    let Some(info) = crate::task::process_info(index) else { return SYSCALL_ERROR; };
-    let bytes = unsafe { core::slice::from_raw_parts((&info as *const crate::task::ProcessInfo).cast::<u8>(), core::mem::size_of::<crate::task::ProcessInfo>()) };
-    if crate::paging::copy_to_current_user(user_out, bytes).is_err() { return SYSCALL_ERROR; }
+    let Ok(index) = usize::try_from(index) else {
+        return SYSCALL_ERROR;
+    };
+    let Some(info) = crate::task::process_info(index) else {
+        return SYSCALL_ERROR;
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&info as *const crate::task::ProcessInfo).cast::<u8>(),
+            core::mem::size_of::<crate::task::ProcessInfo>(),
+        )
+    };
+    if crate::paging::copy_to_current_user(user_out, bytes).is_err() {
+        return SYSCALL_ERROR;
+    }
     0
 }
 
@@ -1034,25 +1141,32 @@ fn sys_socket(kind: u64) -> u64 {
         2 => crate::network::SocketKind::Tcp,
         _ => return SYSCALL_ERROR,
     };
-    crate::network::socket_open(crate::task::current_process_id(), kind)
-        .unwrap_or(SYSCALL_ERROR)
+    crate::network::socket_open(crate::task::current_process_id(), kind).unwrap_or(SYSCALL_ERROR)
 }
 
 fn sys_net_bind(socket: u64, port: u64) -> u64 {
-    let Ok(port) = u16::try_from(port) else { return SYSCALL_ERROR; };
+    let Ok(port) = u16::try_from(port) else {
+        return SYSCALL_ERROR;
+    };
     crate::network::socket_bind(crate::task::current_process_id(), socket, port)
         .map_or(SYSCALL_ERROR, |()| 0)
 }
 
 fn sys_net_connect(socket: u64, packed: u64) -> u64 {
-    let Ok(endpoint) = crate::network::endpoint_from_packed(packed) else { return SYSCALL_ERROR; };
+    let Ok(endpoint) = crate::network::endpoint_from_packed(packed) else {
+        return SYSCALL_ERROR;
+    };
     crate::network::socket_connect(crate::task::current_process_id(), socket, endpoint)
         .map_or(SYSCALL_ERROR, |()| 0)
 }
 
 fn sys_net_send(socket: u64, user_buffer: u64, length: u64) -> u64 {
-    let Ok(length) = usize::try_from(length) else { return SYSCALL_ERROR; };
-    if length > MAX_IO_SIZE { return SYSCALL_ERROR; }
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length > MAX_IO_SIZE {
+        return SYSCALL_ERROR;
+    }
     let mut buffer = [0u8; MAX_IO_SIZE];
     if crate::paging::copy_from_current_user(user_buffer, &mut buffer[..length]).is_err() {
         return SYSCALL_ERROR;
@@ -1062,10 +1176,18 @@ fn sys_net_send(socket: u64, user_buffer: u64, length: u64) -> u64 {
 }
 
 fn sys_net_recv(socket: u64, user_buffer: u64, capacity: u64) -> u64 {
-    let Ok(capacity) = usize::try_from(capacity) else { return SYSCALL_ERROR; };
-    if capacity > MAX_IO_SIZE { return SYSCALL_ERROR; }
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return SYSCALL_ERROR;
+    };
+    if capacity > MAX_IO_SIZE {
+        return SYSCALL_ERROR;
+    }
     let mut buffer = [0u8; MAX_IO_SIZE];
-    match crate::network::socket_recv(crate::task::current_process_id(), socket, &mut buffer[..capacity]) {
+    match crate::network::socket_recv(
+        crate::task::current_process_id(),
+        socket,
+        &mut buffer[..capacity],
+    ) {
         Ok((n, _)) => {
             if crate::paging::copy_to_current_user(user_buffer, &buffer[..n]).is_err() {
                 SYSCALL_ERROR
@@ -1099,13 +1221,19 @@ fn sys_net_info(user_buffer: u64) -> u64 {
 }
 
 fn sys_dns_start(user_name: u64, length: u64) -> u64 {
-    let Ok(length) = usize::try_from(length) else { return SYSCALL_ERROR; };
-    if length == 0 || length > 253 { return SYSCALL_ERROR; }
+    let Ok(length) = usize::try_from(length) else {
+        return SYSCALL_ERROR;
+    };
+    if length == 0 || length > 253 {
+        return SYSCALL_ERROR;
+    }
     let mut name = [0u8; 253];
     if crate::paging::copy_from_current_user(user_name, &mut name[..length]).is_err() {
         return SYSCALL_ERROR;
     }
-    let Ok(name) = core::str::from_utf8(&name[..length]) else { return SYSCALL_ERROR; };
+    let Ok(name) = core::str::from_utf8(&name[..length]) else {
+        return SYSCALL_ERROR;
+    };
     crate::network::dns_start(name).unwrap_or(SYSCALL_ERROR)
 }
 
@@ -1135,7 +1263,6 @@ fn sys_net_peer(socket: u64) -> u64 {
 fn sys_dhcp(enabled: u64) -> u64 {
     crate::network::set_dhcp(enabled != 0).map_or(SYSCALL_ERROR, |()| 0)
 }
-
 
 fn sys_ping_start(ip_packed: u64) -> u64 {
     let raw = (ip_packed & 0xffff_ffff) as u32;
@@ -1176,7 +1303,24 @@ pub extern "C" fn wovenhat_syscall_dispatch(
         value if value == Number::ProcessCount as u64 => crate::task::process_count() as u64,
         value if value == Number::ProcessInfo as u64 => sys_process_info(arg0, arg1),
         value if value == Number::SpawnCommand as u64 => sys_spawn_command(arg0, arg1),
-        value if value == Number::MmapFile as u64 => crate::task::mmap_file_current(arg0, arg1, arg2).unwrap_or(SYSCALL_ERROR),
+        value if value == Number::MmapFileShared as u64 => {
+            crate::task::mmap_file_current(arg0, arg1, arg2, true, true, true).unwrap_or(SYSCALL_ERROR)
+        }
+        value if value == Number::Msync as u64 => {
+            crate::task::msync_current(arg0, arg1).map(|_| 0).unwrap_or(SYSCALL_ERROR)
+        }
+        value if value == Number::MmapFileLazy as u64 => {
+            crate::task::mmap_file_current(arg0, arg1, arg2, false, true, false).unwrap_or(SYSCALL_ERROR)
+        }
+        value if value == Number::MmapFileLazyWritable as u64 => {
+            crate::task::mmap_file_current(arg0, arg1, arg2, true, true, false).unwrap_or(SYSCALL_ERROR)
+        }
+        value if value == Number::MmapFile as u64 => {
+            crate::task::mmap_file_current(arg0, arg1, arg2, false, false, false).unwrap_or(SYSCALL_ERROR)
+        }
+        value if value == Number::MmapFileWritable as u64 => {
+            crate::task::mmap_file_current(arg0, arg1, arg2, true, false, false).unwrap_or(SYSCALL_ERROR)
+        }
         value if value == Number::Fork as u64 => sys_fork(frame),
         value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),
         value if value == Number::MessageReceive as u64 => sys_message_receive(arg0, arg1, arg2),

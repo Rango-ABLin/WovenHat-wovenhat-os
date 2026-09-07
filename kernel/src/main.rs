@@ -12,6 +12,7 @@ mod block;
 mod block_cache;
 mod page_cache;
 mod file_mapping;
+mod file_frames;
 mod capability;
 mod config;
 mod console;
@@ -456,12 +457,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial::write_line(format_args!("[VFS] read/write and path semantics: FAILED"));
         halt();
     }
+    if paging::frame_ownership_self_test() {
+        serial::write_line(format_args!("[FRAME OWNERSHIP] overflow and exhaustion rollback: PASSED"));
+    } else {
+        serial::write_line(format_args!("[FRAME OWNERSHIP] exhaustion rollback: FAILED"));
+        halt();
+    }
+    if file_frames::self_test() {
+        serial::write_line(format_args!("[FRAME CACHE] pinned aliases, LRU eviction, reclaim: PASSED"));
+    } else {
+        serial::write_line(format_args!("[FRAME CACHE] regression tests: FAILED"));
+        halt();
+    }
+    if userspace::shared_file_mmap_self_test() {
+        serial::write_line(format_args!("[SHARED FILE MMAP] aliases, COW, truncation, unlink, reclaim: PASSED"));
+    } else {
+        serial::write_line(format_args!("[SHARED FILE MMAP] regression tests: FAILED"));
+        halt();
+    }
+    if userspace::lazy_file_mmap_self_test() {
+        serial::write_line(format_args!("[LAZY FILE MMAP] regression tests: PASSED"));
+    } else {
+        serial::write_line(format_args!("[LAZY FILE MMAP] regression tests: FAILED"));
+        halt();
+    }
     if userspace::file_mmap_self_test() {
         serial::write_line(format_args!("[FILE MMAP] regression tests: PASSED"));
     } else {
         serial::write_line(format_args!("[FILE MMAP] regression tests: FAILED"));
         halt();
     }
+    // Blocking pipe APIs consult the current task, even for immediate reads.
+    gdt::init();
+    let _user_segments = gdt::user_segments();
+    console.println("GDT/TSS: INSTALLED");
+    console.println("USER MODE SEGMENTS: READY");
+
+    //
+    // Interrupt Descriptor Table
+    //
+
+    interrupts::init();
+
+    console.println("IDT: INSTALLED");
+    if interrupts::fault_policy_self_test() {
+        console.println("USER FAULT RECOVERY: ARMED");
+    } else {
+        console.println("USER FAULT RECOVERY: FAILED");
+        halt();
+    }
+
+    task::init();
+    console.println("SCHEDULER: INITIALIZED");
     if pipe::self_test() {
         console.println("PIPE: OK");
     } else {
@@ -507,27 +554,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
 
-    gdt::init();
-    let _user_segments = gdt::user_segments();
-    console.println("GDT/TSS: INSTALLED");
-    console.println("USER MODE SEGMENTS: READY");
-
-    //
-    // Interrupt Descriptor Table
-    //
-
-    interrupts::init();
-
-    console.println("IDT: INSTALLED");
-    if interrupts::fault_policy_self_test() {
-        console.println("USER FAULT RECOVERY: ARMED");
-    } else {
-        console.println("USER FAULT RECOVERY: FAILED");
-        halt();
-    }
-
-    task::init();
-    console.println("SCHEDULER: INITIALIZED");
     if benchmark::self_test() {
         console.println("BENCHMARK DELTAS: VALIDATED");
     } else {
@@ -791,6 +817,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "[BOOT] anonymous mmap W^X invariant verified (writable mapping is never executable)"
     ));
 
+    if !task::file_fault_io_self_test() {
+        serial::write_line(format_args!("[FAULT IO] interrupt/preemption guard: FAILED"));
+        halt();
+    }
+    serial::write_line(format_args!("[FAULT IO] timer IRQs live, task stable, state restored: PASSED"));
     let first_root = first_program.address_space.root_address();
     let second_root = second_program.address_space.root_address();
     let first_pid = match task::spawn_user_process("init-user-a", first_program) {

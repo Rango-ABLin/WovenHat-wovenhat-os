@@ -334,7 +334,6 @@ fn task_bootstrap() -> ! {
     entry.expect("scheduled task is missing its entry point")()
 }
 
-
 // Stage 7: bounded per-process environment. Entries are stored as KEY=VALUE
 // ASCII byte strings so fork inheritance is allocation-free and deterministic.
 pub const MAX_ENV_VARS: usize = 8;
@@ -348,7 +347,10 @@ struct ProcessEnvironment {
 
 impl ProcessEnvironment {
     const fn empty() -> Self {
-        Self { entries: [[0; MAX_ENV_ENTRY]; MAX_ENV_VARS], lengths: [0; MAX_ENV_VARS] }
+        Self {
+            entries: [[0; MAX_ENV_ENTRY]; MAX_ENV_VARS],
+            lengths: [0; MAX_ENV_VARS],
+        }
     }
 
     fn defaults() -> Self {
@@ -361,26 +363,46 @@ impl ProcessEnvironment {
     }
 
     fn set_bytes(&mut self, key: &[u8], value: &[u8]) -> bool {
-        if key.is_empty() || key.contains(&b'=') || !key.is_ascii() || !value.is_ascii() { return false; }
-        let Some(total) = key.len().checked_add(value.len()).and_then(|n| n.checked_add(1)) else { return false; };
-        if total > MAX_ENV_ENTRY { return false; }
+        if key.is_empty() || key.contains(&b'=') || !key.is_ascii() || !value.is_ascii() {
+            return false;
+        }
+        let Some(total) = key
+            .len()
+            .checked_add(value.len())
+            .and_then(|n| n.checked_add(1))
+        else {
+            return false;
+        };
+        if total > MAX_ENV_ENTRY {
+            return false;
+        }
         let existing = (0..MAX_ENV_VARS).find(|&i| {
             let len = self.lengths[i] as usize;
-            len > key.len() && &self.entries[i][..key.len()] == key && self.entries[i][key.len()] == b'='
+            len > key.len()
+                && &self.entries[i][..key.len()] == key
+                && self.entries[i][key.len()] == b'='
         });
         let slot = existing.or_else(|| (0..MAX_ENV_VARS).find(|&i| self.lengths[i] == 0));
-        let Some(slot) = slot else { return false; };
+        let Some(slot) = slot else {
+            return false;
+        };
         self.entries[slot] = [0; MAX_ENV_ENTRY];
         self.entries[slot][..key.len()].copy_from_slice(key);
         self.entries[slot][key.len()] = b'=';
-        self.entries[slot][key.len()+1..total].copy_from_slice(value);
+        self.entries[slot][key.len() + 1..total].copy_from_slice(value);
         self.lengths[slot] = total as u8;
         true
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum EnvError { NoProcess, Invalid, Full, NotFound, BufferTooSmall }
+pub enum EnvError {
+    NoProcess,
+    Invalid,
+    Full,
+    NotFound,
+    BufferTooSmall,
+}
 
 /// What a process file descriptor refers to.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -469,6 +491,7 @@ pub enum SpawnError {
 }
 
 struct ContextSwitch {
+    next_privilege_stack: u64,
     previous_rsp: *mut u64,
     next_rsp: u64,
     next_address_space: paging::AddressSpace,
@@ -538,6 +561,9 @@ impl Scheduler {
         let next_rsp = self.tasks[next_slot].context.stack_pointer;
         let next_address_space = self.tasks[next_slot].address_space?;
         Some(ContextSwitch {
+            next_privilege_stack: (TASK_STACKS[next_slot].0.get().cast::<u8>() as u64
+                + TASK_STACK_SIZE as u64)
+                & !0xf,
             previous_rsp,
             next_rsp,
             next_address_space,
@@ -591,6 +617,7 @@ impl Scheduler {
 }
 
 unsafe fn switch_stacks(context_switch: ContextSwitch) {
+    gdt::set_privilege_stack(context_switch.next_privilege_stack);
     paging::switch_to(context_switch.next_address_space);
     unsafe {
         wovenhat_context_switch(context_switch.previous_rsp, context_switch.next_rsp);
@@ -702,7 +729,10 @@ pub fn spawn_user_process(
     }
 
     let parent = ProcessId(current_process_id());
-    let context = prepare_user_context(program.image.entry as usize, program.image.stack_top as usize);
+    let context = prepare_user_context(
+        program.image.entry as usize,
+        program.image.stack_top as usize,
+    );
     let mut scheduler = SCHEDULER.lock();
     scheduler.reap_dead();
     let Some(task_slot) = scheduler
@@ -759,6 +789,54 @@ pub fn current_process_id() -> u64 {
         .flatten()
         .find(|process| process.task_id == task_id)
         .map_or(task_id.as_u64(), |process| process.id.as_u64())
+}
+
+static FILE_IO_DEPTH: AtomicU64 = AtomicU64::new(0);
+/// Keep device interrupts live while preventing a second BSP task from spinning
+/// on an I/O lock owned by this task. No process or cache lock spans the I/O.
+pub fn file_fault_io<T>(operation: impl FnOnce() -> T) -> T {
+    let enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    FILE_IO_DEPTH.fetch_add(1, Ordering::AcqRel);
+    let initialized = SCHEDULER.lock().task_count != 0;
+    if initialized { x86_64::instructions::interrupts::enable(); }
+    let result = operation();
+    x86_64::instructions::interrupts::disable();
+    FILE_IO_DEPTH.fetch_sub(1, Ordering::AcqRel);
+    if enabled { x86_64::instructions::interrupts::enable(); }
+    result
+}
+
+pub fn file_fault_io_self_test() -> bool {
+    let enabled = x86_64::instructions::interrupts::are_enabled();
+    let id = current_task_id();
+    let passed = file_fault_io(|| {
+        let start = timer::ticks();
+        while timer::ticks().wrapping_sub(start) < 2 { x86_64::instructions::hlt(); }
+        x86_64::instructions::interrupts::are_enabled() && current_task_id() == id
+            && FILE_IO_DEPTH.load(Ordering::Acquire) == 1
+    });
+    passed && x86_64::instructions::interrupts::are_enabled() == enabled
+        && FILE_IO_DEPTH.load(Ordering::Acquire) == 0
+}
+
+pub fn try_handle_file_fault(address: u64, write: bool) -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let task_id = current_task_id();
+        let (space, slot, mut mapping) = {
+            let processes = PROCESS_TABLE.lock();
+            let Some(process) = processes.iter().flatten().find(|p| p.task_id == task_id) else { return false; };
+            let Some(space) = process.address_space else { return false; };
+            let Some((slot, mapping)) = process.memory_mappings.iter().enumerate().find_map(|(slot, m)|
+                m.filter(|m| address >= m.address && address < m.address + m.size as u64).map(|m| (slot, m))) else { return false; };
+            (space, slot, mapping)
+        };
+        if !userspace::populate_file_page(space, &mut mapping, address, write) { return false; }
+        let mut processes = PROCESS_TABLE.lock();
+        let Some(process) = processes.iter_mut().flatten().find(|p| p.task_id == task_id) else { return false; };
+        process.memory_mappings[slot] = Some(mapping);
+        true
+    })
 }
 
 /// Attempt to resolve a user write fault via copy-on-write.
@@ -926,7 +1004,10 @@ pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, P
 pub fn exec_current(program: userspace::UserProgram) -> ! {
     assert!(program.image.is_valid(), "exec received an invalid image");
     x86_64::instructions::interrupts::disable();
-    let context = prepare_user_context(program.image.entry as usize, program.image.stack_top as usize);
+    let context = prepare_user_context(
+        program.image.entry as usize,
+        program.image.stack_top as usize,
+    );
     let new_address_space = program.address_space;
     let task_id = current_task_id();
     let (old_address_space, old_mappings) = {
@@ -1027,7 +1108,9 @@ pub fn exit_current_process(exit_code: i32) -> ! {
             unsafe { switch_stacks(context_switch) };
         }
     } else {
-        crate::serial::write_line(format_args!("[TASK] exiting process without address space; entering idle"));
+        crate::serial::write_line(format_args!(
+            "[TASK] exiting process without address space; entering idle"
+        ));
     }
 
     loop {
@@ -1067,7 +1150,6 @@ pub fn zombie_count() -> usize {
         .count()
 }
 
-
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ProcessInfo {
@@ -1081,7 +1163,9 @@ pub struct ProcessInfo {
     pub reserved: u32,
 }
 
-pub fn process_count() -> usize { PROCESS_TABLE.lock().iter().flatten().count() }
+pub fn process_count() -> usize {
+    PROCESS_TABLE.lock().iter().flatten().count()
+}
 
 pub fn process_info(index: usize) -> Option<ProcessInfo> {
     let processes = PROCESS_TABLE.lock();
@@ -1103,16 +1187,24 @@ pub fn process_info(index: usize) -> Option<ProcessInfo> {
 }
 
 pub fn env_get(key: &[u8], out: &mut [u8]) -> Result<usize, EnvError> {
-    if key.is_empty() || key.contains(&b'=') || !key.is_ascii() { return Err(EnvError::Invalid); }
+    if key.is_empty() || key.contains(&b'=') || !key.is_ascii() {
+        return Err(EnvError::Invalid);
+    }
     let task_id = current_task_id();
     let processes = PROCESS_TABLE.lock();
-    let process = processes.iter().flatten().find(|p| p.task_id == task_id).ok_or(EnvError::NoProcess)?;
+    let process = processes
+        .iter()
+        .flatten()
+        .find(|p| p.task_id == task_id)
+        .ok_or(EnvError::NoProcess)?;
     for i in 0..MAX_ENV_VARS {
         let len = process.environment.lengths[i] as usize;
         let entry = &process.environment.entries[i][..len];
         if len > key.len() && &entry[..key.len()] == key && entry[key.len()] == b'=' {
-            let value = &entry[key.len()+1..];
-            if value.len() > out.len() { return Err(EnvError::BufferTooSmall); }
+            let value = &entry[key.len() + 1..];
+            if value.len() > out.len() {
+                return Err(EnvError::BufferTooSmall);
+            }
             out[..value.len()].copy_from_slice(value);
             return Ok(value.len());
         }
@@ -1123,28 +1215,59 @@ pub fn env_get(key: &[u8], out: &mut [u8]) -> Result<usize, EnvError> {
 pub fn env_set(key: &[u8], value: &[u8]) -> Result<(), EnvError> {
     let task_id = current_task_id();
     let mut processes = PROCESS_TABLE.lock();
-    let process = processes.iter_mut().flatten().find(|p| p.task_id == task_id).ok_or(EnvError::NoProcess)?;
-    if key.is_empty() || key.contains(&b'=') || !key.is_ascii() || !value.is_ascii() { return Err(EnvError::Invalid); }
-    if key.len().saturating_add(value.len()).saturating_add(1) > MAX_ENV_ENTRY { return Err(EnvError::Invalid); }
-    if process.environment.set_bytes(key, value) { Ok(()) } else { Err(EnvError::Full) }
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|p| p.task_id == task_id)
+        .ok_or(EnvError::NoProcess)?;
+    if key.is_empty() || key.contains(&b'=') || !key.is_ascii() || !value.is_ascii() {
+        return Err(EnvError::Invalid);
+    }
+    if key.len().saturating_add(value.len()).saturating_add(1) > MAX_ENV_ENTRY {
+        return Err(EnvError::Invalid);
+    }
+    if process.environment.set_bytes(key, value) {
+        Ok(())
+    } else {
+        Err(EnvError::Full)
+    }
 }
 
 pub fn env_count() -> usize {
     let task_id = current_task_id();
-    PROCESS_TABLE.lock().iter().flatten().find(|p| p.task_id == task_id)
-        .map(|p| p.environment.lengths.iter().filter(|&&len| len != 0).count()).unwrap_or(0)
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .find(|p| p.task_id == task_id)
+        .map(|p| {
+            p.environment
+                .lengths
+                .iter()
+                .filter(|&&len| len != 0)
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 pub fn env_entry(index: usize, out: &mut [u8]) -> Result<usize, EnvError> {
     let task_id = current_task_id();
     let processes = PROCESS_TABLE.lock();
-    let process = processes.iter().flatten().find(|p| p.task_id == task_id).ok_or(EnvError::NoProcess)?;
+    let process = processes
+        .iter()
+        .flatten()
+        .find(|p| p.task_id == task_id)
+        .ok_or(EnvError::NoProcess)?;
     let mut seen = 0usize;
     for i in 0..MAX_ENV_VARS {
         let len = process.environment.lengths[i] as usize;
-        if len == 0 { continue; }
+        if len == 0 {
+            continue;
+        }
         if seen == index {
-            if len > out.len() { return Err(EnvError::BufferTooSmall); }
+            if len > out.len() {
+                return Err(EnvError::BufferTooSmall);
+            }
             out[..len].copy_from_slice(&process.environment.entries[i][..len]);
             return Ok(len);
         }
@@ -1190,25 +1313,50 @@ pub fn mmap_current(length: u64, writable: bool) -> Result<u64, MemoryError> {
     Ok(mapping.address)
 }
 
-pub fn mmap_file_current(descriptor: u64, length: u64, offset: u64) -> Result<u64, MemoryError> {
-    if !current_has(Capability::FileRead) { return Err(MemoryError::PermissionDenied); }
+pub fn mmap_file_current(
+    descriptor: u64,
+    length: u64,
+    offset: u64,
+    writable: bool,
+    lazy: bool,
+    shared: bool,
+) -> Result<u64, MemoryError> {
+    if !current_has(Capability::FileRead) || (shared && !current_has(Capability::FileWrite)) {
+        return Err(MemoryError::PermissionDenied);
+    }
     let descriptor = usize::try_from(descriptor).map_err(|_| MemoryError::BadDescriptor)?;
     let length = usize::try_from(length).map_err(|_| MemoryError::InvalidLength)?;
     let offset = usize::try_from(offset).map_err(|_| MemoryError::InvalidLength)?;
     let task_id = current_task_id();
     let (index, slot, address_space, file) = {
         let processes = PROCESS_TABLE.lock();
-        let index = processes.iter().position(|p| p.is_some_and(|p| p.task_id == task_id))
+        let index = processes
+            .iter()
+            .position(|p| p.is_some_and(|p| p.task_id == task_id))
             .ok_or(MemoryError::NoProcess)?;
         let process = processes[index].ok_or(MemoryError::NoProcess)?;
         let Some(FdKind::File(file)) = process.files.get(descriptor).copied().flatten() else {
             return Err(MemoryError::BadDescriptor);
         };
-        let slot = process.memory_mappings.iter().position(Option::is_none).ok_or(MemoryError::Full)?;
-        (index, slot, process.address_space.ok_or(MemoryError::NoProcess)?, file)
+        let slot = process
+            .memory_mappings
+            .iter()
+            .position(Option::is_none)
+            .ok_or(MemoryError::Full)?;
+        (
+            index,
+            slot,
+            process.address_space.ok_or(MemoryError::NoProcess)?,
+            file,
+        )
     };
-    let mapping = userspace::map_file_private(address_space, slot, file, offset, length)
-        .ok_or(MemoryError::MappingFailed)?;
+    let mapping = if shared {
+        userspace::map_file_shared(address_space, slot, file, offset, length)
+    } else if lazy {
+        userspace::map_file_lazy(address_space, slot, file, offset, length, writable)
+    } else {
+        userspace::map_file_private(address_space, slot, file, offset, length, writable)
+    }.ok_or(MemoryError::MappingFailed)?;
     let mut processes = PROCESS_TABLE.lock();
     if let Some(process) = processes[index].as_mut().filter(|p| p.task_id == task_id) {
         if process.memory_mappings[slot].is_none() {
@@ -1218,6 +1366,19 @@ pub fn mmap_file_current(descriptor: u64, length: u64, offset: u64) -> Result<u6
     }
     let _ = userspace::unmap_anonymous(address_space, mapping);
     Err(MemoryError::Full)
+}
+
+pub fn msync_current(address: u64, length: u64) -> Result<(), MemoryError> {
+    if !current_has(Capability::FileWrite) { return Err(MemoryError::PermissionDenied); }
+    let size = length.checked_add(4095).filter(|_| length != 0).ok_or(MemoryError::InvalidLength)? & !4095;
+    let task_id = current_task_id();
+    let (space, mapping) = {
+        let processes = PROCESS_TABLE.lock();
+        let process = processes.iter().flatten().find(|p| p.task_id == task_id).ok_or(MemoryError::NoProcess)?;
+        let mapping = process.memory_mappings.iter().flatten().find(|m| m.address == address && size == m.size as u64).copied().ok_or(MemoryError::NotFound)?;
+        (process.address_space.ok_or(MemoryError::NoProcess)?, mapping)
+    };
+    if userspace::sync_file_mapping(space, mapping, true) { Ok(()) } else { Err(MemoryError::MappingFailed) }
 }
 
 pub fn munmap_current(address: u64, length: u64) -> Result<(), MemoryError> {
@@ -1353,7 +1514,9 @@ pub fn write_current(descriptor: u64, buffer: &[u8]) -> Result<usize, FileError>
             }
             vfs::write(id, buffer).map_err(|_| FileError::BadDescriptor)
         }
-        FdKind::PipeWrite(id) => crate::pipe::write(id, buffer).map_err(|_| FileError::BadDescriptor),
+        FdKind::PipeWrite(id) => {
+            crate::pipe::write(id, buffer).map_err(|_| FileError::BadDescriptor)
+        }
         FdKind::PipeRead(_) => Err(FileError::BadDescriptor),
     }
 }
@@ -1531,7 +1694,6 @@ pub fn mkdir_path(path: &str) -> Result<(), FileError> {
     }
     result
 }
-
 
 pub fn current_cwd_str(buf: &mut [u8]) -> Result<usize, FileError> {
     let (cwd, len) = current_cwd();
@@ -1739,6 +1901,7 @@ pub fn tick() {
     }
 }
 pub fn preempt_from_interrupt() {
+    if FILE_IO_DEPTH.load(Ordering::Acquire) != 0 { return; }
     if !PREEMPTION_REQUESTED.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -2000,12 +2163,15 @@ unsafe fn push_stack_value(cursor: &mut usize, value: u64) {
     unsafe { (*cursor as *mut u64).write(value) };
 }
 
-
 pub fn kill_process(pid: u64, sig: u64) -> Result<(), FileError> {
-    if sig > 31 { return Err(FileError::NotFound); }
+    if sig > 31 {
+        return Err(FileError::NotFound);
+    }
     let current_pid = current_process_id();
     let mut processes = PROCESS_TABLE.lock();
-    let current_group = processes.iter().flatten()
+    let current_group = processes
+        .iter()
+        .flatten()
         .find(|p| p.id.as_u64() == current_pid)
         .map(|p| p.process_group)
         .unwrap_or(current_pid);
@@ -2013,16 +2179,32 @@ pub fn kill_process(pid: u64, sig: u64) -> Result<(), FileError> {
     // POSIX-ish targets: pid>0 one process; pid==0 caller's process group;
     // a two's-complement negative pid targets process group abs(pid).
     let signed = pid as i64;
-    let target_group = if pid == 0 { Some(current_group) } else if signed < 0 { Some(signed.wrapping_neg() as u64) } else { None };
+    let target_group = if pid == 0 {
+        Some(current_group)
+    } else if signed < 0 {
+        Some(signed.wrapping_neg() as u64)
+    } else {
+        None
+    };
     let mut matched = false;
     let mut killed_task_ids = alloc::vec::Vec::new();
     for process in processes.iter_mut().flatten() {
-        let selected = if let Some(group) = target_group { process.process_group == group } else { process.id.as_u64() == pid };
-        if !selected { continue; }
+        let selected = if let Some(group) = target_group {
+            process.process_group == group
+        } else {
+            process.id.as_u64() == pid
+        };
+        if !selected {
+            continue;
+        }
         matched = true;
-        if sig == 0 { continue; }
+        if sig == 0 {
+            continue;
+        }
         let action = process.signal_actions[sig as usize];
-        if action == 1 { continue; } // SIG_IGN
+        if action == 1 {
+            continue;
+        } // SIG_IGN
         if action > 1 && sig != 9 {
             process.pending_signal = sig;
             continue;
@@ -2055,16 +2237,26 @@ pub fn kill_process(pid: u64, sig: u64) -> Result<(), FileError> {
         }
         scheduler.task_count = scheduler.task_count.saturating_sub(killed_count as usize);
     }
-    if matched { Ok(()) } else { Err(FileError::NotFound) }
+    if matched {
+        Ok(())
+    } else {
+        Err(FileError::NotFound)
+    }
 }
 
 /// Set/query a minimal sigaction disposition. `handler` uses 0=SIG_DFL, 1=SIG_IGN,
 /// otherwise it is a userspace handler address. Returns the previous disposition.
 pub fn sigaction_current(sig: u64, handler: u64) -> Result<u64, FileError> {
-    if sig == 0 || sig > 31 || sig == 9 { return Err(FileError::PermissionDenied); }
+    if sig == 0 || sig > 31 || sig == 9 {
+        return Err(FileError::PermissionDenied);
+    }
     let task_id = current_task_id();
     let mut processes = PROCESS_TABLE.lock();
-    let process = processes.iter_mut().flatten().find(|p| p.task_id == task_id).ok_or(FileError::NoProcess)?;
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|p| p.task_id == task_id)
+        .ok_or(FileError::NoProcess)?;
     let slot = &mut process.signal_actions[sig as usize];
     let old = *slot;
     *slot = handler;
@@ -2073,8 +2265,13 @@ pub fn sigaction_current(sig: u64, handler: u64) -> Result<u64, FileError> {
 
 pub fn current_process_group() -> u64 {
     let task_id = current_task_id();
-    PROCESS_TABLE.lock().iter().flatten().find(|p| p.task_id == task_id)
-        .map(|p| p.process_group).unwrap_or(current_process_id())
+    PROCESS_TABLE
+        .lock()
+        .iter()
+        .flatten()
+        .find(|p| p.task_id == task_id)
+        .map(|p| p.process_group)
+        .unwrap_or(current_process_id())
 }
 
 pub fn set_process_group(pid: u64, pgid: u64) -> Result<(), FileError> {
@@ -2082,8 +2279,14 @@ pub fn set_process_group(pid: u64, pgid: u64) -> Result<(), FileError> {
     let target = if pid == 0 { caller } else { pid };
     let group = if pgid == 0 { target } else { pgid };
     let mut processes = PROCESS_TABLE.lock();
-    let process = processes.iter_mut().flatten().find(|p| p.id.as_u64() == target).ok_or(FileError::NotFound)?;
-    if target != caller && process.parent.as_u64() != caller { return Err(FileError::PermissionDenied); }
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|p| p.id.as_u64() == target)
+        .ok_or(FileError::NotFound)?;
+    if target != caller && process.parent.as_u64() != caller {
+        return Err(FileError::PermissionDenied);
+    }
     process.process_group = group;
     Ok(())
 }
@@ -2092,15 +2295,21 @@ pub fn set_process_group(pid: u64, pgid: u64) -> Result<(), FileError> {
 pub fn take_pending_signal_current() -> Option<(u64, u64)> {
     let task_id = current_task_id();
     let mut processes = PROCESS_TABLE.lock();
-    let process = processes.iter_mut().flatten().find(|p| p.task_id == task_id)?;
+    let process = processes
+        .iter_mut()
+        .flatten()
+        .find(|p| p.task_id == task_id)?;
     let sig = process.pending_signal;
-    if sig == 0 || sig > 31 { return None; }
+    if sig == 0 || sig > 31 {
+        return None;
+    }
     let handler = process.signal_actions[sig as usize];
-    if handler <= 1 { return None; }
+    if handler <= 1 {
+        return None;
+    }
     process.pending_signal = 0;
     Some((sig, handler))
 }
-
 
 pub fn seek_current(descriptor: u64, offset: u64) -> Result<u64, FileError> {
     let descriptor = usize::try_from(descriptor).map_err(|_| FileError::BadDescriptor)?;
@@ -2138,7 +2347,6 @@ pub fn unlink_current(path: &str) -> Result<(), FileError> {
         _ => FileError::NotFound,
     })
 }
-
 
 pub fn rename_current(old: &str, new: &str) -> Result<(), FileError> {
     if !current_has(Capability::FileWrite) {

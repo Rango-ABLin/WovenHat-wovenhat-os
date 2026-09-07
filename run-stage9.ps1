@@ -1,12 +1,12 @@
 $ErrorActionPreference = "Stop"
 
-$img = Get-ChildItem .\target -Recurse -Filter "wovenhat-os-uefi.img" |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-
-if (-not $img) {
-    throw "wovenhat-os-uefi.img was not found under .\target. Run cargo build first."
+# Ask the normal Cargo target for its image; test VMs can change image mtimes.
+$imagePath = & cargo run --quiet -- --print-image
+if ($LASTEXITCODE -ne 0) { throw "Failed to build the normal WovenHat image." }
+if (-not $imagePath -or -not (Test-Path -LiteralPath $imagePath)) {
+    throw "The normal build did not report an existing UEFI image."
 }
+$img = Get-Item -LiteralPath $imagePath
 
 $dataImage = Join-Path $PSScriptRoot "wovenhat-disk.img"
 if (-not (Test-Path -LiteralPath $dataImage)) {
