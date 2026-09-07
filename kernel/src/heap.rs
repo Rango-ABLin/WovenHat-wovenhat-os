@@ -13,14 +13,16 @@ pub const START: u64 = 0x4444_5000_0000;
 pub const SIZE: usize = 256 * 1024;
 
 #[global_allocator]
-static ALLOCATOR: TrackedBumpAllocator = TrackedBumpAllocator;
+static ALLOCATOR: TrackedAllocator = TrackedAllocator;
 static HEAP: Mutex<HeapState> = Mutex::new(HeapState::empty());
 
 #[derive(Clone, Copy)]
-struct Allocation {
+struct FreeBlock {
     ptr: usize,
     size: usize,
 }
+
+const MAX_FREE_BLOCKS: usize = 128;
 
 struct HeapState {
     start: usize,
@@ -28,7 +30,15 @@ struct HeapState {
     next: usize,
     total_allocations: usize,
     total_allocated_bytes: usize,
-    allocations: [Option<Allocation>; MAX_ALLOCATIONS],
+    live_allocations: [Option<LiveAllocation>; MAX_ALLOCATIONS],
+    free_list: [Option<FreeBlock>; MAX_FREE_BLOCKS],
+    free_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LiveAllocation {
+    ptr: usize,
+    size: usize,
 }
 
 impl HeapState {
@@ -39,7 +49,9 @@ impl HeapState {
             next: 0,
             total_allocations: 0,
             total_allocated_bytes: 0,
-            allocations: [None; MAX_ALLOCATIONS],
+            live_allocations: [None; MAX_ALLOCATIONS],
+            free_list: [const { None }; MAX_FREE_BLOCKS],
+            free_count: 0,
         }
     }
 
@@ -58,9 +70,69 @@ impl HeapState {
         Ok(())
     }
 
+    fn find_free(&mut self, layout: Layout) -> Option<usize> {
+        let needed = layout.size();
+        let align = layout.align();
+
+        let mut best_idx = None;
+        let mut best_size = usize::MAX;
+
+        for i in 0..self.free_count {
+            if let Some(block) = self.free_list[i] {
+                let aligned_ptr = align_up(block.ptr, align)?;
+                let waste = aligned_ptr.saturating_sub(block.ptr);
+                if waste + needed <= block.size && block.size < best_size {
+                    best_size = block.size;
+                    best_idx = Some(i);
+                }
+            }
+        }
+
+        let idx = best_idx?;
+        let block = self.free_list[idx].take()?;
+
+        let aligned_ptr = align_up(block.ptr, align)?;
+        let waste = aligned_ptr.saturating_sub(block.ptr);
+        let remaining = block.size.saturating_sub(waste + needed);
+
+        if remaining > 0 {
+            let rem_ptr = aligned_ptr + needed;
+            self.insert_free_block(FreeBlock {
+                ptr: rem_ptr,
+                size: remaining,
+            });
+        }
+
+        Some(aligned_ptr)
+    }
+
+    fn insert_free_block(&mut self, block: FreeBlock) {
+        if block.size == 0 {
+            return;
+        }
+        if self.free_count < MAX_FREE_BLOCKS {
+            self.free_list[self.free_count] = Some(block);
+            self.free_count += 1;
+        }
+    }
+
     fn alloc(&mut self, layout: Layout) -> *mut u8 {
         if self.start == 0 {
             return null_mut();
+        }
+
+        if let Some(ptr) = self.find_free(layout) {
+            let slot = match self.live_allocations.iter_mut().position(|s| s.is_none()) {
+                Some(i) => i,
+                None => return null_mut(),
+            };
+            self.live_allocations[slot] = Some(LiveAllocation {
+                ptr,
+                size: layout.size(),
+            });
+            self.total_allocations += 1;
+            self.total_allocated_bytes += layout.size();
+            return ptr as *mut u8;
         }
 
         let aligned = match align_up(self.next, layout.align()) {
@@ -77,12 +149,12 @@ impl HeapState {
             return null_mut();
         }
 
-        let slot = match self.allocations.iter_mut().position(|slot| slot.is_none()) {
-            Some(index) => index,
+        let slot = match self.live_allocations.iter_mut().position(|s| s.is_none()) {
+            Some(i) => i,
             None => return null_mut(),
         };
 
-        self.allocations[slot] = Some(Allocation {
+        self.live_allocations[slot] = Some(LiveAllocation {
             ptr: aligned,
             size: layout.size(),
         });
@@ -95,37 +167,50 @@ impl HeapState {
     fn dealloc(&mut self, pointer: *mut u8, _layout: Layout) {
         let ptr = pointer as usize;
         let Some(slot) = self
-            .allocations
+            .live_allocations
             .iter_mut()
-            .position(|slot| matches!(slot, Some(allocation) if allocation.ptr == ptr))
+            .position(|s| matches!(s, Some(a) if a.ptr == ptr))
         else {
             return;
         };
 
-        let Some(allocation) = self.allocations[slot].take() else {
+        let Some(allocation) = self.live_allocations[slot].take() else {
             return;
         };
 
         self.total_allocations = self.total_allocations.saturating_sub(1);
         self.total_allocated_bytes = self.total_allocated_bytes.saturating_sub(allocation.size);
+
+        self.insert_free_block(FreeBlock {
+            ptr: allocation.ptr,
+            size: allocation.size,
+        });
     }
 
     fn stats(&self) -> Stats {
+        let mut free_bytes = 0usize;
+        for i in 0..self.free_count {
+            if let Some(block) = self.free_list[i] {
+                free_bytes += block.size;
+            }
+        }
         Stats {
             start: START,
             size: SIZE,
             allocated_bytes: self.total_allocated_bytes,
+            free_bytes,
             allocations: self.total_allocations,
         }
     }
 }
 
-struct TrackedBumpAllocator;
+struct TrackedAllocator;
 
 pub struct Stats {
     pub start: u64,
     pub size: usize,
     pub allocated_bytes: usize,
+    pub free_bytes: usize,
     pub allocations: usize,
 }
 
@@ -136,7 +221,7 @@ pub enum InitError {
     AddressOverflow,
 }
 
-unsafe impl GlobalAlloc for TrackedBumpAllocator {
+unsafe impl GlobalAlloc for TrackedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         HEAP.lock().alloc(layout)
     }

@@ -169,7 +169,7 @@ extern "x86-interrupt" fn page_fault_handler(
         serial::write_fmt(format_args!("FAULT ADDRESS: UNAVAILABLE\n"));
     }
     serial::write_fmt(format_args!(
-        "PAGE FAULT DETAILS: PRESENT={} WRITE={} USER={} RESERVED={} INSTRUCTION_FETCH={}\n",
+        "PAGE FAULT DETAILS: PROTECTION_VIOLATION={} WRITE={} USER={} RESERVED={} INSTRUCTION_FETCH={}\n",
         error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
         error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
         error_code.contains(PageFaultErrorCode::USER_MODE),

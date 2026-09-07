@@ -114,7 +114,7 @@ impl PhysicalFrameAllocator {
             usable_regions: self.range_count,
             total_frames: self.total_frames,
             allocated_frames: self.allocated_frames,
-            remaining_frames: self.total_frames - self.allocated_frames,
+            remaining_frames: self.total_frames.saturating_sub(self.allocated_frames),
         }
     }
 
