@@ -300,12 +300,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             "[BOOT] shell-first runtime ready; entering diagnostic shell"
         ));
 
-        let mut shell = Shell::new();
-        console.clear();
-        console.println("WOVENHAT DIAGNOSTIC SHELL");
-        console.println("CORE RUNTIME: ONLINE");
-        console.println("TYPE 'help' FOR COMMANDS");
+        // Start userspace init -> /bin/sh (non-fatal if spawn fails).
+        match userspace::create_init_process() {
+            Some(program) => match task::spawn_user_process("init", program) {
+                Ok((pid, _)) => {
+                    serial::write_line(format_args!(
+                        "[BOOT] userspace init/sh scheduled as pid {}",
+                        pid.as_u64()
+                    ));
+                    console.println("USERSPACE INIT+SH: STARTED");
+                }
+                Err(_) => console.println("USERSPACE INIT+SH: SPAWN FAILED"),
+            },
+            None => console.println("USERSPACE INIT+SH: IMAGE FAILED"),
+        }
+
         console.println("");
+        let mut desktop = gui::Desktop::new(graphics::Color::DARK_BLUE);
+        let mut window = gui::Window::new(gui::Rect::new(80, 80, 480, 280), "WOVENHAT DESKTOP");
+        window.add_button(gui::Button::new(
+            gui::Rect::new(120, 180, 180, 48),
+            "ACTIVATE",
+            graphics::Color::CYAN,
+        ));
+        window.add_button(gui::Button::new(
+            gui::Rect::new(320, 180, 180, 48),
+            "SECOND",
+            graphics::Color::CYAN,
+        ));
+        desktop.add_window(window);
+        let mut shell = Shell::new();
+        let mut desktop_active = false;
+
+        // Start in the diagnostic shell. F1 toggles to the graphical desktop.
+        console.clear();
+        console.println("WOVENHAT DIAGNOSTIC SHELL (F1 TO OPEN DESKTOP)");
         shell.print_prompt(&mut console);
 
         let mut userspace_was_foreground = false;
@@ -317,12 +346,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 console.println("USERSPACE SESSION ENDED");
                 console.println("");
                 shell.print_prompt(&mut console);
+                desktop_active = false;
             }
             userspace_was_foreground = userspace_foreground;
 
+            // The kernel UI may consume PS/2 input only when no userspace
+            // process owns the foreground terminal.  In particular, do not
+            // call keyboard::poll() while /bin/sh is foreground: poll() pops
+            // the scancode from the shared queue, which would starve the
+            // userspace read(0, ...) syscall and make the shell appear hung.
             if !userspace_foreground {
                 if let Some(key) = keyboard::poll() {
-                    shell.handle_key(key, &mut console);
+                    if matches!(key, keyboard::Key::F1) {
+                        desktop_active = !desktop_active;
+                        if desktop_active {
+                            console.render_desktop(&desktop);
+                        } else {
+                            console.clear();
+                            console.println("WOVENHAT DIAGNOSTIC SHELL (F1 TO OPEN DESKTOP)");
+                            shell.print_prompt(&mut console);
+                        }
+                    } else if desktop_active {
+                        let event = match key {
+                            keyboard::Key::Char(character) => gui::InputEvent::Key(character),
+                            keyboard::Key::Enter => gui::InputEvent::Key('\n'),
+                            keyboard::Key::Backspace => gui::InputEvent::Key('\u{8}'),
+                            keyboard::Key::Tab => gui::InputEvent::Key('\t'),
+                            keyboard::Key::F1 => unreachable!(),
+                        };
+                        desktop.handle(&event);
+                        console.render_desktop(&desktop);
+                    } else {
+                        shell.handle_key(key, &mut console);
+                    }
                 }
             }
 
@@ -852,79 +908,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(feature = "qemu-test")]
     qemu_test_exit_success();
 
-    // Start userspace init -> /bin/sh (non-fatal if spawn fails).
-    match userspace::create_init_process() {
-        Some(program) => match task::spawn_user_process("init", program) {
-            Ok((pid, _)) => {
-                serial::write_line(format_args!(
-                    "[BOOT] userspace init/sh scheduled as pid {}",
-                    pid.as_u64()
-                ));
-                console.println("USERSPACE INIT+SH: STARTED");
-            }
-            Err(_) => console.println("USERSPACE INIT+SH: SPAWN FAILED"),
-        },
-        None => console.println("USERSPACE INIT+SH: IMAGE FAILED"),
-    }
-
-    console.println("");
-    let mut desktop = gui::Desktop::new(graphics::Color::DARK_BLUE);
-    let mut window = gui::Window::new(gui::Rect::new(80, 80, 480, 280), "WOVENHAT DESKTOP");
-    window.add_button(gui::Button::new(
-        gui::Rect::new(120, 180, 180, 48),
-        "ACTIVATE",
-        graphics::Color::CYAN,
-    ));
-    window.add_button(gui::Button::new(
-        gui::Rect::new(320, 180, 180, 48),
-        "SECOND",
-        graphics::Color::CYAN,
-    ));
-    desktop.add_window(window);
-    let mut shell = Shell::new();
-    let mut desktop_active = false;
-
-    // Start in the diagnostic shell. F1 toggles to the graphical desktop.
-    console.clear();
-    console.println("WOVENHAT DIAGNOSTIC SHELL (F1 TO OPEN DESKTOP)");
-    shell.print_prompt(&mut console);
-
-    //
-    // F1 switches between the desktop and diagnostic shell. Keyboard IRQ
-    // decoding stays outside both interfaces.
-    //
-    // Interrupt-driven keyboard input. The IRQ handler only queues raw
-    // scancodes; decoding and rendering remain in the main loop.
-    //
-
     loop {
-        if let Some(key) = keyboard::poll() {
-            if matches!(key, keyboard::Key::F1) {
-                desktop_active = !desktop_active;
-                if desktop_active {
-                    console.render_desktop(&desktop);
-                } else {
-                    console.clear();
-                    console.println("WOVENHAT DIAGNOSTIC SHELL (F1 TO OPEN DESKTOP)");
-                    shell.print_prompt(&mut console);
-                }
-            } else if desktop_active {
-                let event = match key {
-                    keyboard::Key::Char(character) => gui::InputEvent::Key(character),
-                    keyboard::Key::Enter => gui::InputEvent::Key('\n'),
-                    keyboard::Key::Backspace => gui::InputEvent::Key('\u{8}'),
-                    keyboard::Key::Tab => gui::InputEvent::Key('\t'),
-                    keyboard::Key::F1 => unreachable!(),
-                };
-                desktop.handle(&event);
-                console.render_desktop(&desktop);
-            } else {
-                shell.handle_key(key, &mut console);
-            }
-        }
-
-        syscall::service_pending();
-        task::preemption_point();
         x86_64::instructions::hlt();
     }
 }

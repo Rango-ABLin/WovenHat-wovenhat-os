@@ -113,16 +113,22 @@ impl Keyboard {
     }
 
     fn decode(&mut self, scancode: u8) -> Option<Key> {
+        // PS/2 Set 1: break codes have bit 7 set (make | 0x80).
+        // Filter all break codes first; only shift release is meaningful.
+        if scancode & 0x80 != 0 {
+            return match scancode {
+                0xAA | 0xB6 => {
+                    self.shift = false;
+                    None
+                }
+                _ => None,
+            };
+        }
+
         match scancode {
             // Shift pressed
             0x2A | 0x36 => {
                 self.shift = true;
-                None
-            }
-
-            // Shift released
-            0xAA | 0xB6 => {
-                self.shift = false;
                 None
             }
 
@@ -188,8 +194,14 @@ pub fn self_test() -> bool {
             .is_some_and(|key| matches!(key, Key::Enter))
 }
 pub fn handle_interrupt() {
-    // SAFETY: IRQ1 means the PS/2 controller has placed a keyboard scancode in
-    // its output buffer. Reading port 0x60 consumes exactly that byte.
+    // Confirm that the PS/2 controller really has a fresh keyboard byte before
+    // consuming port 0x60. This filters duplicate/spurious IRQ1 delivery and
+    // ignores auxiliary-device bytes.
+    let status = unsafe { inb(STATUS_PORT) };
+    if status & 0x01 == 0 || status & 0x20 != 0 {
+        return;
+    }
+
     let scancode = unsafe { inb(DATA_PORT) };
     SCANCODES.push(scancode);
 }
