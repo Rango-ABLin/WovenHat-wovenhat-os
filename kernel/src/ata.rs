@@ -23,7 +23,9 @@ const STATUS_BSY: u8 = 1 << 7;
 const POLL_LIMIT: usize = 100_000;
 const LBA28_SECTORS: u64 = 1 << 28;
 
-static PRIMARY_MASTER: Mutex<Option<AtaPio>> = Mutex::new(None);
+type BufferedAta = crate::block_cache::CachedDevice<AtaPio, 64>;
+
+static PRIMARY_MASTER: Mutex<Option<BufferedAta>> = Mutex::new(None);
 
 pub struct AtaPio {
     sectors: u64,
@@ -130,13 +132,15 @@ impl BlockDevice for AtaPio {
 }
 
 pub fn init() -> Option<u64> {
+    let mut primary = PRIMARY_MASTER.lock();
+    if let Some(disk) = primary.as_ref() { return Some(disk.sector_count()); }
     let disk = AtaPio::identify()?;
     let sectors = disk.sectors;
-    *PRIMARY_MASTER.lock() = Some(disk);
+    *primary = Some(BufferedAta::new(disk));
     Some(sectors)
 }
 
-pub fn with_primary_master<R>(operation: impl FnOnce(&mut AtaPio) -> R) -> Option<R> {
+pub fn with_primary_master<R>(operation: impl FnOnce(&mut BufferedAta) -> R) -> Option<R> {
     let mut disk = PRIMARY_MASTER.lock();
     disk.as_mut().map(operation)
 }

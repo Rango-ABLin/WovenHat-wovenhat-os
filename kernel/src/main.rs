@@ -10,6 +10,8 @@ mod audit;
 mod benchmark;
 mod block;
 mod block_cache;
+mod page_cache;
+mod file_mapping;
 mod capability;
 mod config;
 mod console;
@@ -408,8 +410,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     if block_cache::self_test() {
         console.println("BLOCK CACHE: OK");
+        serial::write_line(format_args!("[BUFFER CACHE] regression tests: PASSED"));
     } else {
         console.println("BLOCK CACHE: FAILED");
+        serial::write_line(format_args!("[BUFFER CACHE] regression tests: FAILED"));
+        halt();
+    }
+
+    if page_cache::self_test() {
+        serial::write_line(format_args!("[FILE PAGES] regression tests: PASSED"));
+    } else {
+        serial::write_line(format_args!("[FILE PAGES] regression tests: FAILED"));
         halt();
     }
 
@@ -439,8 +450,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     if vfs::self_test() {
         console.println("VFS READ/WRITE: OK");
+        serial::write_line(format_args!("[VFS] read/write and path semantics: PASSED"));
     } else {
         console.println("VFS READ/WRITE: FAILED");
+        serial::write_line(format_args!("[VFS] read/write and path semantics: FAILED"));
+        halt();
+    }
+    if userspace::file_mmap_self_test() {
+        serial::write_line(format_args!("[FILE MMAP] regression tests: PASSED"));
+    } else {
+        serial::write_line(format_args!("[FILE MMAP] regression tests: FAILED"));
         halt();
     }
     if pipe::self_test() {

@@ -203,6 +203,8 @@ pub enum Number {
     ProcessInfo = 56,
     /// command-line pointer + byte length -> spawn child, return pid
     SpawnCommand = 57,
+    /// fd, byte length, page-aligned file offset: read-only private snapshot.
+    MmapFile = 58,
 }
 
 pub fn entry_address() -> u64 {
@@ -690,7 +692,7 @@ fn sys_getticks() -> u64 {
 }
 
 fn sys_sync() -> u64 {
-    crate::storage::sync_all_mounted() as u64
+    crate::storage::sync_all_mounted().map(|count| count as u64).unwrap_or(SYSCALL_ERROR)
 }
 
 fn sys_ioctl(_fd: u64, _req: u64, _arg: u64) -> u64 {
@@ -1174,6 +1176,7 @@ pub extern "C" fn wovenhat_syscall_dispatch(
         value if value == Number::ProcessCount as u64 => crate::task::process_count() as u64,
         value if value == Number::ProcessInfo as u64 => sys_process_info(arg0, arg1),
         value if value == Number::SpawnCommand as u64 => sys_spawn_command(arg0, arg1),
+        value if value == Number::MmapFile as u64 => crate::task::mmap_file_current(arg0, arg1, arg2).unwrap_or(SYSCALL_ERROR),
         value if value == Number::Fork as u64 => sys_fork(frame),
         value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),
         value if value == Number::MessageReceive as u64 => sys_message_receive(arg0, arg1, arg2),

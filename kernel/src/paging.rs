@@ -743,6 +743,26 @@ pub fn write_user_bytes(
     Ok(())
 }
 
+/// Inspect user pages through the kernel's physical mapping without switching CR3.
+pub(crate) fn read_user_bytes_in(address_space: AddressSpace, start: u64, output: &mut [u8])
+    -> Result<(), MapRangeError> {
+    let paging = PAGING.lock();
+    let mapper = mapper_for(&paging, address_space)?;
+    let mut copied = 0;
+    while copied < output.len() {
+        let address = start.checked_add(copied as u64).ok_or(MapRangeError::InvalidRange)?;
+        let (physical, count, flags) = translated_chunk(&mapper, address, output.len() - copied)
+            .map_err(|_| MapRangeError::NotMapped)?;
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) { return Err(MapRangeError::InvalidRange); }
+        let source = paging.physical_memory_offset.checked_add(physical)
+            .ok_or(MapRangeError::InvalidRange)? as *const u8;
+        // The paging lock keeps the translated, allocated frame live while copying.
+        unsafe { core::ptr::copy_nonoverlapping(source, output[copied..].as_mut_ptr(), count); }
+        copied += count;
+    }
+    Ok(())
+}
+
 pub fn zero_user_range_in(
     address_space: AddressSpace,
     start: u64,

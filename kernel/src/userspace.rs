@@ -3720,6 +3720,27 @@ pub fn map_anonymous(
     })
 }
 
+/// Populate private, read-only NX pages without advancing the file offset.
+/// Mapping lifetime is independent of the descriptor and subsequent file writes.
+pub fn map_file_private(address_space: AddressSpace, slot: usize, file: crate::vfs::OpenFileId,
+    offset: usize, length: usize) -> Option<AnonymousMapping> {
+    let size = crate::file_mapping::mapped_size(crate::vfs::file_size(file).ok()?, offset, length)?;
+    let mapping = map_anonymous(address_space, slot, size, false)?;
+    let mut buffer = [0; 1024];
+    let mut copied = 0;
+    while copied < length {
+        let count = buffer.len().min(length - copied);
+        if crate::vfs::read_at(file, offset + copied, &mut buffer[..count]) != Ok(count)
+            || paging::write_user_bytes(address_space.paging, mapping.address + copied as u64, &buffer[..count]).is_err()
+        {
+            let _ = unmap_anonymous(address_space, mapping);
+            return None;
+        }
+        copied += count;
+    }
+    Some(mapping)
+}
+
 pub fn unmap_anonymous(address_space: AddressSpace, mapping: AnonymousMapping) -> bool {
     paging::unmap_user_range_in(address_space.paging, mapping.address, mapping.size).is_ok()
 }
@@ -3953,4 +3974,157 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> Option<()> {
         .get_mut(offset..offset + 8)?
         .copy_from_slice(&value.to_le_bytes());
     Some(())
+}
+
+/// Test real file mappings before scheduler-dependent boot tests.
+pub fn file_mmap_self_test() -> bool {
+    const PATH: &str = "/tmp/file-mmap-test";
+    static DATA: [u8; 4103] = { let mut data = [5; 4103]; data[3] = 0x33; data };
+    if crate::vfs::stat(PATH).is_ok() || crate::vfs::write_file(PATH, &DATA).is_err() { return false; }
+    let Ok(file) = crate::vfs::open(PATH) else { let _ = crate::vfs::remove(PATH); return false; };
+    let Some(root) = paging::create_user_address_space(USER_MMAP_START) else {
+        let _ = crate::vfs::close_open_file(file); let _ = crate::vfs::remove(PATH); return false;
+    };
+    let space = AddressSpace { paging: root, stack_base: 0, mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS], mapping_count: 0 };
+    let _ = crate::vfs::seek(file, 3);
+    let Some(mapping) = map_file_private(space, 0, file, 0, DATA.len()) else {
+        let _ = paging::discard_empty_user_address_space(root);
+        let _ = crate::vfs::close_open_file(file); let _ = crate::vfs::remove(PATH); return false;
+    };
+    let mut byte = [0; 1];
+    let mut tail = [9; 8];
+    let mut passed = crate::vfs::read(file, &mut byte) == Ok(1) && byte == [0x33]
+        && paging::user_range_has_protection_in(root, mapping.address, mapping.size, false, false)
+        && paging::read_user_bytes_in(root, mapping.address + 4100, &mut tail).is_ok()
+        && tail == [5, 5, 5, 0, 0, 0, 0, 0]
+        && map_file_private(space, 1, file, 1, 1).is_none()
+        && map_file_private(space, 1, file, 0, 0).is_none()
+        && map_file_private(space, 1, file, 4096, 8).is_none();
+    if let Some(offset_map) = map_file_private(space, 1, file, 4096, 7) {
+        passed &= paging::read_user_bytes_in(root, offset_map.address, &mut tail).is_ok()
+            && tail == [5, 5, 5, 5, 5, 5, 5, 0];
+        passed &= unmap_anonymous(space, offset_map);
+    } else { passed = false; }
+    passed &= crate::vfs::write_file(PATH, b"changed").is_ok();
+    passed &= crate::vfs::close_open_file(file).is_ok();
+    passed &= paging::read_user_bytes_in(root, mapping.address, &mut byte).is_ok() && byte == [5];
+    passed &= paging::destroy_user_address_space(root, &[(mapping.address, mapping.size)]).is_ok();
+    passed &= crate::vfs::remove(PATH).is_ok();
+    passed
+}
+
+global_asm!(r#"
+.section .rodata.wovenhat_file_mmap_stub, "a"
+.global wovenhat_file_mmap_start
+.global wovenhat_file_mmap_end
+wovenhat_file_mmap_start:
+    sub rsp, 16
+    mov eax, 2
+    lea rdi, [rip + wovenhat_file_mmap_path]
+    mov esi, 9
+    int 0x80
+    cmp rax, -1
+    je wovenhat_file_mmap_fail
+    mov rbx, rax
+    mov eax, 27
+    mov rdi, rbx
+    mov esi, 3
+    int 0x80
+    cmp rax, 3
+    jne wovenhat_file_mmap_fail
+    mov eax, 58
+    mov rdi, rbx
+    mov esi, 24
+    xor edx, edx
+    int 0x80
+    cmp rax, -1
+    je wovenhat_file_mmap_fail
+    mov r12, rax
+    cmp dword ptr [r12], 0x636c6557
+    jne wovenhat_file_mmap_fail
+    cmp byte ptr [r12 + 24], 0
+    jne wovenhat_file_mmap_fail
+    xor eax, eax
+    mov rdi, rbx
+    mov rsi, rsp
+    mov edx, 1
+    int 0x80
+    cmp rax, 1
+    jne wovenhat_file_mmap_fail
+    cmp byte ptr [rsp], 99
+    jne wovenhat_file_mmap_fail
+    mov eax, 58
+    mov rdi, rbx
+    mov esi, 1
+    mov edx, 1
+    int 0x80
+    cmp rax, -1
+    jne wovenhat_file_mmap_fail
+    mov eax, 58
+    mov edi, 1
+    mov esi, 1
+    xor edx, edx
+    int 0x80
+    cmp rax, -1
+    jne wovenhat_file_mmap_fail
+    mov eax, 6
+    mov rdi, rbx
+    int 0x80
+    test rax, rax
+    jne wovenhat_file_mmap_fail
+    cmp dword ptr [r12], 0x636c6557
+    jne wovenhat_file_mmap_fail
+    mov eax, 9
+    mov rdi, r12
+    mov esi, 4097
+    int 0x80
+    cmp rax, -1
+    jne wovenhat_file_mmap_fail
+    mov eax, 9
+    mov rdi, r12
+    mov esi, 24
+    int 0x80
+    test rax, rax
+    jne wovenhat_file_mmap_fail
+    mov eax, 9
+    mov rdi, r12
+    mov esi, 24
+    int 0x80
+    cmp rax, -1
+    jne wovenhat_file_mmap_fail
+    lea rsi, [rip + wovenhat_file_mmap_pass]
+    xor ebx, ebx
+    jmp wovenhat_file_mmap_report
+wovenhat_file_mmap_fail:
+    lea rsi, [rip + wovenhat_file_mmap_bad]
+    mov ebx, 1
+wovenhat_file_mmap_report:
+    mov eax, 1
+    mov edi, 1
+    mov edx, 16
+    int 0x80
+    mov eax, 3
+    mov edi, ebx
+    int 0x80
+2:  jmp 2b
+wovenhat_file_mmap_path: .ascii "/etc/motd"
+wovenhat_file_mmap_pass: .ascii "FILE MMAP: PASS\n"
+wovenhat_file_mmap_bad: .ascii "FILE MMAP: FAIL\n"
+wovenhat_file_mmap_end:
+.previous
+.global wovenhat_sys_mmap_file
+wovenhat_sys_mmap_file:
+    mov eax, 58
+    int 0x80
+    ret
+"#);
+
+pub fn install_file_mmap_test() -> bool {
+    unsafe extern "C" { static wovenhat_file_mmap_start: u8; static wovenhat_file_mmap_end: u8; }
+    let stub = unsafe {
+        let start = &wovenhat_file_mmap_start as *const u8;
+        let end = &wovenhat_file_mmap_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    };
+    build_stub_elf(stub).is_some_and(|elf| crate::vfs::create_read_only("/bin/mmaptest", &elf).is_ok())
 }

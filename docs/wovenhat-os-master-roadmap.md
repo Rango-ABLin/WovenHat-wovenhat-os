@@ -72,7 +72,9 @@ Current drivers are QEMU-specific. A fully-fledged OS needs a driver framework, 
 - [ ] FAT32 **write path** (you have read; directory creation, cluster allocation, free-space tracking, safe unmount/flush are still needed)
 - [ ] Journaling or copy-on-write filesystem option (ext-like or a from-scratch CoW design) — FAT32 alone is not a serious modern filesystem (no permissions, no journaling, 4 GB file cap)
 - [ ] Raise `fat32::MAX_READ_CLUSTERS` (currently 64) to a streaming read model instead of a hard cap — needed before real files/executables get larger
-- [ ] Buffer cache / page cache layer between VFS and block devices (currently every read hits the device layer directly)
+- [x] Persistent ATA sector buffer cache with bounded LRU replacement, dirty writeback, failure retry, and diagnostics; see `buffer-cache.md`.
+- [x] Demand-loaded clean FAT32 file pages with bounded LRU caching and invalidation; see `file-page-cache.md`.
+- [ ] VM frame-backed file pages, physical memory reclamation, and file-backed mmap coherence.
 - [ ] File permissions tied into your existing UID/GID syscalls (`Getuid`/`Getgid` exist; nothing currently enforces per-file access control)
 - **Definition of done**: can build and store a real userspace toolchain's output on-disk, survive unclean shutdown without corruption, and enforce per-user file permissions.
 

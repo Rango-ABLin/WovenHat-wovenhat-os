@@ -16,10 +16,22 @@ pub enum NodeKind {
 }
 
 #[derive(Clone, Copy)]
+struct DiskPath {
+    bytes: [u8; PATH_CAPACITY],
+    length: usize,
+}
+impl DiskPath {
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("")
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Node {
     path: [u8; PATH_CAPACITY],
     path_length: usize,
     data: [u8; NODE_CAPACITY],
+    backing: Option<DiskPath>,
     length: usize,
     writable: bool,
     kind: NodeKind,
@@ -32,6 +44,7 @@ impl Node {
             path: [0; PATH_CAPACITY],
             path_length: 0,
             data: [0; NODE_CAPACITY],
+            backing: None,
             length: 0,
             writable: false,
             kind: NodeKind::File,
@@ -195,6 +208,7 @@ impl Registry {
     }
 
     fn remove(&mut self, path: &str) -> Result<(), Error> {
+        validate_absolute_path(path)?;
         if path == "/" {
             return Err(Error::ReadOnly);
         }
@@ -209,7 +223,7 @@ impl Registry {
             let dir_path = node.path_str();
             for other in self.nodes.iter().filter(|n| n.occupied) {
                 if immediate_child_name(dir_path, other.path_str()).is_some() {
-                    return Err(Error::Full); // reuse as "not empty"
+                    return Err(Error::NotEmpty);
                 }
             }
         }
@@ -223,22 +237,46 @@ impl Registry {
         if old == "/" || new == "/" {
             return Err(Error::ReadOnly);
         }
+        let index = self.nodes.iter().position(|n| n.matches(old)).ok_or(Error::NotFound)?;
+        if old == new {
+            return Ok(());
+        }
         if self.nodes.iter().any(|n| n.matches(new)) {
             return Err(Error::AlreadyExists);
         }
-        let index = self
-            .nodes
-            .iter()
-            .position(|n| n.matches(old))
-            .ok_or(Error::NotFound)?;
-        let node = &mut self.nodes[index];
-        let bytes = new.as_bytes();
-        if bytes.len() >= PATH_CAPACITY {
-            return Err(Error::Full);
+        if descendant_suffix(old, new).is_some() {
+            return Err(Error::InvalidPath);
         }
-        node.path = [0; PATH_CAPACITY];
-        node.path[..bytes.len()].copy_from_slice(bytes);
-        node.path_length = bytes.len();
+        let parent = parent_path(new).ok_or(Error::InvalidPath)?;
+        if !self.nodes.iter().any(|n| n.matches(parent) && n.kind == NodeKind::Directory) {
+            return Err(Error::NotFound);
+        }
+        let directory = self.nodes[index].kind == NodeKind::Directory;
+        // Preflight every resulting path before changing any node. Keep node indices
+        // stable so existing open-file descriptions continue to reference their data.
+        for node in self.nodes.iter().filter(|n| n.occupied) {
+            if directory {
+                if let Some(suffix) = descendant_suffix(old, node.path_str()) {
+                    if new.len() + suffix.len() > PATH_CAPACITY {
+                        return Err(Error::InvalidPath);
+                    }
+                }
+            }
+        }
+        for node in self.nodes.iter_mut().filter(|n| n.occupied) {
+            let suffix_start = if node.matches(old) || (directory && descendant_suffix(old, node.path_str()).is_some()) {
+                Some(old.len())
+            } else {
+                None
+            };
+            if let Some(start) = suffix_start {
+                let suffix_len = node.path_length - start;
+                node.path.copy_within(start..node.path_length, new.len());
+                node.path[..new.len()].copy_from_slice(new.as_bytes());
+                node.path_length = new.len() + suffix_len;
+                node.path[node.path_length..].fill(0);
+            }
+        }
         Ok(())
     }
 
@@ -264,6 +302,7 @@ impl Registry {
     }
 
     fn stat(&self, path: &str) -> Result<Stat, Error> {
+        validate_absolute_path(path)?;
         let node = self
             .nodes
             .iter()
@@ -278,6 +317,7 @@ impl Registry {
 
     /// Return the `index`-th direct child of `dir_path` (0-based).
     fn readdir(&self, dir_path: &str, index: usize) -> Result<DirEntry, Error> {
+        validate_absolute_path(dir_path)?;
         let dir = self
             .nodes
             .iter()
@@ -315,11 +355,20 @@ fn validate_absolute_path(path: &str) -> Result<(), Error> {
     if path.as_bytes().contains(&0) {
         return Err(Error::InvalidPath);
     }
-    // Reject trailing slash except for root.
-    if path.len() > 1 && path.ends_with('/') {
+    // The VFS accepts canonical absolute paths. Shell/task resolvers handle
+    // relative paths and dot components before entering this layer. Limit each
+    // component to the directory-entry ABI so names are never truncated.
+    if path != "/" && path[1..].split('/').any(|part|
+        part.is_empty() || part == "." || part == ".." || part.len() > MAX_DIR_NAME
+    ) {
         return Err(Error::InvalidPath);
     }
     Ok(())
+}
+
+/// Return the slash-prefixed suffix only at a directory boundary.
+fn descendant_suffix<'a>(directory: &str, path: &'a str) -> Option<&'a str> {
+    path.strip_prefix(directory).filter(|suffix| suffix.starts_with('/'))
 }
 
 fn parent_path(path: &str) -> Option<&str> {
@@ -469,10 +518,24 @@ pub enum Error {
     AlreadyExists,
     ReadOnly,
     Full,
+    NotEmpty,
+    Io,
 }
 
 pub fn create_read_only(path: &str, data: &[u8]) -> Result<(), Error> {
     REGISTRY.lock().insert(path, data, false).map(|_| ())
+}
+
+/// Import disk metadata without copying the file payload into VFS RAM storage.
+pub fn create_disk_file(path: &str, length: usize) -> Result<(), Error> {
+    if length > NODE_CAPACITY { return Err(Error::Full); }
+    let mut registry = REGISTRY.lock();
+    let index = registry.insert(path, &[], false)?;
+    let mut backing = DiskPath { bytes: [0; PATH_CAPACITY], length: path.len() };
+    backing.bytes[..path.len()].copy_from_slice(path.as_bytes());
+    registry.nodes[index].backing = Some(backing);
+    registry.nodes[index].length = length;
+    Ok(())
 }
 
 /// Create or overwrite a writable file.
@@ -507,6 +570,7 @@ pub fn readdir(path: &str, index: usize) -> Result<DirEntry, Error> {
 /// Open a **file** path and return a new open-file description (refcount = 1).
 /// Directories cannot be opened for read/write; use `readdir` / `stat` instead.
 pub fn open(path: &str) -> Result<OpenFileId, Error> {
+    validate_absolute_path(path)?;
     let registry = REGISTRY.lock();
     let node = registry
         .nodes
@@ -529,11 +593,27 @@ pub fn close_open_file(id: OpenFileId) -> Result<(), Error> {
     OPEN_FILES.lock().drop_id(id)
 }
 
+pub fn file_size(id: OpenFileId) -> Result<usize, Error> {
+    let mut table = OPEN_FILES.lock();
+    let index = table.get_mut(id)?.node;
+    REGISTRY.lock().nodes.get(index).filter(|node| node.occupied && node.kind == NodeKind::File)
+        .map(|node| node.length).ok_or(Error::InvalidDescriptor)
+}
+
+/// Positional reads do not alter the shared open-file offset.
+pub fn read_at(id: OpenFileId, offset: usize, buffer: &mut [u8]) -> Result<usize, Error> {
+    read_from(id, Some(offset), buffer)
+}
+
 pub fn read(id: OpenFileId, buffer: &mut [u8]) -> Result<usize, Error> {
+    read_from(id, None, buffer)
+}
+
+fn read_from(id: OpenFileId, position: Option<usize>, buffer: &mut [u8]) -> Result<usize, Error> {
     let mut table = OPEN_FILES.lock();
     let entry = table.get_mut(id)?;
     let node_index = entry.node;
-    let offset = entry.offset;
+    let offset = position.unwrap_or(entry.offset);
 
     let registry = REGISTRY.lock();
     let node = registry
@@ -545,15 +625,23 @@ pub fn read(id: OpenFileId, buffer: &mut [u8]) -> Result<usize, Error> {
         return Err(Error::InvalidDescriptor);
     }
     let count = core::cmp::min(node.length - offset, buffer.len());
-    buffer[..count].copy_from_slice(&node.data[offset..offset + count]);
-    drop(registry);
+    if let Some(backing) = node.backing {
+        drop(registry);
+        let read = crate::storage::read_disk_file(backing.as_str(), offset, &mut buffer[..count])
+            .map_err(|_| Error::Io)?;
+        if read != count { return Err(Error::Io); }
+    } else {
+        buffer[..count].copy_from_slice(&node.data[offset..offset + count]);
+        drop(registry);
+    }
 
     let entry = table.get_mut(id)?;
-    entry.offset = offset + count;
+    if position.is_none() { entry.offset = offset + count; }
     Ok(count)
 }
 
 pub fn read_all(path: &str, buffer: &mut [u8]) -> Result<usize, Error> {
+    validate_absolute_path(path)?;
     let registry = REGISTRY.lock();
     let node = registry
         .nodes
@@ -563,8 +651,16 @@ pub fn read_all(path: &str, buffer: &mut [u8]) -> Result<usize, Error> {
     if node.length > buffer.len() {
         return Err(Error::Full);
     }
-    buffer[..node.length].copy_from_slice(&node.data[..node.length]);
-    Ok(node.length)
+    let length = node.length;
+    if let Some(backing) = node.backing {
+        drop(registry);
+        let read = crate::storage::read_disk_file(backing.as_str(), 0, &mut buffer[..length])
+            .map_err(|_| Error::Io)?;
+        if read != length { return Err(Error::Io); }
+    } else {
+        buffer[..length].copy_from_slice(&node.data[..length]);
+    }
+    Ok(length)
 }
 
 pub fn seek(id: OpenFileId, offset: usize) -> Result<usize, Error> {
@@ -617,7 +713,7 @@ pub fn write(id: OpenFileId, buffer: &[u8]) -> Result<usize, Error> {
 /// Directories are skipped. Intended for storage layer discovery under `/mnt`.
 pub fn for_each_file_with_prefix<F>(prefix: &str, mut f: F)
 where
-    F: FnMut(&str, &[u8]),
+    F: FnMut(&str),
 {
     let registry = REGISTRY.lock();
     for node in registry.nodes.iter() {
@@ -626,7 +722,7 @@ where
         }
         let path = node.path_str();
         if path.starts_with(prefix) {
-            f(path, &node.data[..node.length]);
+            f(path);
         }
     }
 }
@@ -640,7 +736,13 @@ pub fn open_file_description_count() -> usize {
 }
 
 pub fn self_test() -> bool {
-    let mut scratch = Registry::empty();
+    // The registry exceeds the 1 MiB boot stack. Reserve scratch storage
+    // statically and reset one node at a time so repeated self-tests are safe.
+    static SCRATCH: Mutex<Registry> = Mutex::new(Registry::empty());
+    let mut scratch = SCRATCH.lock();
+    for node in &mut scratch.nodes {
+        *node = Node::empty();
+    }
     // Parent directories required before inserting files.
     let root_ok = scratch.mkdir("/").is_err(); // root cannot be created via mkdir on empty
     scratch.nodes[0] = Node::directory(b"/");
@@ -649,6 +751,8 @@ pub fn self_test() -> bool {
     let duplicate = scratch.insert("/mnt/test.txt", b"again", false) == Err(Error::AlreadyExists);
     let invalid_path = scratch.insert("relative", b"bad", false) == Err(Error::InvalidPath);
     let no_parent = scratch.insert("/missing/file", b"x", false) == Err(Error::NotFound);
+
+    let path_semantics = path_semantics_self_test(&mut scratch);
 
     // Directory listing on the live registry.
     let root_stat = matches!(stat("/"), Ok(Stat { kind: NodeKind::Directory, .. }));
@@ -720,6 +824,16 @@ pub fn self_test() -> bool {
     // Directories cannot be opened as files.
     let dir_open_rejected = open("/etc").is_err();
 
+    // A descriptor opened before a directory move still reads the same file.
+    let moved = rename("/tmp", "/vfs-moved").is_ok();
+    let handle_survives = moved
+        && seek(reader, 0) == Ok(0)
+        && read(reader, &mut buffer) == Ok(payload.len())
+        && buffer == *payload
+        && stat("/tmp/vfs-self-test").is_err()
+        && stat("/vfs-moved/vfs-self-test").is_ok();
+    let restored = moved && rename("/vfs-moved", "/tmp").is_ok();
+
     let _ = close_open_file(protected);
     let _ = close_open_file(reader);
     let _ = close_open_file(shared);
@@ -737,6 +851,7 @@ pub fn self_test() -> bool {
         && duplicate
         && invalid_path
         && no_parent
+        && path_semantics
         && root_stat
         && etc_stat
         && file_stat
@@ -745,6 +860,88 @@ pub fn self_test() -> bool {
         && round_trip
         && read_only_ok
         && dir_open_rejected
+        && handle_survives
+        && restored
         && cleaned
         && boot_nodes
+}
+
+/// Exercise path semantics on the statically allocated scratch registry.
+fn path_semantics_self_test(fs: &mut Registry) -> bool {
+    for path in ["", "relative", "//home", "/home/", "/home//x", "/home/./x", "/home/../x", "/nul\0x"] {
+        if fs.mkdir(path) != Err(Error::InvalidPath)
+            || fs.remove(path) != Err(Error::InvalidPath)
+            || !matches!(fs.stat(path), Err(Error::InvalidPath))
+            || !matches!(fs.readdir(path, 0), Err(Error::InvalidPath))
+            || fs.rename(path, "/valid") != Err(Error::InvalidPath)
+            || fs.rename("/mnt", path) != Err(Error::InvalidPath)
+            || fs.write_file(path, b"x") != Err(Error::InvalidPath)
+            || open(path) != Err(Error::InvalidPath)
+            || read_all(path, &mut [0; 1]) != Err(Error::InvalidPath)
+        {
+            return false;
+        }
+    }
+    for path in ["/home", "/home/anthony", "/home/anthony/docs", "/home/anthony2"] {
+        if fs.mkdir(path).is_err() { return false; }
+    }
+    let Ok(file_index) = fs.insert("/home/anthony/docs/a.txt", b"payload", true) else { return false; };
+    let count = fs.count();
+    if fs.remove("/home/anthony") != Err(Error::NotEmpty)
+        || fs.rename("/home/anthony", "/missing/user") != Err(Error::NotFound)
+        || fs.rename("/home/anthony", "/mnt/test.txt/user") != Err(Error::NotFound)
+        || fs.rename("/home/anthony", "/home/anthony/docs/user") != Err(Error::InvalidPath)
+        || fs.rename("/home/anthony", "/home/anthony2") != Err(Error::AlreadyExists)
+        || fs.rename("/", "/root") != Err(Error::ReadOnly)
+        || fs.rename("/home", "/") != Err(Error::ReadOnly)
+        || fs.rename("/missing", "/missing") != Err(Error::NotFound)
+        || fs.rename("/home/anthony", "/home/anthony").is_err()
+        || !fs.nodes[file_index].matches("/home/anthony/docs/a.txt")
+        || fs.count() != count
+    { return false; }
+    if fs.rename("/home/anthony", "/home/user").is_err()
+        || fs.stat("/home/anthony").is_ok()
+        || fs.stat("/home/anthony/docs").is_ok()
+        || fs.stat("/home/anthony/docs/a.txt").is_ok()
+        || fs.stat("/home/user").is_err()
+        || fs.stat("/home/user/docs").is_err()
+        || fs.stat("/home/anthony2").is_err()
+        || !fs.nodes[file_index].matches("/home/user/docs/a.txt")
+        || &fs.nodes[file_index].data[..7] != b"payload"
+        || !fs.nodes[file_index].writable
+        || fs.count() != count
+        || !matches!(fs.readdir("/home/user", 0), Ok(entry) if entry.name_str() == "docs")
+        || !matches!(fs.readdir("/home/user/docs", 0), Ok(entry) if entry.name_str() == "a.txt")
+    { return false; }
+    // Destination itself fits, but its descendants would exceed path capacity.
+    let parent = alloc::format!("/{}", "p".repeat(60));
+    let destination = alloc::format!("{}/{}", parent, "d".repeat(60));
+    if fs.mkdir(&parent).is_err()
+        || fs.rename("/home/user", &destination) != Err(Error::InvalidPath)
+        || fs.stat(&destination).is_ok()
+        || fs.stat("/home/user/docs").is_err()
+        || !fs.nodes[file_index].matches("/home/user/docs/a.txt")
+    { return false; }
+    // Exactly PATH_CAPACITY bytes is valid for both insertion and rename.
+    let parent = alloc::format!("/{}", "p".repeat(63));
+    let boundary = alloc::format!("{}/{}", parent, "a".repeat(63));
+    let renamed = alloc::format!("{}/{}", parent, "b".repeat(63));
+    let oversized = alloc::format!("{}/{}", parent, "c".repeat(64));
+    let long_component = alloc::format!("/{}", "x".repeat(MAX_DIR_NAME + 1));
+    if fs.mkdir(&parent).is_err() || fs.mkdir(&boundary).is_err()
+        || fs.rename(&boundary, &renamed).is_err()
+        || fs.mkdir(&oversized) != Err(Error::InvalidPath)
+        || fs.mkdir(&long_component) != Err(Error::InvalidPath)
+        || fs.rename(&renamed, &oversized) != Err(Error::InvalidPath)
+        || fs.stat(&renamed).is_err()
+    { return false; }
+    // Move to another parent, then shorten the prefix, retaining file identity.
+    fs.rename("/home/user/docs", "/mnt/docs").is_ok()
+        && fs.rename("/mnt/docs/a.txt", "/mnt/docs/b.txt").is_ok()
+        && fs.rename("/mnt/docs", "/d").is_ok()
+        && fs.nodes[file_index].matches("/d/b.txt")
+        && fs.remove("/d") == Err(Error::NotEmpty)
+        && fs.remove("/d/b.txt").is_ok()
+        && fs.remove("/d").is_ok()
+        && fs.remove("/home/user").is_ok()
 }

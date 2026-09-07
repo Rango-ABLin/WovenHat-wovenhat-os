@@ -6,7 +6,7 @@ const DIRECTORY_ENTRIES_PER_SECTOR: usize = SECTOR_SIZE / DIRECTORY_ENTRY_SIZE;
 const FAT32_ENTRY_MASK: u32 = 0x0fff_ffff;
 const FAT32_BAD_CLUSTER: u32 = 0x0fff_fff7;
 const FAT32_END_MIN: u32 = 0x0fff_fff8;
-const MAX_READ_CLUSTERS: usize = 64;
+const MAX_READ_CLUSTERS: usize = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -406,44 +406,43 @@ pub fn read_file(
     entry: DirectoryEntry,
     buffer: &mut [u8],
 ) -> Result<usize, Error> {
-    let file_size = entry.size as usize;
-    let target = core::cmp::min(file_size, buffer.len());
-    if target == 0 {
-        return Ok(0);
-    }
+    read_file_at(device, volume, entry, 0, buffer)
+}
 
+/// Read a byte range without loading preceding file contents.
+pub fn read_file_at(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    entry: DirectoryEntry,
+    offset: usize,
+    buffer: &mut [u8],
+) -> Result<usize, Error> {
+    let target = (entry.size as usize).saturating_sub(offset).min(buffer.len());
+    if target == 0 { return Ok(0); }
     let mut cluster = entry.first_cluster;
     let mut visited = [0_u32; MAX_READ_CLUSTERS];
     let mut visited_count = 0;
+    let mut position = 0usize;
     let mut copied = 0;
     let mut sector = [0_u8; SECTOR_SIZE];
-
     while copied < target {
-        if visited_count == visited.len() {
-            return Err(Error::ChainTooLong);
-        }
-        if visited[..visited_count].contains(&cluster) {
-            return Err(Error::ChainLoop);
-        }
+        if visited_count == visited.len() { return Err(Error::ChainTooLong); }
+        if visited[..visited_count].contains(&cluster) { return Err(Error::ChainLoop); }
         visited[visited_count] = cluster;
         visited_count += 1;
-
         let cluster_lba = volume.cluster_lba(cluster)?;
         for sector_index in 0..volume.sectors_per_cluster as u64 {
-            if copied == target {
-                break;
+            if copied == target { break; }
+            if position + SECTOR_SIZE > offset {
+                device.read_sector(cluster_lba + sector_index, &mut sector).map_err(Error::Block)?;
+                let start = offset.saturating_sub(position);
+                let count = (SECTOR_SIZE - start).min(target - copied);
+                buffer[copied..copied + count].copy_from_slice(&sector[start..start + count]);
+                copied += count;
             }
-            device
-                .read_sector(cluster_lba + sector_index, &mut sector)
-                .map_err(Error::Block)?;
-            let count = core::cmp::min(SECTOR_SIZE, target - copied);
-            buffer[copied..copied + count].copy_from_slice(&sector[..count]);
-            copied += count;
+            position += SECTOR_SIZE;
         }
-        if copied == target {
-            return Ok(copied);
-        }
-
+        if copied == target { return Ok(copied); }
         cluster = match next_cluster(device, volume, cluster)? {
             ClusterLink::Next(next) => next,
             ClusterLink::End => return Err(Error::TruncatedFile),
@@ -1072,5 +1071,28 @@ pub fn self_test() -> bool {
         find_root(&mut root_cycle, volume, b"MISSING TXT") == Err(Error::ChainLoop)
     });
 
-    valid && invalid_rejected && cycle_rejected && root_cycle_rejected
+    valid && invalid_rejected && cycle_rejected && root_cycle_rejected && range_self_test()
+}
+
+fn range_self_test() -> bool {
+    let mut disk = TestDisk { valid_signature: true, cyclic_chain: false };
+    let Ok(volume) = mount(&mut disk) else { return false; };
+    let Ok(entry) = find_root(&mut disk, volume, b"KERNEL  BIN") else { return false; };
+    let mut data = [0; 32];
+    if read_file_at(&mut disk, volume, entry, 500, &mut data) != Ok(32)
+        || data[..12] != [b'A'; 12] || data[12..] != [b'B'; 20]
+    { return false; }
+    data.fill(0);
+    read_file_at(&mut disk, volume, entry, 590, &mut data) == Ok(10)
+        && data[..10] == [b'B'; 10] && data[10..] == [0; 22]
+        && read_file_at(&mut disk, volume, entry, 600, &mut data) == Ok(0)
+        && read_file_at(&mut disk, volume, entry, usize::MAX, &mut data) == Ok(0)
+}
+
+#[cfg(test)]
+mod range_tests {
+    #[test]
+    fn unaligned_range_and_eof() { assert!(super::range_self_test()); }
+    #[test]
+    fn existing_fat32_regressions() { assert!(super::self_test()); }
 }

@@ -1,4 +1,4 @@
-use crate::{ata, block_cache::CachedDevice, fat32, gpt, partition, vfs};
+use crate::{ata, fat32, gpt, partition, vfs};
 
 const DIRECTORY_ATTRIBUTE: u8 = 0x10;
 const MAX_IMPORT_DEPTH: usize = 2;
@@ -109,9 +109,7 @@ fn import_directory(
         if entry.size as usize > vfs::NODE_CAPACITY {
             continue;
         }
-        let mut data = [0_u8; vfs::NODE_CAPACITY];
-        let length = fat32::read_file(device, volume, entry, &mut data)?;
-        match vfs::create_read_only(path, &data[..length]) {
+        match vfs::create_disk_file(path, entry.size as usize) {
             Ok(()) => mounted += 1,
             Err(vfs::Error::AlreadyExists) => {}
             Err(vfs::Error::Full) => return Err(fat32::Error::DirectoryFull),
@@ -252,9 +250,7 @@ fn import_resolved(
     if entry.size as usize > vfs::NODE_CAPACITY {
         return Err(EnsureError::TooLarge);
     }
-    let mut data = [0_u8; vfs::NODE_CAPACITY];
-    let length = fat32::read_file(device, volume, entry, &mut data).map_err(map_fat_err)?;
-    match vfs::create_read_only(full_path, &data[..length]) {
+    match vfs::create_disk_file(full_path, entry.size as usize) {
         Ok(()) | Err(vfs::Error::AlreadyExists) => Ok(()),
         Err(_) => Err(EnsureError::Vfs),
     }
@@ -353,10 +349,10 @@ fn persist_on_device(
     path: &str,
     data: &[u8],
 ) -> Result<(), PersistError> {
-    // Cache metadata + data sectors for the whole transaction, then flush once.
-    let mut cache = CachedDevice::<_, 16>::new(device);
-    let result = persist_on_cached_device(&mut cache, path, data);
-    let flushed = cache.flush().map_err(|_| PersistError::Failed);
+    // The ATA cache survives this transaction; flush before reporting success.
+    FILE_PAGES.lock().invalidate();
+    let result = persist_on_cached_device(device, path, data);
+    let flushed = device.flush().map_err(|_| PersistError::Failed);
     result.and(flushed)
 }
 
@@ -401,9 +397,9 @@ pub fn persist_directory(path: &str) -> Result<(), PersistError> {
         }
     }
     ata::with_primary_master(|disk| {
-        let mut cache = CachedDevice::<_, 16>::new(disk);
-        let result = mkdir_on_cached_device(&mut cache, relative);
-        let flushed = cache.flush().map_err(|_| PersistError::Failed);
+        FILE_PAGES.lock().invalidate();
+        let result = mkdir_on_cached_device(disk, relative);
+        let flushed = disk.flush().map_err(|_| PersistError::Failed);
         result.and(flushed)
     }).unwrap_or(Err(PersistError::NoDevice))
 }
@@ -449,12 +445,59 @@ pub fn fat32_writable() -> bool {
 
 /// Best-effort walk of every VFS file under `/mnt/` and persist each one.
 /// Returns the number of files successfully written.
-pub fn sync_all_mounted() -> usize {
-    let mut ok = 0usize;
-    vfs::for_each_file_with_prefix("/mnt/", |path, _data| {
-        if persist_path(path).is_ok() {
-            ok += 1;
-        }
+pub fn sync_all_mounted() -> Result<usize, PersistError> {
+    // Snapshot names while holding VFS; persistence reacquires VFS to read data.
+    // Never call persist_path from the registry's locked callback.
+    let mut paths = alloc::vec::Vec::new();
+    vfs::for_each_file_with_prefix("/mnt/", |path| {
+        paths.push(alloc::string::String::from(path));
     });
-    ok
+    let mut ok = 0usize;
+    let mut failed = false;
+    for path in paths {
+        if persist_path(&path).is_ok() { ok += 1; } else { failed = true; }
+    }
+    if ata::with_primary_master(|disk| disk.flush()).is_some_and(|r| r.is_err()) {
+        failed = true;
+    }
+    if failed { Err(PersistError::Failed) } else { Ok(ok) }
+}
+
+// Lock order: ATA device, then file pages. Never call VFS while holding pages.
+static FILE_PAGES: spin::Mutex<crate::page_cache::PageCache<16>> =
+    spin::Mutex::new(crate::page_cache::PageCache::new());
+
+pub fn page_cache_stats() -> crate::page_cache::Stats { FILE_PAGES.lock().stats() }
+
+pub fn read_disk_file(path: &str, offset: usize, output: &mut [u8]) -> Result<usize, crate::block::Error> {
+    let relative = path.strip_prefix("/mnt/").ok_or(crate::block::Error::InvalidBuffer)?;
+    ata::with_primary_master(|disk| {
+        FILE_PAGES.lock().read(path, offset, output, |start, page| {
+            read_disk_page(disk, relative, start, page).map_err(|_| crate::block::Error::DeviceFault)
+        })
+    }).unwrap_or(Err(crate::block::Error::DeviceFault))
+}
+
+fn read_volume_page(device: &mut impl crate::block::BlockDevice, volume: fat32::Volume,
+    path: &str, offset: usize, output: &mut [u8]) -> Result<usize, fat32::Error> {
+    let entry = fat32::resolve_path(device, volume, path)?;
+    if entry.attributes & DIRECTORY_ATTRIBUTE != 0 { return Err(fat32::Error::NotFound); }
+    fat32::read_file_at(device, volume, entry, offset, output)
+}
+
+fn read_disk_page(device: &mut impl crate::block::BlockDevice, path: &str,
+    offset: usize, output: &mut [u8]) -> Result<usize, fat32::Error> {
+    match fat32::mount(device) {
+        Ok(volume) => return read_volume_page(device, volume, path, offset, output),
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {},
+        Err(error) => return Err(error),
+    }
+    let part = match partition::find_fat32(device) {
+        Ok(Some(part)) => part,
+        _ => gpt::find_fat_partition(device).map_err(|_| fat32::Error::InvalidBootSector)?
+            .ok_or(fat32::Error::InvalidBootSector)?,
+    };
+    let mut view = partition::PartitionDevice::new(device, part).map_err(|_| fat32::Error::InvalidBootSector)?;
+    let volume = fat32::mount(&mut view)?;
+    read_volume_page(&mut view, volume, path, offset, output)
 }

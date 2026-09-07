@@ -430,10 +430,13 @@ pub enum FileError {
     TooManyFiles,
     BadDescriptor,
     AlreadyExists,
+    NotEmpty,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MemoryError {
+    PermissionDenied,
+    BadDescriptor,
     NoProcess,
     InvalidLength,
     Full,
@@ -1185,6 +1188,36 @@ pub fn mmap_current(length: u64, writable: bool) -> Result<u64, MemoryError> {
     }
     process.memory_mappings[slot] = Some(mapping);
     Ok(mapping.address)
+}
+
+pub fn mmap_file_current(descriptor: u64, length: u64, offset: u64) -> Result<u64, MemoryError> {
+    if !current_has(Capability::FileRead) { return Err(MemoryError::PermissionDenied); }
+    let descriptor = usize::try_from(descriptor).map_err(|_| MemoryError::BadDescriptor)?;
+    let length = usize::try_from(length).map_err(|_| MemoryError::InvalidLength)?;
+    let offset = usize::try_from(offset).map_err(|_| MemoryError::InvalidLength)?;
+    let task_id = current_task_id();
+    let (index, slot, address_space, file) = {
+        let processes = PROCESS_TABLE.lock();
+        let index = processes.iter().position(|p| p.is_some_and(|p| p.task_id == task_id))
+            .ok_or(MemoryError::NoProcess)?;
+        let process = processes[index].ok_or(MemoryError::NoProcess)?;
+        let Some(FdKind::File(file)) = process.files.get(descriptor).copied().flatten() else {
+            return Err(MemoryError::BadDescriptor);
+        };
+        let slot = process.memory_mappings.iter().position(Option::is_none).ok_or(MemoryError::Full)?;
+        (index, slot, process.address_space.ok_or(MemoryError::NoProcess)?, file)
+    };
+    let mapping = userspace::map_file_private(address_space, slot, file, offset, length)
+        .ok_or(MemoryError::MappingFailed)?;
+    let mut processes = PROCESS_TABLE.lock();
+    if let Some(process) = processes[index].as_mut().filter(|p| p.task_id == task_id) {
+        if process.memory_mappings[slot].is_none() {
+            process.memory_mappings[slot] = Some(mapping);
+            return Ok(mapping.address);
+        }
+    }
+    let _ = userspace::unmap_anonymous(address_space, mapping);
+    Err(MemoryError::Full)
 }
 
 pub fn munmap_current(address: u64, length: u64) -> Result<(), MemoryError> {
@@ -2101,6 +2134,7 @@ pub fn unlink_current(path: &str) -> Result<(), FileError> {
     vfs::remove(path).map_err(|e| match e {
         vfs::Error::NotFound => FileError::NotFound,
         vfs::Error::ReadOnly => FileError::PermissionDenied,
+        vfs::Error::NotEmpty => FileError::NotEmpty,
         _ => FileError::NotFound,
     })
 }

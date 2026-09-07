@@ -15,7 +15,7 @@ This revision implements the five follow-up areas requested after the initial FA
 
 - New `block_cache.rs` provides a fixed-size, allocation-free write-back sector cache.
 - Reads are cached and dirty sectors are coalesced until `flush()`.
-- FAT32 persistence transactions use a 16-sector cache and flush once after the operation.
+- Updated 2026-09-07: the ATA device now owns a persistent 64-sector cache shared by mounting, reads, and persistence. Persist operations explicitly flush and retain clean entries; see `buffer-cache.md`.
 - Hit/miss counters and a RAM-disk self-test are included.
 
 ## 3. Userspace utilities and mini-libc

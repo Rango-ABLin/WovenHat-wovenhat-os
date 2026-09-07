@@ -6,3 +6,5 @@ target/
 *.exe
 *.dll
 *.log
+
+/wovenhat-disk.img

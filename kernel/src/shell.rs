@@ -207,6 +207,11 @@ impl Shell {
                     }
                 }
             }
+            "rename" | "mv" => {
+                if authorize(Capability::FileWrite, console) {
+                    cmd_rename(arg, console);
+                }
+            }
             "mkdir" => {
                 if authorize(Capability::FileWrite, console) {
                     if arg.is_empty() {
@@ -243,6 +248,16 @@ impl Shell {
             "pwd" => {
                 if authorize(Capability::FileRead, console) {
                     console.println(state().cwd_str());
+                }
+            }
+            "mmaptest" => {
+                if authorize(Capability::FileRead, console)
+                    && authorize(Capability::TaskControl, console)
+                    && authorize(Capability::ProcessCreate, console)
+                {
+                    if ensure_program("/bin/mmaptest", userspace::install_file_mmap_test) {
+                        cmd_run("/bin/mmaptest", console);
+                    } else { console.println("mmaptest: install failed"); }
                 }
             }
             "run" => {
@@ -334,6 +349,8 @@ fn print_help(console: &mut Console<'_>) {
     console.println("         memory|mem heap paging bench fs mount persist sync syscall");
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
+    console.println("         rename|mv <old> <new>");
+    console.println("test:    mmaptest (read-only private file mappings)");
     console.println("nav:     cd [path]  pwd  echo <text>");
     console.println("process: run <elf>  sh  init  spawn  user|ring3  kill <pid> [sig]");
     console.println("runtime: userland udpecho [port] dhcp <on|off>   (Stage 9 runtime)");
@@ -523,7 +540,10 @@ fn cmd_persist(arg: &str, console: &mut Console<'_>) {
 }
 
 fn cmd_sync(console: &mut Console<'_>) {
-    let count = storage::sync_all_mounted();
+    let Ok(count) = storage::sync_all_mounted() else {
+        console.println("sync: failed; dirty buffers retained for retry");
+        return;
+    };
     console.print("sync: persisted ");
     print_u64(console, count as u64);
     console.println(" file(s) under /mnt");
@@ -709,6 +729,26 @@ fn cmd_bench(console: &mut Console<'_>) {
 }
 
 fn cmd_fs(console: &mut Console<'_>) {
+    if let Some(stats) = crate::ata::with_primary_master(|disk| disk.stats()) {
+        console.print("buffer cache: hits="); print_u64(console, stats.hits);
+        console.print(" misses="); print_u64(console, stats.misses);
+        console.print(" writebacks="); print_u64(console, stats.writebacks);
+        console.print(" evictions="); print_u64(console, stats.evictions);
+        console.newline();
+        console.print("sectors: resident="); print_u64(console, stats.resident as u64);
+        console.print(" dirty="); print_u64(console, stats.dirty as u64);
+        console.print(" capacity="); print_u64(console, stats.capacity as u64);
+        console.newline();
+    } else {
+        console.println("buffer cache: no ATA device");
+    }
+    let pages = storage::page_cache_stats();
+    console.print("file pages: hits="); print_u64(console, pages.hits);
+    console.print(" misses="); print_u64(console, pages.misses);
+    console.print(" evictions="); print_u64(console, pages.evictions);
+    console.print(" resident="); print_u64(console, pages.resident as u64);
+    console.print(" capacity="); print_u64(console, pages.capacity as u64);
+    console.newline();
     console.print("vfs nodes: ");
     print_u64(console, vfs::node_count() as u64);
     console.print("  open-file descriptions: ");
@@ -862,6 +902,26 @@ fn cmd_write(arg: &str, console: &mut Console<'_>) {
     }
 }
 
+fn cmd_rename(args: &str, console: &mut Console<'_>) {
+    let mut args = args.split_whitespace();
+    let (Some(old), Some(new), None) = (args.next(), args.next(), args.next()) else {
+        console.println("usage: rename <old> <new>");
+        return;
+    };
+    let (Some(old), Some(new)) = (shell_resolve(old), shell_resolve(new)) else {
+        console.println("rename: bad path");
+        return;
+    };
+    match vfs::rename(&old, &new) {
+        Ok(()) => console.println("renamed"),
+        Err(vfs::Error::NotFound) => console.println("rename: source or destination parent missing"),
+        Err(vfs::Error::AlreadyExists) => console.println("rename: destination exists"),
+        Err(vfs::Error::InvalidPath) => console.println("rename: invalid path or destination"),
+        Err(vfs::Error::ReadOnly) => console.println("rename: refused"),
+        Err(_) => console.println("rename: failed"),
+    }
+}
+
 fn cmd_rm(path: &str, console: &mut Console<'_>) {
     let Some(path) = shell_resolve(path) else {
         console.println("rm: bad path");
@@ -871,7 +931,7 @@ fn cmd_rm(path: &str, console: &mut Console<'_>) {
         Ok(()) => console.println("removed"),
         Err(vfs::Error::NotFound) => console.println("rm: not found"),
         Err(vfs::Error::ReadOnly) => console.println("rm: refused"),
-        Err(vfs::Error::Full) => console.println("rm: directory not empty"),
+        Err(vfs::Error::NotEmpty) => console.println("rm: directory not empty"),
         Err(_) => console.println("rm: failed"),
     }
 }
