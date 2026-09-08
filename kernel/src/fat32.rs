@@ -261,17 +261,19 @@ pub fn list_root(
     list_directory(device, volume, volume.root_cluster, output)
 }
 
-/// List entries in any directory starting at `dir_cluster`.
-pub fn list_directory(
+/// Visit entries in any directory starting at `dir_cluster`.
+pub fn for_each_directory_entry<F>(
     device: &mut impl BlockDevice,
     volume: Volume,
     dir_cluster: u32,
-    output: &mut [Option<DirectoryEntry>],
-) -> Result<usize, Error> {
+    mut visitor: F,
+) -> Result<(), Error>
+where
+    F: FnMut(DirectoryEntry) -> Result<(), Error>,
+{
     let mut cluster = dir_cluster;
     let mut visited = [0_u32; MAX_DIRECTORY_CLUSTERS];
     let mut visited_count = 0;
-    let mut count = 0;
     let mut sector = [0_u8; SECTOR_SIZE];
 
     loop {
@@ -293,7 +295,7 @@ pub fn list_directory(
                 let offset = index * DIRECTORY_ENTRY_SIZE;
                 let first = sector[offset];
                 if first == 0 {
-                    return Ok(count);
+                    return Ok(());
                 }
                 let attributes = sector[offset + 11];
                 if first == 0xe5
@@ -302,31 +304,32 @@ pub fn list_directory(
                 {
                     continue;
                 }
-                let slot = output.get_mut(count).ok_or(Error::DirectoryFull)?;
-                let mut short_name = [0_u8; 11];
-                short_name.copy_from_slice(&sector[offset..offset + 11]);
-                let first_cluster = ((read_u16(&sector, offset + 20) as u32) << 16)
-                    | read_u16(&sector, offset + 26) as u32;
-                let size = read_u32(&sector, offset + 28);
-                if first_cluster < 2 && size != 0 {
-                    return Err(Error::CorruptDirectory);
-                }
-                *slot = Some(DirectoryEntry {
-                    short_name,
-                    first_cluster,
-                    size,
-                    attributes,
-                });
-                count += 1;
+                visitor(directory_entry_from_sector(&sector, offset)?)?;
             }
         }
         cluster = match next_cluster(device, volume, cluster)? {
             ClusterLink::Next(next) => next,
-            ClusterLink::End => return Ok(count),
+            ClusterLink::End => return Ok(()),
         };
     }
 }
 
+/// List entries in any directory starting at `dir_cluster`.
+pub fn list_directory(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    dir_cluster: u32,
+    output: &mut [Option<DirectoryEntry>],
+) -> Result<usize, Error> {
+    let mut count = 0;
+    for_each_directory_entry(device, volume, dir_cluster, |entry| {
+        let slot = output.get_mut(count).ok_or(Error::DirectoryFull)?;
+        *slot = Some(entry);
+        count += 1;
+        Ok(())
+    })?;
+    Ok(count)
+}
 /// Resolve a Unix-style absolute path of 8.3 components against a FAT32 volume.
 ///
 /// Example: `"/BIN/SH"` or `"BIN/SH"` (leading slash optional). Each component is

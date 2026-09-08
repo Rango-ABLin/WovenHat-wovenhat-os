@@ -266,69 +266,68 @@ fn import_directory(
     depth: usize,
     writable_import: bool,
 ) -> Result<usize, fat32::Error> {
-    let mut entries = [None; MAX_DIR_ENTRIES];
-    let count = fat32::list_directory(device, volume, dir_cluster, &mut entries)?;
     let mut mounted = 0usize;
 
-    for entry in entries[..count].iter().flatten().copied() {
+    fat32::for_each_directory_entry(device, volume, dir_cluster, |entry| {
         if entry.attributes & 0x08 != 0 {
-            continue;
+            return Ok(());
         }
         // Skip . and ..
         if entry.short_name[0] == b'.' {
-            continue;
+            return Ok(());
         }
 
         let mut name = [0u8; 12];
         let Some(name_len) = short_name_to_str(&entry.short_name, &mut name) else {
-            continue;
+            return Ok(());
         };
         let Ok(name_str) = core::str::from_utf8(&name[..name_len]) else {
-            continue;
+            return Ok(());
         };
 
-        let mut path_buf = [0u8; 64];
+        let mut path_buf = [0u8; crate::config::MAX_PATH_SIZE];
         let Some(path_len) = join_path(vfs_prefix, name_str, &mut path_buf) else {
-            continue;
+            return Ok(());
         };
         let Ok(path) = core::str::from_utf8(&path_buf[..path_len]) else {
-            continue;
+            return Ok(());
         };
 
         let is_dir = entry.attributes & DIRECTORY_ATTRIBUTE != 0;
         if is_dir {
             match vfs::mkdir(path) {
-                Ok(()) | Err(vfs::Error::AlreadyExists) => mounted += 1,
+                Ok(()) => mounted = mounted.saturating_add(1),
+                Err(vfs::Error::AlreadyExists) | Err(vfs::Error::Full) => {}
                 Err(_) => return Err(fat32::Error::DirectoryFull),
             }
-            if depth + 1 < MAX_IMPORT_DEPTH && entry.first_cluster >= 2 {
-                mounted += import_directory(
+            if depth < MAX_BOOT_IMPORT_DEPTH && entry.first_cluster >= 2 {
+                mounted = mounted.saturating_add(import_directory(
                     device,
                     volume,
                     entry.first_cluster,
                     path,
                     depth + 1,
                     writable_import,
-                )?;
+                )?);
             }
-            continue;
+            return Ok(());
         }
 
         if entry.size as usize > vfs::NODE_CAPACITY {
-            continue;
+            return Ok(());
         }
         let writable = writable_import && entry.attributes & READ_ONLY_ATTRIBUTE == 0;
         match vfs::create_disk_file_with_writable(path, entry.size as usize, writable) {
-            Ok(()) => mounted += 1,
-            Err(vfs::Error::AlreadyExists) => {}
-            Err(vfs::Error::Full) => return Err(fat32::Error::DirectoryFull),
+            Ok(()) => mounted = mounted.saturating_add(1),
+            Err(vfs::Error::AlreadyExists) | Err(vfs::Error::Full) => {}
             Err(_) => {}
         }
-    }
+        Ok(())
+    })?;
+
     Ok(mounted)
 }
-
-fn join_path(prefix: &str, name: &str, out: &mut [u8; 64]) -> Option<usize> {
+fn join_path(prefix: &str, name: &str, out: &mut [u8]) -> Option<usize> {
     let slash = !prefix.ends_with('/');
     let need = prefix.len() + usize::from(slash) + name.len();
     if need > out.len() {
@@ -393,27 +392,97 @@ pub fn ensure_path(path: &str) -> Result<(), EnsureError> {
     if mnt_path(path) && !mnt_mounted() {
         return Err(unavailable_ensure_error());
     }
-    if vfs::stat(path).is_ok() {
-        return Ok(());
-    }
-    if path == "/mnt" {
-        return match vfs::mkdir("/mnt") {
-            Ok(()) | Err(vfs::Error::AlreadyExists) => Ok(()),
-            Err(_) => Err(EnsureError::Vfs),
+    if !mnt_path(path) {
+        return if vfs::stat(path).is_ok() {
+            Ok(())
+        } else {
+            Err(EnsureError::NotUnderMount)
         };
     }
-    if !path.starts_with("/mnt/") {
-        return Err(EnsureError::NotUnderMount);
+
+    if let Ok(stat) = vfs::stat(path) {
+        if stat.kind != vfs::NodeKind::Directory {
+            return Ok(());
+        }
     }
 
-    let relative = &path[5..]; // strip "/mnt/"
     if !block_io::primary_ata_present() {
         return Err(EnsureError::NoDevice);
     }
     let mut disk = block_io::primary_ata();
+
+    if path == "/mnt" {
+        match vfs::mkdir("/mnt") {
+            Ok(()) | Err(vfs::Error::AlreadyExists) => {}
+            Err(_) => return Err(EnsureError::Vfs),
+        }
+        return ensure_root_listing_on_disk(&mut disk);
+    }
+
+    let relative = &path[5..]; // strip "/mnt/"
     ensure_on_disk(&mut disk, relative, path)
 }
+fn ensure_root_listing_on_disk(
+    device: &mut impl crate::block::BlockDevice,
+) -> Result<(), EnsureError> {
+    match fat32::mount(device) {
+        Ok(volume) => {
+            let imported = import_directory(
+                device,
+                volume,
+                volume.root_cluster,
+                "/mnt",
+                MAX_BOOT_IMPORT_DEPTH,
+                !device.is_read_only(),
+            )
+            .map_err(map_fat_err)?;
+            MNT_IMPORTED.fetch_add(imported, Ordering::AcqRel);
+            return Ok(());
+        }
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
+        Err(_) => return Err(EnsureError::Failed),
+    }
 
+    if let Ok(Some(part)) = partition::find_fat32(device) {
+        let mut view =
+            partition::PartitionDevice::new(device, part).map_err(|_| EnsureError::Failed)?;
+        let volume = fat32::mount(&mut view).map_err(map_fat_err)?;
+        let writable_import = !view.is_read_only();
+        let imported = import_directory(
+            &mut view,
+            volume,
+            volume.root_cluster,
+            "/mnt",
+            MAX_BOOT_IMPORT_DEPTH,
+            writable_import,
+        )
+        .map_err(map_fat_err)?;
+        MNT_IMPORTED.fetch_add(imported, Ordering::AcqRel);
+        return Ok(());
+    }
+
+    match gpt::find_fat_partition(device) {
+        Ok(Some(part)) => {
+            let mut view =
+                partition::PartitionDevice::new(device, part).map_err(|_| EnsureError::Failed)?;
+            let volume = fat32::mount(&mut view).map_err(map_fat_err)?;
+            let writable_import = !view.is_read_only();
+            let imported = import_directory(
+                &mut view,
+                volume,
+                volume.root_cluster,
+                "/mnt",
+                MAX_BOOT_IMPORT_DEPTH,
+                writable_import,
+            )
+            .map_err(map_fat_err)?;
+            MNT_IMPORTED.fetch_add(imported, Ordering::AcqRel);
+            Ok(())
+        }
+        Ok(None) | Err(gpt::Error::MissingProtectiveMbr) => Err(EnsureError::NotFat32),
+        Err(_) => Err(EnsureError::Failed),
+    }
+}
 fn ensure_on_disk(
     device: &mut impl crate::block::BlockDevice,
     relative: &str,
@@ -457,10 +526,21 @@ fn import_resolved(
     create_parent_dirs(full_path)?;
 
     if is_dir {
-        return match vfs::mkdir(full_path) {
-            Ok(()) | Err(vfs::Error::AlreadyExists) => Ok(()),
-            Err(_) => Err(EnsureError::Vfs),
-        };
+        match vfs::mkdir(full_path) {
+            Ok(()) | Err(vfs::Error::AlreadyExists) => {}
+            Err(_) => return Err(EnsureError::Vfs),
+        }
+        let imported = import_directory(
+            device,
+            volume,
+            entry.first_cluster,
+            full_path,
+            MAX_BOOT_IMPORT_DEPTH,
+            !device.is_read_only(),
+        )
+        .map_err(map_fat_err)?;
+        MNT_IMPORTED.fetch_add(imported, Ordering::AcqRel);
+        return Ok(());
     }
     if entry.size as usize > vfs::NODE_CAPACITY {
         return Err(EnsureError::TooLarge);
