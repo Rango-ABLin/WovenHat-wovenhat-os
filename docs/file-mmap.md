@@ -41,7 +41,8 @@ Unlink removes the name while retaining the inode until its last reference
 closes. Recreating the pathname allocates another node. Path-based FAT32
 backing is copied into the existing RAM inode buffer before an open disk file
 is unlinked, preventing a persisted replacement from redirecting old faults.
-Rename preserves node identity.
+Rename preserves node identity and, for `/mnt` short-name paths, updates both
+on-disk FAT32 metadata and VFS disk-backing paths for renamed descendants.
 
 Shared aliases use the same physical page, including after fork. VFS reads
 observe shared writes before msync; VFS writes update resident shared pages.
@@ -66,29 +67,50 @@ path; this milestone does not replace every byte buffer with a physical frame.
 
 LRU eviction selects cache-owned pages with no live mapping references.
 Allocation failure also reclaims unpinned cache pages and retries. Mapped
-frames are never freed by reclaim. Unmap releases unused cache ownership;
+frames are never freed by cache reclaim. Unmap releases unused cache ownership;
 self-tests verify exact frame and open-reference reclamation. Ownership is
 reserved before publishing a fork PTE; full-table and counter-overflow tests
 verify failure cannot release a still-live source frame.
 
-This is bounded cache reclamation, not swap or eviction of live process pages.
-If all cache slots are pinned or frames remain unavailable, population fails.
+Live mapped-page eviction now covers clean private lazy pages, shared writable
+pages, and dirty writable-private lazy pages. Clean private pages are discarded
+and refaulted from the retained backing inode. Shared pages are copied back
+before unmap. Dirty private pages are copied into bounded swap slots, refcounted
+across fork, then mapped back as private frames on refault. Swap slots prefer
+reserved raw ATA sectors when the mounted FAT32 image leaves trailing space and
+fall back to kernel RAM otherwise. If all cache slots, safe live mappings, and
+swap slots are unavailable, population fails.
 
-## Fault I/O and multicore boundary
+## Pager, fault I/O, and multicore boundary
 
-The fault path copies its mapping metadata and releases the process lock
-before loading. Physical-cache misses perform I/O without holding that cache lock, then
-recheck the key before publishing a frame. CPU interrupts are enabled during I/O, allowing timer IRQs to be serviced. A BSP preemption guard prevents another task from spinning on an
-I/O lock held by the interrupted task; interrupt state is restored afterward.
-A boot test verifies timer ticks advance, the task stays stable, and guard and
-interrupt state are restored. The existing ATA and byte-cache backend locks
-remain serialized by the BSP guard; they are not asynchronous I/O queues.
+The fault path copies its mapping metadata and releases the process lock before
+queueing the missing page to a bounded pager worker. The faulting user context is
+blocked, the pager task populates the page, and the original instruction resumes
+after wakeup. The worker runs at normal priority so user wait loops cannot starve
+pending page faults, while idle pager wakeups do not outrank the high-priority
+kernel validation task.
+
+Physical-cache misses perform I/O without holding that cache lock, then recheck
+the key before publishing a frame. CPU interrupts are enabled during backing
+reads, allowing timer IRQs to be serviced. A BSP preemption guard prevents
+another task from spinning on an I/O lock held by the interrupted task; interrupt
+state is restored afterward. A boot test verifies timer ticks advance, the task
+stays stable, and guard and interrupt state are restored.
+
+The storage path now has a separate bounded block-I/O completion worker. Eligible
+primary-ATA sector reads, writes, and flushes from scheduled tasks queue to
+`block-io`; early boot, interrupts-disabled code, and the block-I/O worker itself
+use direct ATA access. This keeps pager, swap, and file persistence callers from
+performing their own ATA operation in user-task context after the scheduler is
+running. The ATA driver underneath is still PIO-polled, not hardware
+interrupt/DMA-completed.
 
 Only the bootstrap CPU schedules tasks. These ownership and lock boundaries
 are preparation for SMP, not an SMP implementation: per-CPU preemption state,
 in-flight mapping/unmap synchronization, remote TLB shootdowns, and AP startup
-are still required before additional CPUs may schedule tasks. Fault I/O is
-synchronous; there is no asynchronous pager worker yet.
+are still required before additional CPUs may schedule tasks. The pager and
+block-I/O workers are asynchronous at the scheduler level; true device-level
+storage completion remains driver work.
 
 ## Tests
 
@@ -118,10 +140,19 @@ mmaptest
 msynctest
 ```
 
-Expect FILE MMAP: PASS twice and MSYNC DISK: PASS. mmaptest exercises private,
-lazy, shared, fork, kernel buffer-copy, and msync syscall paths. The kernel
-suite also tests physical alias identity, pinned-frame protection, LRU eviction,
-truncation, unlink/recreation, and resource reclamation.
+Expect FILE MMAP: PASS twice and MSYNC DISK: PASS. The QEMU boot suite also
+runs `mmaptest` as a Ring-3 pager regression and expects `Ring-3 faults queued=8
+completed=8: PASSED`. Kernel boot validation prints `[BLOCK IO] async completion
+tests: PASSED` for queue mechanics, `[BLOCK IO] worker completion: PASSED` for
+runtime worker wake/completion, `[SWAP] disk-backed policy tests: PASSED` for
+the block-device swap engine, and `[PRIVATE SWAP MMAP] dirty eviction/refault:
+PASSED` after copying a dirty private lazy page into a swap slot, evicting it,
+and refaulting the changed byte without writing the source file. The lazy mmap
+self-test also evicts a clean resident file-backed page, reclaims its frame, and
+faults it back in. mmaptest exercises private, lazy, shared, fork, kernel
+buffer-copy, and msync syscall paths. The kernel suite also tests physical alias
+identity, pinned-frame protection, LRU eviction, truncation, unlink/recreation,
+and resource reclamation.
 
 msynctest creates /mnt/vmsync.txt and /mnt/vmpin.txt only when absent. Existing
 files are verified, never overwritten by the probe. It checks durable msync

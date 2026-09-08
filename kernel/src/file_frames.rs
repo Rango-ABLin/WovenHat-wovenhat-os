@@ -130,9 +130,18 @@ pub fn map(
                     let _ = paging::release_file_frame(entry.frame);
                 }
             }
-            let Some(frame) = paging::allocate_file_frame(&bytes) else {
+            drop(cache);
+            let frame = paging::allocate_file_frame(&bytes).or_else(|| {
+                if crate::task::evict_one_mapped_file_page() {
+                    paging::allocate_file_frame(&bytes)
+                } else {
+                    None
+                }
+            });
+            let Some(frame) = frame else {
                 return false;
             };
+            cache = CACHE.lock();
             frame
         }
     };

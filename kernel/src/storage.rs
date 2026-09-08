@@ -1,5 +1,7 @@
-use crate::{ata, fat32, gpt, partition, vfs};
+use crate::block::BlockDevice;
+use crate::{ata, block_io, fat32, gpt, partition, swap, vfs};
 
+const READ_ONLY_ATTRIBUTE: u8 = 0x01;
 const DIRECTORY_ATTRIBUTE: u8 = 0x10;
 const MAX_IMPORT_DEPTH: usize = 2;
 const MAX_DIR_ENTRIES: usize = 32;
@@ -16,12 +18,27 @@ pub fn mount_ata_root() -> MountStatus {
     ata::with_primary_master(|disk| {
         let direct = mount_device(disk);
         if direct != MountStatus::NotFat32 {
+            if matches!(direct, MountStatus::Mounted(_)) {
+                configure_direct_swap(disk);
+            }
             return direct;
         }
         match partition::find_fat32(disk) {
-            Ok(Some(partition)) => mount_partition(disk, partition),
+            Ok(Some(partition)) => {
+                let status = mount_partition(disk, partition);
+                if matches!(status, MountStatus::Mounted(_)) {
+                    configure_partition_swap(disk, partition);
+                }
+                status
+            }
             Ok(None) => match gpt::find_fat_partition(disk) {
-                Ok(Some(partition)) => mount_partition(disk, partition),
+                Ok(Some(partition)) => {
+                    let status = mount_partition(disk, partition);
+                    if matches!(status, MountStatus::Mounted(_)) {
+                        configure_partition_swap(disk, partition);
+                    }
+                    status
+                }
                 Ok(None) | Err(gpt::Error::MissingProtectiveMbr) => MountStatus::NotFat32,
                 Err(_) => MountStatus::Failed,
             },
@@ -41,6 +58,39 @@ fn mount_partition(
     mount_device(&mut view)
 }
 
+fn configure_direct_swap(device: &mut impl crate::block::BlockDevice) {
+    let Ok(volume) = fat32::mount(device) else {
+        return;
+    };
+    configure_swap_area(volume.total_sectors as u64, device.sector_count());
+}
+
+fn configure_partition_swap(
+    device: &mut impl crate::block::BlockDevice,
+    partition: partition::Partition,
+) {
+    let Ok(mut view) = partition::PartitionDevice::new(device, partition) else {
+        return;
+    };
+    let Ok(volume) = fat32::mount(&mut view) else {
+        return;
+    };
+    let Some(start_lba) = partition.start_lba.checked_add(volume.total_sectors as u64) else {
+        return;
+    };
+    let Some(limit_lba) = partition.start_lba.checked_add(partition.sectors) else {
+        return;
+    };
+    configure_swap_area(start_lba, limit_lba);
+}
+
+fn configure_swap_area(start_lba: u64, limit_lba: u64) {
+    if limit_lba <= start_lba {
+        return;
+    }
+    let _ = swap::configure_ata_backing(start_lba, limit_lba - start_lba);
+}
+
 fn mount_device(device: &mut impl crate::block::BlockDevice) -> MountStatus {
     let volume = match fat32::mount(device) {
         Ok(volume) => volume,
@@ -52,7 +102,16 @@ fn mount_device(device: &mut impl crate::block::BlockDevice) -> MountStatus {
 
     let _ = vfs::mkdir("/mnt");
 
-    match import_directory(device, volume, volume.root_cluster, "/mnt", 0) {
+    let writable_import = !device.is_read_only();
+
+    match import_directory(
+        device,
+        volume,
+        volume.root_cluster,
+        "/mnt",
+        0,
+        writable_import,
+    ) {
         Ok(count) => MountStatus::Mounted(count),
         Err(_) => MountStatus::Failed,
     }
@@ -64,6 +123,7 @@ fn import_directory(
     dir_cluster: u32,
     vfs_prefix: &str,
     depth: usize,
+    writable_import: bool,
 ) -> Result<usize, fat32::Error> {
     let mut entries = [None; MAX_DIR_ENTRIES];
     let count = fat32::list_directory(device, volume, dir_cluster, &mut entries)?;
@@ -101,7 +161,14 @@ fn import_directory(
                 Err(_) => return Err(fat32::Error::DirectoryFull),
             }
             if depth + 1 < MAX_IMPORT_DEPTH && entry.first_cluster >= 2 {
-                mounted += import_directory(device, volume, entry.first_cluster, path, depth + 1)?;
+                mounted += import_directory(
+                    device,
+                    volume,
+                    entry.first_cluster,
+                    path,
+                    depth + 1,
+                    writable_import,
+                )?;
             }
             continue;
         }
@@ -109,7 +176,8 @@ fn import_directory(
         if entry.size as usize > vfs::NODE_CAPACITY {
             continue;
         }
-        match vfs::create_disk_file(path, entry.size as usize) {
+        let writable = writable_import && entry.attributes & READ_ONLY_ATTRIBUTE == 0;
+        match vfs::create_disk_file_with_writable(path, entry.size as usize, writable) {
             Ok(()) => mounted += 1,
             Err(vfs::Error::AlreadyExists) => {}
             Err(vfs::Error::Full) => return Err(fat32::Error::DirectoryFull),
@@ -195,8 +263,11 @@ pub fn ensure_path(path: &str) -> Result<(), EnsureError> {
     }
 
     let relative = &path[5..]; // strip "/mnt/"
-    ata::with_primary_master(|disk| ensure_on_disk(disk, relative, path))
-        .unwrap_or(Err(EnsureError::NoDevice))
+    if !block_io::primary_ata_present() {
+        return Err(EnsureError::NoDevice);
+    }
+    let mut disk = block_io::primary_ata();
+    ensure_on_disk(&mut disk, relative, path)
 }
 
 fn ensure_on_disk(
@@ -250,7 +321,8 @@ fn import_resolved(
     if entry.size as usize > vfs::NODE_CAPACITY {
         return Err(EnsureError::TooLarge);
     }
-    match vfs::create_disk_file(full_path, entry.size as usize) {
+    let writable = !device.is_read_only() && entry.attributes & READ_ONLY_ATTRIBUTE == 0;
+    match vfs::create_disk_file_with_writable(full_path, entry.size as usize, writable) {
         Ok(()) | Err(vfs::Error::AlreadyExists) => Ok(()),
         Err(_) => Err(EnsureError::Vfs),
     }
@@ -311,6 +383,236 @@ pub enum PersistError {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationError {
+    NotSupported,
+    NotFound,
+    NoDevice,
+    BadName,
+    AlreadyExists,
+    NotEmpty,
+    ReadOnly,
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LiveMutationTestStatus {
+    Skipped,
+    Passed,
+    Failed(&'static str),
+}
+
+/// Exercise the live ATA/FAT32 mutation path when a mounted `/mnt` volume exists.
+///
+/// This is intended for disposable QEMU disks. It mirrors the diagnostic-shell
+/// sequence for mkdir/write/persist/directory rename/delete and skips when the
+/// boot has no writable FAT32 ATA mount.
+pub fn live_mutation_self_test() -> LiveMutationTestStatus {
+    if !block_io::primary_ata_present() || vfs::stat("/mnt").is_err() {
+        return LiveMutationTestStatus::Skipped;
+    }
+
+    const OLD_DIR: &str = "/mnt/tmutd";
+    const NEW_DIR: &str = "/mnt/tmuta";
+    const OLD_FILE: &str = "/mnt/tmutd/a.txt";
+    const NEW_FILE: &str = "/mnt/tmuta/a.txt";
+    const CONTENT: &[u8] = b"hello";
+
+    if vfs::stat(OLD_DIR).is_ok() || vfs::stat(NEW_DIR).is_ok() {
+        return LiveMutationTestStatus::Failed("fixture exists");
+    }
+    if vfs::mkdir(OLD_DIR).is_err() {
+        return LiveMutationTestStatus::Failed("vfs mkdir");
+    }
+    if persist_directory(OLD_DIR).is_err() {
+        return LiveMutationTestStatus::Failed("fat mkdir");
+    }
+    if vfs::write_file(OLD_FILE, CONTENT).is_err() {
+        return LiveMutationTestStatus::Failed("vfs write");
+    }
+    if persist_path(OLD_FILE).is_err() {
+        return LiveMutationTestStatus::Failed("fat persist");
+    }
+    if rename_path(OLD_DIR, NEW_DIR).is_err() {
+        return LiveMutationTestStatus::Failed("fat rename");
+    }
+    if vfs::rename(OLD_DIR, NEW_DIR).is_err() {
+        return LiveMutationTestStatus::Failed("vfs rename");
+    }
+    if ensure_path(OLD_FILE) != Err(EnsureError::NotFound) || vfs::stat(OLD_FILE).is_ok() {
+        return LiveMutationTestStatus::Failed("old path survived");
+    }
+    if ensure_path(NEW_FILE).is_err() {
+        return LiveMutationTestStatus::Failed("new path missing");
+    }
+    let mut bytes = [0_u8; 8];
+    if vfs::read_all(NEW_FILE, &mut bytes) != Ok(CONTENT.len())
+        || &bytes[..CONTENT.len()] != CONTENT
+    {
+        return LiveMutationTestStatus::Failed("new data mismatch");
+    }
+    if delete_path(NEW_FILE).is_err() {
+        return LiveMutationTestStatus::Failed("fat delete file");
+    }
+    if vfs::remove(NEW_FILE).is_err() {
+        return LiveMutationTestStatus::Failed("vfs delete file");
+    }
+    if delete_path(NEW_DIR).is_err() {
+        return LiveMutationTestStatus::Failed("fat delete dir");
+    }
+    if vfs::remove(NEW_DIR).is_err() {
+        return LiveMutationTestStatus::Failed("vfs delete dir");
+    }
+
+    if let Err(stage) = live_directory_growth_self_test() {
+        return LiveMutationTestStatus::Failed(stage);
+    }
+
+    LiveMutationTestStatus::Passed
+}
+
+fn live_numbered_child_path<'a>(
+    dir: &str,
+    prefix: u8,
+    index: usize,
+    out: &'a mut [u8; 40],
+) -> Option<&'a str> {
+    if index >= 100 {
+        return None;
+    }
+    let dir_bytes = dir.as_bytes();
+    let total = dir_bytes.len().checked_add(1)?.checked_add(7)?;
+    if total > out.len() {
+        return None;
+    }
+    out[..dir_bytes.len()].copy_from_slice(dir_bytes);
+    let mut offset = dir_bytes.len();
+    out[offset] = b'/';
+    offset += 1;
+    out[offset] = prefix;
+    out[offset + 1] = b'0' + (index / 10) as u8;
+    out[offset + 2] = b'0' + (index % 10) as u8;
+    out[offset + 3] = b'.';
+    out[offset + 4] = b't';
+    out[offset + 5] = b'x';
+    out[offset + 6] = b't';
+    core::str::from_utf8(&out[..total]).ok()
+}
+
+fn create_live_test_file(path: &str, content: &[u8]) -> Result<(), &'static str> {
+    if vfs::write_file(path, content).is_err() {
+        return Err("growth vfs write");
+    }
+    if persist_path(path).is_err() {
+        return Err("growth fat persist");
+    }
+    Ok(())
+}
+
+fn remove_live_test_file(path: &str) -> Result<(), &'static str> {
+    if delete_path(path).is_err() {
+        return Err("growth fat delete file");
+    }
+    if vfs::remove(path).is_err() {
+        return Err("growth vfs delete file");
+    }
+    Ok(())
+}
+
+fn remove_live_test_dir(path: &str) -> Result<(), &'static str> {
+    if delete_path(path).is_err() {
+        return Err("growth fat delete dir");
+    }
+    if vfs::remove(path).is_err() {
+        return Err("growth vfs delete dir");
+    }
+    Ok(())
+}
+
+fn live_directory_growth_self_test() -> Result<(), &'static str> {
+    const GROW_DIR: &str = "/mnt/tgrow";
+    const FULL_DIR: &str = "/mnt/tfull";
+    const MOVE_FILE: &str = "/mnt/tmv.txt";
+    const MOVED_FILE: &str = "/mnt/tfull/tmv.txt";
+
+    if vfs::stat(GROW_DIR).is_ok() || vfs::stat(FULL_DIR).is_ok() || vfs::stat(MOVE_FILE).is_ok() {
+        return Err("growth fixture exists");
+    }
+
+    if vfs::mkdir(GROW_DIR).is_err() {
+        return Err("growth vfs mkdir");
+    }
+    if persist_directory(GROW_DIR).is_err() {
+        return Err("growth fat mkdir");
+    }
+    for index in 0..15 {
+        let mut path = [0_u8; 40];
+        let Some(path) = live_numbered_child_path(GROW_DIR, b'g', index, &mut path) else {
+            return Err("growth path build");
+        };
+        create_live_test_file(path, b"x")?;
+    }
+    let mut last_path = [0_u8; 40];
+    let Some(last_path) = live_numbered_child_path(GROW_DIR, b'g', 14, &mut last_path) else {
+        return Err("growth path build");
+    };
+    if ensure_path(last_path).is_err() {
+        return Err("growth ensure");
+    }
+    let mut byte = [0_u8; 1];
+    if vfs::read_all(last_path, &mut byte) != Ok(1) || byte[0] != b'x' {
+        return Err("growth readback");
+    }
+
+    if vfs::mkdir(FULL_DIR).is_err() {
+        return Err("full vfs mkdir");
+    }
+    if persist_directory(FULL_DIR).is_err() {
+        return Err("full fat mkdir");
+    }
+    for index in 0..14 {
+        let mut path = [0_u8; 40];
+        let Some(path) = live_numbered_child_path(FULL_DIR, b'd', index, &mut path) else {
+            return Err("full path build");
+        };
+        create_live_test_file(path, b"q")?;
+    }
+    create_live_test_file(MOVE_FILE, b"z")?;
+    if rename_path(MOVE_FILE, MOVED_FILE).is_err() {
+        return Err("full fat rename");
+    }
+    if vfs::rename(MOVE_FILE, MOVED_FILE).is_err() {
+        return Err("full vfs rename");
+    }
+    if ensure_path(MOVE_FILE) != Err(EnsureError::NotFound) || vfs::stat(MOVE_FILE).is_ok() {
+        return Err("full old survived");
+    }
+    if ensure_path(MOVED_FILE).is_err() {
+        return Err("full new missing");
+    }
+    if vfs::read_all(MOVED_FILE, &mut byte) != Ok(1) || byte[0] != b'z' {
+        return Err("full readback");
+    }
+
+    remove_live_test_file(MOVED_FILE)?;
+    for index in 0..14 {
+        let mut path = [0_u8; 40];
+        let Some(path) = live_numbered_child_path(FULL_DIR, b'd', index, &mut path) else {
+            return Err("full path build");
+        };
+        remove_live_test_file(path)?;
+    }
+    remove_live_test_dir(FULL_DIR)?;
+    for index in 0..15 {
+        let mut path = [0_u8; 40];
+        let Some(path) = live_numbered_child_path(GROW_DIR, b'g', index, &mut path) else {
+            return Err("growth path build");
+        };
+        remove_live_test_file(path)?;
+    }
+    remove_live_test_dir(GROW_DIR)
+}
+
 /// Persist a VFS file under `/mnt/` to the live ATA FAT32 volume.
 ///
 /// Multi-component paths are supported. Missing FAT32 directories are created
@@ -343,8 +645,11 @@ pub fn persist_path(path: &str) -> Result<(), PersistError> {
         return Err(PersistError::TooLarge);
     }
 
-    ata::with_primary_master(|disk| persist_on_device(disk, relative, &data[..length]))
-        .unwrap_or(Err(PersistError::NoDevice))
+    if !block_io::primary_ata_present() {
+        return Err(PersistError::NoDevice);
+    }
+    let mut disk = block_io::primary_ata();
+    persist_on_device(&mut disk, relative, &data[..length])
 }
 
 fn persist_on_device(
@@ -413,13 +718,14 @@ pub fn persist_directory(path: &str) -> Result<(), PersistError> {
             return Err(PersistError::BadName);
         }
     }
-    ata::with_primary_master(|disk| {
-        FILE_PAGES.lock().invalidate();
-        let result = mkdir_on_cached_device(disk, relative);
-        let flushed = disk.flush().map_err(|_| PersistError::Failed);
-        result.and(flushed)
-    })
-    .unwrap_or(Err(PersistError::NoDevice))
+    if !block_io::primary_ata_present() {
+        return Err(PersistError::NoDevice);
+    }
+    let mut disk = block_io::primary_ata();
+    FILE_PAGES.lock().invalidate();
+    let result = mkdir_on_cached_device(&mut disk, relative);
+    let flushed = disk.flush().map_err(|_| PersistError::Failed);
+    result.and(flushed)
 }
 
 fn mkdir_on_cached_device(
@@ -448,12 +754,141 @@ fn mkdir_on_cached_device(
     }
 }
 
+pub fn delete_path(path: &str) -> Result<(), MutationError> {
+    if path == "/mnt" || !path.starts_with("/mnt/") {
+        return Err(MutationError::NotSupported);
+    }
+    let relative = &path[5..];
+    validate_fat_relative(relative)?;
+    if !block_io::primary_ata_present() {
+        return Err(MutationError::NoDevice);
+    }
+    let mut disk = block_io::primary_ata();
+    if disk.is_read_only() {
+        return Err(MutationError::ReadOnly);
+    }
+    FILE_PAGES.lock().invalidate();
+    let result = delete_on_cached_device(&mut disk, relative);
+    let flushed = disk.flush().map_err(|_| MutationError::Failed);
+    result.and(flushed)
+}
+
+fn delete_on_cached_device(
+    device: &mut impl crate::block::BlockDevice,
+    path: &str,
+) -> Result<(), MutationError> {
+    match fat32::mount(device) {
+        Ok(volume) => return fat32::delete_path(device, volume, path).map_err(map_mutation_err),
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
+        Err(_) => return Err(MutationError::Failed),
+    }
+    if let Ok(Some(part)) = partition::find_fat32(device) {
+        let mut view =
+            partition::PartitionDevice::new(device, part).map_err(|_| MutationError::Failed)?;
+        let volume = fat32::mount(&mut view).map_err(map_mutation_err)?;
+        return fat32::delete_path(&mut view, volume, path).map_err(map_mutation_err);
+    }
+    match gpt::find_fat_partition(device) {
+        Ok(Some(part)) => {
+            let mut view =
+                partition::PartitionDevice::new(device, part).map_err(|_| MutationError::Failed)?;
+            let volume = fat32::mount(&mut view).map_err(map_mutation_err)?;
+            fat32::delete_path(&mut view, volume, path).map_err(map_mutation_err)
+        }
+        _ => Err(MutationError::Failed),
+    }
+}
+
+pub fn rename_path(old: &str, new: &str) -> Result<(), MutationError> {
+    if old == "/mnt" || new == "/mnt" || !old.starts_with("/mnt/") || !new.starts_with("/mnt/") {
+        return Err(MutationError::NotSupported);
+    }
+    let old_relative = &old[5..];
+    let new_relative = &new[5..];
+    validate_fat_relative(old_relative)?;
+    validate_fat_relative(new_relative)?;
+    if !block_io::primary_ata_present() {
+        return Err(MutationError::NoDevice);
+    }
+    let mut disk = block_io::primary_ata();
+    if disk.is_read_only() {
+        return Err(MutationError::ReadOnly);
+    }
+    FILE_PAGES.lock().invalidate();
+    let result = rename_on_cached_device(&mut disk, old_relative, new_relative);
+    let flushed = disk.flush().map_err(|_| MutationError::Failed);
+    result.and(flushed)
+}
+
+fn rename_on_cached_device(
+    device: &mut impl crate::block::BlockDevice,
+    old: &str,
+    new: &str,
+) -> Result<(), MutationError> {
+    match fat32::mount(device) {
+        Ok(volume) => {
+            return fat32::rename_path(device, volume, old, new).map_err(map_mutation_err)
+        }
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
+        Err(_) => return Err(MutationError::Failed),
+    }
+    if let Ok(Some(part)) = partition::find_fat32(device) {
+        let mut view =
+            partition::PartitionDevice::new(device, part).map_err(|_| MutationError::Failed)?;
+        let volume = fat32::mount(&mut view).map_err(map_mutation_err)?;
+        return fat32::rename_path(&mut view, volume, old, new).map_err(map_mutation_err);
+    }
+    match gpt::find_fat_partition(device) {
+        Ok(Some(part)) => {
+            let mut view =
+                partition::PartitionDevice::new(device, part).map_err(|_| MutationError::Failed)?;
+            let volume = fat32::mount(&mut view).map_err(map_mutation_err)?;
+            fat32::rename_path(&mut view, volume, old, new).map_err(map_mutation_err)
+        }
+        _ => Err(MutationError::Failed),
+    }
+}
+
+fn validate_fat_relative(relative: &str) -> Result<(), MutationError> {
+    if relative.is_empty() {
+        return Err(MutationError::BadName);
+    }
+    for component in relative.split('/') {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || fat32::encode_short_name(component).is_none()
+        {
+            return Err(MutationError::BadName);
+        }
+    }
+    Ok(())
+}
+
+fn map_mutation_err(err: fat32::Error) -> MutationError {
+    match err {
+        fat32::Error::NotFound => MutationError::NotFound,
+        fat32::Error::NameTooLong | fat32::Error::InvalidPath => MutationError::BadName,
+        fat32::Error::AlreadyExists => MutationError::AlreadyExists,
+        fat32::Error::DirectoryNotEmpty => MutationError::NotEmpty,
+        fat32::Error::ReadOnly | fat32::Error::Block(crate::block::Error::ReadOnly) => {
+            MutationError::ReadOnly
+        }
+        fat32::Error::Block(_) | fat32::Error::WriteFailed => MutationError::Failed,
+        _ => MutationError::Failed,
+    }
+}
+
 fn map_persist_err(err: fat32::Error) -> PersistError {
     match err {
         fat32::Error::NotFound => PersistError::NotFound,
-        fat32::Error::NameTooLong | fat32::Error::DirectoryFull => PersistError::BadName,
+        fat32::Error::NameTooLong | fat32::Error::DirectoryFull | fat32::Error::InvalidPath => {
+            PersistError::BadName
+        }
         fat32::Error::NoSpace => PersistError::TooLarge,
-        fat32::Error::Block(_) | fat32::Error::WriteFailed => PersistError::Failed,
+        fat32::Error::Block(_) | fat32::Error::WriteFailed | fat32::Error::ReadOnly => {
+            PersistError::Failed
+        }
         _ => PersistError::Failed,
     }
 }
@@ -481,8 +916,11 @@ pub fn sync_all_mounted() -> Result<usize, PersistError> {
             failed = true;
         }
     }
-    if ata::with_primary_master(|disk| disk.flush()).is_some_and(|r| r.is_err()) {
-        failed = true;
+    if block_io::primary_ata_present() {
+        let mut disk = block_io::primary_ata();
+        if disk.flush().is_err() {
+            failed = true;
+        }
     }
     if failed {
         Err(PersistError::Failed)
@@ -507,13 +945,14 @@ pub fn read_disk_file(
     let relative = path
         .strip_prefix("/mnt/")
         .ok_or(crate::block::Error::InvalidBuffer)?;
-    ata::with_primary_master(|disk| {
-        FILE_PAGES.lock().read(path, offset, output, |start, page| {
-            read_disk_page(disk, relative, start, page)
-                .map_err(|_| crate::block::Error::DeviceFault)
-        })
+    if !block_io::primary_ata_present() {
+        return Err(crate::block::Error::DeviceFault);
+    }
+    let mut disk = block_io::primary_ata();
+    FILE_PAGES.lock().read(path, offset, output, |start, page| {
+        read_disk_page(&mut disk, relative, start, page)
+            .map_err(|_| crate::block::Error::DeviceFault)
     })
-    .unwrap_or(Err(crate::block::Error::DeviceFault))
 }
 
 fn read_volume_page(

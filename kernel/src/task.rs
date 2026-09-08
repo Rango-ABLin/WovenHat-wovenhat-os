@@ -999,7 +999,7 @@ pub fn start_pager() -> bool {
     if PAGER_TASK.lock().is_some() {
         return true;
     }
-    match spawn_with_priority("pager", pager_task, TaskPriority::LOW) {
+    match spawn_with_priority("pager", pager_task, TaskPriority::NORMAL) {
         Ok(id) => {
             *PAGER_TASK.lock() = Some(id);
             true
@@ -1014,6 +1014,26 @@ pub fn pager_stats() -> (u64, u64) {
         PAGER_COMPLETIONS.load(Ordering::Acquire),
     )
 }
+
+pub fn evict_one_mapped_file_page() -> bool {
+    let mut processes = PROCESS_TABLE.lock();
+    for process in processes.iter_mut().flatten() {
+        let Some(space) = process.address_space else {
+            continue;
+        };
+        for mapping in process.memory_mappings.iter_mut().flatten() {
+            let pages = mapping.size / 4096;
+            for index in 0..pages {
+                let address = mapping.address + (index * 4096) as u64;
+                if userspace::evict_file_page(space, mapping, address) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Attempt to resolve a user write fault via copy-on-write.
 /// Returns true if the fault was handled and the process may resume.
 pub fn try_handle_cow_fault(fault_address: u64) -> bool {
@@ -1034,7 +1054,28 @@ pub fn try_handle_cow_fault(fault_address: u64) -> bool {
     }
     let paging_as = address_space.paging();
     drop(processes);
-    paging::try_break_cow(paging_as, fault_address)
+    if !paging::try_break_cow(paging_as, fault_address) {
+        return false;
+    }
+    let mut processes = PROCESS_TABLE.lock();
+    if let Some(process) = processes
+        .iter_mut()
+        .flatten()
+        .find(|process| process.task_id == task_id)
+    {
+        if let Some(mapping) = process
+            .memory_mappings
+            .iter_mut()
+            .flatten()
+            .find(|mapping| {
+                fault_address >= mapping.address
+                    && fault_address < mapping.address + mapping.size as u64
+            })
+        {
+            let _ = userspace::mark_file_page_dirty(mapping, fault_address);
+        }
+    }
+    true
 }
 
 pub fn current_credentials() -> Credentials {
@@ -2234,6 +2275,14 @@ pub fn current_task_id() -> TaskId {
     scheduler.tasks[scheduler.current_slot].id
 }
 
+pub fn current_task_id_if_running() -> Option<TaskId> {
+    let scheduler = SCHEDULER.lock();
+    if scheduler.task_count == 0 {
+        return None;
+    }
+    Some(scheduler.tasks[scheduler.current_slot].id)
+}
+
 pub fn current_has(capability: Capability) -> bool {
     let scheduler = SCHEDULER.lock();
     assert!(scheduler.task_count != 0, "scheduler not initialized");
@@ -2540,22 +2589,78 @@ pub fn unlink_current(path: &str) -> Result<(), FileError> {
     if !current_has(Capability::FileWrite) {
         return Err(FileError::PermissionDenied);
     }
-    vfs::remove(path).map_err(|e| match e {
-        vfs::Error::NotFound => FileError::NotFound,
-        vfs::Error::ReadOnly => FileError::PermissionDenied,
-        vfs::Error::NotEmpty => FileError::NotEmpty,
-        _ => FileError::NotFound,
-    })
+    let path = resolve_path_for_current(path)?;
+    if is_mnt_child(&path) {
+        let _ = crate::storage::ensure_path(&path);
+        vfs::can_remove(&path).map_err(map_vfs_file_error)?;
+        vfs::prepare_remove(&path).map_err(map_vfs_file_error)?;
+        crate::storage::delete_path(&path).map_err(map_mutation_file_error)?;
+    }
+    vfs::remove(&path).map_err(map_vfs_file_error)
 }
 
 pub fn rename_current(old: &str, new: &str) -> Result<(), FileError> {
     if !current_has(Capability::FileWrite) {
         return Err(FileError::PermissionDenied);
     }
-    vfs::rename(old, new).map_err(|e| match e {
+    let old = resolve_path_for_current(old)?;
+    let new = resolve_path_for_current(new)?;
+    if touches_mnt(&old) || touches_mnt(&new) {
+        if !is_mnt_child(&old) || !is_mnt_child(&new) {
+            return Err(FileError::NotFound);
+        }
+        let _ = crate::storage::ensure_path(&old);
+        if let Some(parent) = parent_path_string(&new) {
+            if parent == "/mnt" || parent.starts_with("/mnt/") {
+                let _ = crate::storage::ensure_path(&parent);
+            }
+        }
+        vfs::can_rename(&old, &new).map_err(map_vfs_file_error)?;
+        crate::storage::rename_path(&old, &new).map_err(map_mutation_file_error)?;
+    }
+    vfs::rename(&old, &new).map_err(map_vfs_file_error)
+}
+
+fn is_mnt_child(path: &str) -> bool {
+    path.starts_with("/mnt/")
+}
+
+fn touches_mnt(path: &str) -> bool {
+    path == "/mnt" || path.starts_with("/mnt/")
+}
+
+fn parent_path_string(path: &str) -> Option<alloc::string::String> {
+    if !path.starts_with('/') || path == "/" {
+        return None;
+    }
+    let index = path.rfind('/')?;
+    if index == 0 {
+        Some(alloc::string::String::from("/"))
+    } else {
+        Some(alloc::string::String::from(&path[..index]))
+    }
+}
+
+fn map_vfs_file_error(error: vfs::Error) -> FileError {
+    match error {
         vfs::Error::NotFound => FileError::NotFound,
         vfs::Error::AlreadyExists => FileError::AlreadyExists,
         vfs::Error::ReadOnly => FileError::PermissionDenied,
+        vfs::Error::NotEmpty => FileError::NotEmpty,
+        vfs::Error::Full => FileError::TooManyFiles,
         _ => FileError::NotFound,
-    })
+    }
+}
+
+fn map_mutation_file_error(error: crate::storage::MutationError) -> FileError {
+    match error {
+        crate::storage::MutationError::AlreadyExists => FileError::AlreadyExists,
+        crate::storage::MutationError::NotEmpty => FileError::NotEmpty,
+        crate::storage::MutationError::ReadOnly => FileError::PermissionDenied,
+        crate::storage::MutationError::NoDevice
+        | crate::storage::MutationError::NotSupported
+        | crate::storage::MutationError::NotFound
+        | crate::storage::MutationError::BadName
+        | crate::storage::MutationError::Failed => FileError::NotFound,
+    }
 }

@@ -10,6 +10,7 @@ if path.exists():
 
 sector_size = 512
 total_sectors = 70000
+swap_sectors = 32 * 8
 reserved = 32
 fat_sectors = 600
 first_data = reserved + 2 * fat_sectors
@@ -45,9 +46,9 @@ fat = bytearray(sector_size)
 struct.pack_into("<III", fat, 0, 0x0FFFFFF8, 0xFFFFFFFF, 0x0FFFFFFF)
 # Exclusive creation prevents accidental replacement, including concurrent runs.
 with path.open("xb") as disk:
-    disk.truncate(total_sectors * sector_size)
+    disk.truncate((total_sectors + swap_sectors) * sector_size)
     for lba, data in ((0, boot), (1, info), (6, boot), (7, info),
                       (reserved, fat), (reserved + fat_sectors, fat)):
         disk.seek(lba * sector_size)
         disk.write(data)
-print(f"Created FAT32 disk: {path} ({total_sectors * sector_size} bytes)")
+print(f"Created FAT32 disk: {path} ({total_sectors * sector_size} FAT32 bytes + {swap_sectors * sector_size} swap bytes)")

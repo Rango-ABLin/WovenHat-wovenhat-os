@@ -9,19 +9,22 @@ across descriptors and avoid FAT traversal and sector-cache calls on hits.
 The cache uses LRU replacement. All pages are clean and can be discarded;
 failed loads are never marked valid. Partial final pages expose only bytes
 inside EOF. FAT32 range reads handle unaligned offsets and cross-sector/cluster
-reads without fetching earlier file contents. The chain traversal bound now
-covers the existing 64 KiB file limit with 512-byte clusters.
+reads without fetching earlier file contents. File-chain traversal is now
+bounded by the declared file size and mounted media cluster count instead of a
+fixed 64/128-cluster read ceiling.
 
-Storage persistence invalidates all file pages before modifying the disk,
-including operations that later fail. This deliberately conservative policy
-prevents stale reads after overwrites or cluster reuse. File writes still use
-VFS RAM storage plus explicit persistence through the sector write-back cache.
-Imported files retain their existing read-only status.
+Storage invalidates all file pages before FAT32 create/overwrite, mkdir,
+delete, or rename operations, including operations that later fail. This
+deliberately conservative policy prevents stale reads after overwrites, metadata
+moves, or cluster reuse. File writes still use VFS RAM storage plus explicit
+persistence through the sector write-back cache. Imported files retain their
+existing read-only status.
 
 VFS reads copy backing metadata and release the VFS registry lock before disk
 I/O. Storage acquires ATA before file-page cache locks; cache loaders never
-call VFS. VFS rename preserves the original disk backing path, so reading a
-renamed imported node still works. This does not implement on-disk rename.
+call VFS. VFS rename updates disk-backing paths for the renamed node and all
+renamed descendants, and the storage layer now performs the matching on-disk
+FAT32 rename for `/mnt` short-name paths.
 
 `fs` displays a separate `file pages:` line with hits, misses, evictions,
 resident pages, and capacity. The cache uses fixed kernel storage for its page
@@ -54,7 +57,9 @@ disk page loading until it is persisted and imported from disk.
 - `rustc --edition 2021 --test tests/page_cache.rs -o target/page-cache-tests.exe`
   followed by `target/page-cache-tests.exe`: 5 passed. Covers page boundaries,
   EOF, cache hits, LRU replacement, failed loads, invalidation, existing FAT32
-  regression cases, and integrated FAT32 range/page-cache reads through 64 KiB.
+  regression cases, integrated FAT32 range/page-cache reads through 64 KiB,
+  FAT32 streaming reads beyond the former fixed cluster cap, and FAT32
+  delete/rename mutation regressions.
 - QEMU reported buffer cache, file pages, and VFS regression tests PASSED.
   As before, the broader suite subsequently panicked because the scheduler was
   not initialized. Test-feature build used the previously documented unused-code

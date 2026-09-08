@@ -26,9 +26,11 @@ The operation uses the existing node array without allocating another tree.
 Removing a non-empty directory returns `NotEmpty`, separately from capacity
 errors (`Full`). The diagnostic shell displays `rm: directory not empty`, and
 the task layer preserves `NotEmpty`. The syscall ABI still uses its existing
-generic failure return. Stored process/shell cwd strings are not rewritten by
-VFS rename; this milestone does not add inode-based cwd tracking or persistence
-for renames on FAT32.
+generic failure return. Stored process/shell cwd strings are not rewritten by VFS rename; this
+milestone does not add inode-based cwd tracking. FAT32 short-name `/mnt`
+renames are now durable: the storage layer updates the on-disk directory entry
+before VFS paths are moved, and VFS backing paths for descendants are rewritten
+with the same prefix rule.
 
 Regression checks are part of `vfs::self_test()` in the QEMU boot suite. They
 cover the complete subtree example, prefix boundaries, file identity and data,

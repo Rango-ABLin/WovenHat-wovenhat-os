@@ -33,6 +33,37 @@ sentinel. The assembly entry preserves general registers and returns with iretq.
 | 24 | dup2 | oldfd, newfd |
 | 25 | getppid | |
 | 26 | kill | pid, sig (0/9/15) |
+| 27 | lseek | fd, offset, whence |
+| 28 | unlink | user path, path length |
+| 29 | sleep | ticks |
+| 30 | rename | old path, old_len|(new_len<<32), new path |
+| 31 | getticks | none |
+| 32 | sync | none |
+| 33 | ioctl | fd, request, argument |
+| 34 | sigaction | signal, handler address/default/ignore |
+| 35 | getpgrp | none |
+| 36 | setpgid | pid, pgid |
+| 37 | socket | kind: UDP=1, TCP=2 |
+| 38 | bind | socket, local port |
+| 39 | connect | socket, packed IPv4 endpoint |
+| 40 | net_send | socket, user buffer, length |
+| 41 | net_recv | socket, user buffer, capacity |
+| 42 | net_close | socket |
+| 43 | net_info | user NetInfo pointer |
+| 44 | dns_start | hostname pointer, length |
+| 45 | dns_poll | query id, user IPv4[4] buffer |
+| 46 | net_peer | socket |
+| 47 | dhcp | 0 static fallback, nonzero DHCP |
+| 48 | ping_start | packed IPv4 |
+| 49 | ping_poll | query id |
+| 50 | exec_command | command-line pointer, byte length |
+| 51 | env_get | key pointer, key length, value buffer |
+| 52 | env_set | key pointer, packed key/value lengths, value pointer |
+| 53 | env_count | none |
+| 54 | env_entry | index, output pointer, capacity |
+| 55 | process_count | none |
+| 56 | process_info | index, user ProcessInfo pointer |
+| 57 | spawn_command | command-line pointer, byte length |
 
 Descriptor 0 reads the nonblocking PS/2 byte stream; descriptors 1 and 2 write to COM1. The reserved standard descriptors cannot be closed, and VFS handles begin at 3. See [standard streams](standard-streams.md).
 
@@ -66,7 +97,10 @@ descriptor tables and do not overcommit memory.
 
 Fork uses copy-on-write page sharing; open-file descriptions are reference-counted so
 offsets are shared across parent and child. There is no `argv`/environment transfer yet.
-Directories are first-class VFS nodes; `stat`, `readdir`, and `mkdir` are available.
+Directories are first-class VFS nodes; `stat`, `readdir`, `mkdir`, `unlink`,
+`rename`, and `sync` are available. For `/mnt` short-name FAT32 paths, `mkdir`,
+`unlink`, and `rename` update the on-disk directory entries and flush before
+returning success; cross-mount rename and non-empty directory unlink are rejected.
 
 
 ## Read-only private file mapping

@@ -5,8 +5,9 @@
 //! scheduler, and hardware status helpers.
 
 use crate::{
-    benchmark, capability::Capability, console::Console, device, heap, keyboard::Key, memory,
-    network, paging, storage, syscall, task, terminal, timer, userspace, vfs, virtio_net,
+    benchmark, block_io, capability::Capability, console::Console, device, heap, keyboard::Key,
+    memory, network, paging, storage, swap, syscall, task, terminal, timer, userspace, vfs,
+    virtio_net,
 };
 use spin::Once;
 
@@ -133,6 +134,11 @@ impl Shell {
             }
             "caps" => cmd_caps(console),
             "devices" | "dev" => cmd_devices(console),
+            "blockio" | "iostat" => {
+                if authorize(Capability::TaskInspect, console) {
+                    cmd_block_io(console);
+                }
+            }
             "net" => cmd_net(console),
             "netstat" => cmd_netstat(console),
             "udpecho" => cmd_udpecho(arg, console),
@@ -367,7 +373,9 @@ impl Shell {
 fn print_help(console: &mut Console<'_>) {
     console.println("WovenHat kernel shell 0.7.0 Stage 9");
     console.println("system:  help clear version ticks|uptime tasks|ps caps devices net netstat");
-    console.println("         memory|mem heap paging bench fs mount persist sync syscall");
+    console.println(
+        "         memory|mem heap paging bench fs blockio|iostat mount persist sync syscall",
+    );
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
     console.println("         rename|mv <old> <new>");
@@ -616,6 +624,32 @@ fn cmd_sync(console: &mut Console<'_>) {
     console.println(" file(s) under /mnt");
 }
 
+fn cmd_block_io(console: &mut Console<'_>) {
+    let stats = block_io::stats();
+    console.print("block io: queued=");
+    print_u64(console, stats.queued);
+    console.print(" completed=");
+    print_u64(console, stats.completed);
+    console.print(" direct=");
+    print_u64(console, stats.direct);
+    console.print(" pending=");
+    print_u64(console, stats.pending as u64);
+    console.print(" active=");
+    print_u64(console, stats.active as u64);
+    console.newline();
+
+    let swap_stats = swap::stats();
+    console.print("swap: used=");
+    print_u64(console, swap_stats.used as u64);
+    console.print(" ram=");
+    print_u64(console, swap_stats.ram_used as u64);
+    console.print(" disk=");
+    print_u64(console, swap_stats.disk_used as u64);
+    console.print(" disk_slots=");
+    print_u64(console, swap_stats.disk_slots as u64);
+    console.newline();
+}
+
 fn ensure_program(path: &str, installer: fn() -> bool) -> bool {
     vfs::stat(path).is_ok() || installer()
 }
@@ -859,7 +893,7 @@ fn cmd_fs(console: &mut Console<'_>) {
 
 fn cmd_mount(console: &mut Console<'_>) {
     console.println("storage: ATA primary master (if present)");
-    console.println("boot mounts FAT32 root into /mnt (read-only import)");
+    console.println("boot mounts FAT32 root into /mnt (writable when media allows)");
     console.println("on-demand: cat/stat/run of /mnt/... pulls missing paths");
     console.print("vfs nodes under /mnt: ");
     let mut count = 0usize;
@@ -1011,15 +1045,37 @@ fn cmd_rename(args: &str, console: &mut Console<'_>) {
         console.println("rename: bad path");
         return;
     };
+
+    if touches_mnt(&old) || touches_mnt(&new) {
+        if !is_mnt_child(&old) || !is_mnt_child(&new) {
+            console.println("rename: cross-mount not supported");
+            return;
+        }
+        let _ = storage::ensure_path(&old);
+        if let Some(parent) = shell_parent_path(&new) {
+            if parent == "/mnt" || parent.starts_with("/mnt/") {
+                let _ = storage::ensure_path(&parent);
+            }
+        }
+        match vfs::can_rename(&old, &new) {
+            Ok(()) => {}
+            Err(err) => {
+                print_rename_vfs_error(err, console);
+                return;
+            }
+        }
+        match storage::rename_path(&old, &new) {
+            Ok(()) => {}
+            Err(err) => {
+                print_rename_storage_error(err, console);
+                return;
+            }
+        }
+    }
+
     match vfs::rename(&old, &new) {
         Ok(()) => console.println("renamed"),
-        Err(vfs::Error::NotFound) => {
-            console.println("rename: source or destination parent missing")
-        }
-        Err(vfs::Error::AlreadyExists) => console.println("rename: destination exists"),
-        Err(vfs::Error::InvalidPath) => console.println("rename: invalid path or destination"),
-        Err(vfs::Error::ReadOnly) => console.println("rename: refused"),
-        Err(_) => console.println("rename: failed"),
+        Err(err) => print_rename_vfs_error(err, console),
     }
 }
 
@@ -1028,12 +1084,36 @@ fn cmd_rm(path: &str, console: &mut Console<'_>) {
         console.println("rm: bad path");
         return;
     };
+    if path == "/mnt" {
+        console.println("rm: refused");
+        return;
+    }
+
+    if is_mnt_child(&path) {
+        let _ = storage::ensure_path(&path);
+        match vfs::can_remove(&path) {
+            Ok(()) => {}
+            Err(err) => {
+                print_rm_vfs_error(err, console);
+                return;
+            }
+        }
+        if let Err(err) = vfs::prepare_remove(&path) {
+            print_rm_vfs_error(err, console);
+            return;
+        }
+        match storage::delete_path(&path) {
+            Ok(()) => {}
+            Err(err) => {
+                print_rm_storage_error(err, console);
+                return;
+            }
+        }
+    }
+
     match vfs::remove(&path) {
         Ok(()) => console.println("removed"),
-        Err(vfs::Error::NotFound) => console.println("rm: not found"),
-        Err(vfs::Error::ReadOnly) => console.println("rm: refused"),
-        Err(vfs::Error::NotEmpty) => console.println("rm: directory not empty"),
-        Err(_) => console.println("rm: failed"),
+        Err(err) => print_rm_vfs_error(err, console),
     }
 }
 
@@ -1043,7 +1123,20 @@ fn cmd_mkdir(path: &str, console: &mut Console<'_>) {
         return;
     };
     match vfs::mkdir(&path) {
-        Ok(()) => console.println("ok"),
+        Ok(()) => {
+            if is_mnt_child(&path) {
+                match storage::persist_directory(&path) {
+                    Ok(()) => console.println("ok"),
+                    Err(storage::PersistError::NoDevice) => console.println("mkdir: no ATA disk"),
+                    Err(storage::PersistError::BadName) => {
+                        console.println("mkdir: FAT 8.3 path required")
+                    }
+                    Err(_) => console.println("mkdir: disk persist failed"),
+                }
+            } else {
+                console.println("ok");
+            }
+        }
         Err(vfs::Error::AlreadyExists) => console.println("mkdir: exists"),
         Err(vfs::Error::NotFound) => console.println("mkdir: parent missing"),
         Err(vfs::Error::Full) => console.println("mkdir: vfs full"),
@@ -1259,6 +1352,75 @@ fn cmd_user(console: &mut Console<'_>) {
             console.newline();
         }
         Err(_) => console.println("user: spawn failed"),
+    }
+}
+
+fn is_mnt_child(path: &str) -> bool {
+    path.starts_with("/mnt/")
+}
+
+fn touches_mnt(path: &str) -> bool {
+    path == "/mnt" || path.starts_with("/mnt/")
+}
+
+fn shell_parent_path(path: &str) -> Option<alloc::string::String> {
+    if !path.starts_with('/') || path == "/" {
+        return None;
+    }
+    let index = path.rfind('/')?;
+    if index == 0 {
+        Some(alloc::string::String::from("/"))
+    } else {
+        Some(alloc::string::String::from(&path[..index]))
+    }
+}
+
+fn print_rename_vfs_error(err: vfs::Error, console: &mut Console<'_>) {
+    match err {
+        vfs::Error::NotFound => console.println("rename: source or destination parent missing"),
+        vfs::Error::AlreadyExists => console.println("rename: destination exists"),
+        vfs::Error::InvalidPath => console.println("rename: invalid path or destination"),
+        vfs::Error::ReadOnly => console.println("rename: refused"),
+        _ => console.println("rename: failed"),
+    }
+}
+
+fn print_rename_storage_error(err: storage::MutationError, console: &mut Console<'_>) {
+    match err {
+        storage::MutationError::NotSupported => {
+            console.println("rename: cross-mount not supported")
+        }
+        storage::MutationError::NotFound => {
+            console.println("rename: source or destination parent missing")
+        }
+        storage::MutationError::NoDevice => console.println("rename: no ATA disk"),
+        storage::MutationError::BadName => console.println("rename: FAT 8.3 path required"),
+        storage::MutationError::AlreadyExists => console.println("rename: destination exists"),
+        storage::MutationError::NotEmpty => console.println("rename: directory not empty"),
+        storage::MutationError::ReadOnly => console.println("rename: refused"),
+        storage::MutationError::Failed => console.println("rename: disk update failed"),
+    }
+}
+
+fn print_rm_vfs_error(err: vfs::Error, console: &mut Console<'_>) {
+    match err {
+        vfs::Error::NotFound => console.println("rm: not found"),
+        vfs::Error::ReadOnly => console.println("rm: refused"),
+        vfs::Error::NotEmpty => console.println("rm: directory not empty"),
+        _ => console.println("rm: failed"),
+    }
+}
+
+fn print_rm_storage_error(err: storage::MutationError, console: &mut Console<'_>) {
+    match err {
+        storage::MutationError::NotSupported => console.println("rm: refused"),
+        storage::MutationError::NotFound => console.println("rm: not found"),
+        storage::MutationError::NoDevice => console.println("rm: no ATA disk"),
+        storage::MutationError::BadName => console.println("rm: FAT 8.3 path required"),
+        storage::MutationError::AlreadyExists => console.println("rm: failed"),
+        storage::MutationError::NotEmpty => console.println("rm: directory not empty"),
+        storage::MutationError::ReadOnly => console.println("rm: refused"),
+        storage::MutationError::Failed => console.println("rm: disk update failed"),
     }
 }
 

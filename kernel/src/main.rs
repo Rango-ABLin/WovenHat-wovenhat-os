@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "qemu-test", allow(dead_code, unused_imports))]
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
@@ -10,6 +11,7 @@ mod audit;
 mod benchmark;
 mod block;
 mod block_cache;
+mod block_io;
 mod capability;
 mod config;
 mod console;
@@ -39,6 +41,7 @@ mod pipe;
 mod serial;
 mod shell;
 mod storage;
+mod swap;
 mod syscall;
 mod task;
 mod terminal;
@@ -272,6 +275,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pic::unmask(timer::IRQ);
         pic::unmask(keyboard::IRQ);
         x86_64::instructions::interrupts::enable();
+        if !block_io::start_worker() {
+            console.println("BLOCK I/O WORKER: START FAILED");
+            halt();
+        }
+        if !block_io::async_completion_self_test() {
+            console.println("BLOCK I/O COMPLETION: FAILED");
+            halt();
+        }
         if !task::start_pager() {
             console.println("PAGER: START FAILED");
             halt();
@@ -442,6 +453,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial::write_line(format_args!("[BUFFER CACHE] regression tests: FAILED"));
         halt();
     }
+    if block_io::self_test() {
+        console.println("ASYNC BLOCK I/O: OK");
+        serial::write_line(format_args!("[BLOCK IO] async completion tests: PASSED"));
+    } else {
+        console.println("ASYNC BLOCK I/O: FAILED");
+        serial::write_line(format_args!("[BLOCK IO] async completion tests: FAILED"));
+        halt();
+    }
+    if swap::self_test() {
+        console.println("SWAP BACKING: OK");
+        serial::write_line(format_args!("[SWAP] disk-backed policy tests: PASSED"));
+    } else {
+        console.println("SWAP BACKING: FAILED");
+        serial::write_line(format_args!("[SWAP] disk-backed policy tests: FAILED"));
+        halt();
+    }
 
     if page_cache::self_test() {
         serial::write_line(format_args!("[FILE PAGES] regression tests: PASSED"));
@@ -512,6 +539,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial::write_line(format_args!("[LAZY FILE MMAP] regression tests: PASSED"));
     } else {
         serial::write_line(format_args!("[LAZY FILE MMAP] regression tests: FAILED"));
+        halt();
+    }
+    if userspace::private_lazy_swap_self_test() {
+        serial::write_line(format_args!(
+            "[PRIVATE SWAP MMAP] dirty eviction/refault: PASSED"
+        ));
+    } else {
+        serial::write_line(format_args!("[PRIVATE SWAP MMAP] regression tests: FAILED"));
         halt();
     }
     if userspace::file_mmap_self_test() {
@@ -640,7 +675,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let storage_status = storage::mount_ata_root();
     match storage_status {
         storage::MountStatus::Mounted(files) => {
-            console.println("FAT32 ROOT MOUNTED READ-ONLY");
+            console.println("FAT32 ROOT MOUNTED");
             serial::write_line(format_args!("[VFS] mounted {} FAT32 root files", files));
         }
         storage::MountStatus::NoDevice => console.println("FAT32 MOUNT: NO BLOCK DEVICE"),
@@ -739,9 +774,38 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     pic::unmask(timer::IRQ);
     pic::unmask(keyboard::IRQ);
     x86_64::instructions::interrupts::enable();
+    if !block_io::start_worker() {
+        console.println("BLOCK I/O WORKER: START FAILED");
+        halt();
+    }
+    if block_io::async_completion_self_test() {
+        serial::write_line(format_args!("[BLOCK IO] worker completion: PASSED"));
+    } else {
+        serial::write_line(format_args!("[BLOCK IO] worker completion: FAILED"));
+        halt();
+    }
     if !task::start_pager() {
         console.println("PAGER: START FAILED");
         halt();
+    }
+    match storage::live_mutation_self_test() {
+        storage::LiveMutationTestStatus::Passed => {
+            serial::write_line(format_args!(
+                "[STORAGE MUTATION] live FAT32 rename/delete/growth: PASSED"
+            ));
+        }
+        storage::LiveMutationTestStatus::Skipped => {
+            serial::write_line(format_args!(
+                "[STORAGE MUTATION] live FAT32 rename/delete/growth: SKIPPED"
+            ));
+        }
+        storage::LiveMutationTestStatus::Failed(stage) => {
+            serial::write_line(format_args!(
+                "[STORAGE MUTATION] live FAT32 rename/delete/growth: FAILED at {}",
+                stage
+            ));
+            halt();
+        }
     }
 
     while timer::ticks() < 3 {
@@ -940,48 +1004,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "[BOOT] user write/open/read/close and pointer validation verified"
     ));
 
-    // Exercise a real Ring-3 absent-page exception. The pager must park the
-    // faulting context, populate the backing page on its worker task, then
-    // resume the original instruction. mmaptest covers sparse lazy faults,
-    // writes, fork, and kernel copy_to/from_user fault resolution.
-    let pager_before = task::pager_stats();
-    if !userspace::install_file_mmap_test() {
-        console.println("PAGER MMAP IMAGE: INSTALL FAILED");
-        halt();
-    }
-    let mut pager_image = alloc::vec![0u8; vfs::NODE_CAPACITY];
-    let Ok(pager_image_len) = vfs::read_all("/bin/mmaptest", &mut pager_image) else {
-        console.println("PAGER MMAP IMAGE: READ FAILED");
-        halt();
-    };
-    let Some(pager_program) = userspace::load_elf_with_argv(&pager_image[..pager_image_len], &["/bin/mmaptest"]) else {
-        console.println("PAGER MMAP IMAGE: LOAD FAILED");
-        halt();
-    };
-    let pager_pid = match task::spawn_user_process("pager-mmaptest", pager_program) {
-        Ok((pid, _)) => pid,
-        Err(_) => {
-            console.println("PAGER MMAP PROCESS: SPAWN FAILED");
-            halt();
-        }
-    };
-    while !task::process_exited(pager_pid) {
-        x86_64::instructions::hlt();
-    }
-    let pager_status = task::wait_process(pager_pid.as_u64());
-    let pager_after = task::pager_stats();
-    if pager_status != Ok(0)
-        || pager_after.0 <= pager_before.0
-        || pager_after.1 < pager_after.0
-    {
-        console.println("ASYNCHRONOUS PAGER: FAILED");
-        halt();
-    }
-    serial::write_line(format_args!(
-        "[PAGER] Ring-3 faults queued={} completed={}: PASSED",
-        pager_after.0 - pager_before.0,
-        pager_after.1 - pager_before.1
-    ));
     if !syscall::last_completed(syscall::Number::Getpid) {
         console.println("USER SYSCALL ABI: FAILED");
         halt();
@@ -1019,6 +1041,57 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("RING3 PROCESS GETPID/EXIT: OK");
     serial::write_line(format_args!(
         "[BOOT] ring3 process and syscall ABI verified"
+    ));
+    // Exercise a real Ring-3 absent-page exception. The pager must park the
+    // faulting context, populate the backing page on its worker task, then
+    // resume the original instruction. mmaptest covers sparse lazy faults,
+    // writes, fork, and kernel copy_to/from_user fault resolution.
+    let pager_before = task::pager_stats();
+    if !userspace::install_file_mmap_test() {
+        console.println("PAGER MMAP IMAGE: INSTALL FAILED");
+        halt();
+    }
+    let mut pager_image = alloc::vec![0u8; vfs::NODE_CAPACITY];
+    let Ok(pager_image_len) = vfs::read_all("/bin/mmaptest", &mut pager_image) else {
+        console.println("PAGER MMAP IMAGE: READ FAILED");
+        halt();
+    };
+    let Some(pager_program) =
+        userspace::load_elf_with_argv(&pager_image[..pager_image_len], &["/bin/mmaptest"])
+    else {
+        console.println("PAGER MMAP IMAGE: LOAD FAILED");
+        halt();
+    };
+    let pager_pid = match task::spawn_user_process("pager-mmaptest", pager_program) {
+        Ok((pid, _)) => pid,
+        Err(_) => {
+            console.println("PAGER MMAP PROCESS: SPAWN FAILED");
+            halt();
+        }
+    };
+    let pager_wait_start = timer::ticks();
+    while !task::process_exited(pager_pid) {
+        if timer::ticks().wrapping_sub(pager_wait_start) > 200 {
+            let (queued, completed) = task::pager_stats();
+            serial::write_line(format_args!(
+                "[PAGER] mmaptest timeout queued={} completed={}",
+                queued, completed
+            ));
+            console.println("ASYNCHRONOUS PAGER: TIMEOUT");
+            halt();
+        }
+        x86_64::instructions::hlt();
+    }
+    let pager_status = task::wait_process(pager_pid.as_u64());
+    let pager_after = task::pager_stats();
+    if pager_status != Ok(0) || pager_after.0 <= pager_before.0 || pager_after.1 < pager_after.0 {
+        console.println("ASYNCHRONOUS PAGER: FAILED");
+        halt();
+    }
+    serial::write_line(format_args!(
+        "[PAGER] Ring-3 faults queued={} completed={}: PASSED",
+        pager_after.0 - pager_before.0,
+        pager_after.1 - pager_before.1
     ));
     console.println("KEYBOARD IRQ: READY");
 

@@ -27,9 +27,9 @@ Corrected against source, not the stale docs:
 |---|---|---|
 | Physical memory / paging | Solid — checked-arithmetic frame allocator, per-page permission validation on all user copies | `memory.rs`, `paging.rs` |
 | Scheduling | **Preemptive**, timer-interrupt driven, task states, PID/parent-child, wait/exit | `task.rs`, `interrupts.rs:199` |
-| User mode + syscalls | Working ring-3 execution, `int 0x80` ABI, 17 syscalls, capability-gated | `syscall.rs`, `gdt.rs` |
+| User mode + syscalls | Working ring-3 execution with an expanded `int 0x80` ABI for files, processes, IPC, networking, and mmap; capability-gated | `syscall.rs`, `gdt.rs` |
 | Capability model | 11 capability bits, bootstrap vs userspace default sets | `capability.rs` |
-| Filesystem | FAT32 read path + GPT partition parsing, hardened against malformed/malicious volumes (loop detection, overflow checks) | `fat32.rs`, `gpt.rs`, `vfs.rs` |
+| Filesystem | FAT32 read/write/mutation path for short-name `/mnt` files and directories, GPT partition parsing, and malformed-volume hardening | `fat32.rs`, `gpt.rs`, `vfs.rs`, `storage.rs` |
 | IPC | Fixed-size mailbox model, capability + allow-list gated | `ipc.rs` |
 | ELF loading | Validating loader: segment overlap checks, W^X, address-limit clamping | `elf.rs` |
 | Audit | Privileged-syscall audit log | `audit.rs` |
@@ -69,15 +69,21 @@ Current drivers are QEMU-specific. A fully-fledged OS needs a driver framework, 
 - **Definition of done**: boots and functions on real hardware (or a second, differently-configured VM/hypervisor) without code changes, not just the one QEMU profile in CI.
 
 ### Phase A3: Filesystem Maturity
-- [ ] FAT32 **write path** (you have read; directory creation, cluster allocation, free-space tracking, safe unmount/flush are still needed)
+- [x] FAT32 short-name `/mnt` create/overwrite/delete/rename path, including directory creation, cluster allocation/freeing, subtree-safe directory rename, full-directory cluster extension, FSInfo free-space hint updates, safer overwrite rollback, shell/syscall integration, sector-cache flush, and regression coverage.
+- [ ] FAT32 write-path hardening: long filename creation, safe unmount UX, journaling or crash-safe metadata ordering.
 - [ ] Journaling or copy-on-write filesystem option (ext-like or a from-scratch CoW design) — FAT32 alone is not a serious modern filesystem (no permissions, no journaling, 4 GB file cap)
-- [ ] Raise `fat32::MAX_READ_CLUSTERS` (currently 64) to a streaming read model instead of a hard cap — needed before real files/executables get larger
+- [x] Replaced the fixed `fat32::MAX_READ_CLUSTERS` file-read ceiling with size/media-bounded streaming reads; directory metadata scans retain a bounded corruption guard.
 - [x] Persistent ATA sector buffer cache with bounded LRU replacement, dirty writeback, failure retry, and diagnostics; see `buffer-cache.md`.
 - [x] Demand-loaded clean FAT32 file pages with bounded LRU caching and invalidation; see `file-page-cache.md`.
 - [x] Read-only private file snapshots via syscall 58, with Ring-3 mmaptest; see `file-mmap.md`.
 - [x] Writable private snapshots (59) and demand-paged private mappings (60/61), including sparse fork and lifecycle tests.
 - [x] Physical mapping-cache aliases, unpinned LRU reclamation, shared writable mappings and msync (62/63), retained unlinked inodes, and interrupt-enabled BSP fault I/O.
-- [ ] Live-page eviction/swap, asynchronous pager workers, and full multicore execution with TLB shootdowns.
+- [x] Bounded scheduler-level pager worker for lazy file faults, with Ring-3 QEMU regression coverage.
+- [x] Conservative live mapped-page eviction/refault for safe file-backed pages.
+- [x] Dirty private-page tracking with bounded swap-slot eviction/refault for writable private lazy mappings.
+- [x] Disk-backed swap policy over reserved raw ATA sectors, with generation-checked handles and RAM fallback.
+- [x] Bounded scheduler-level block-I/O completion worker for primary ATA sector reads/writes/flushes, with QEMU queue/wake/completion regression coverage; ATA remains PIO-polled.
+- [ ] Hardware interrupt/DMA-backed storage completion and full multicore execution with TLB shootdowns.
 - [ ] File permissions tied into your existing UID/GID syscalls (`Getuid`/`Getgid` exist; nothing currently enforces per-file access control)
 - **Definition of done**: can build and store a real userspace toolchain's output on-disk, survive unclean shutdown without corruption, and enforce per-user file permissions.
 
@@ -191,5 +197,5 @@ Ongoing, cheap to start now:
 
 - **Don't let Track B leak into the kernel.** The moment an LLM runtime, a UI theming engine, or clustering logic needs a new *kernel* syscall beyond generic primitives (IPC, capability grant/revoke, mmap, network sockets), stop and ask whether that belongs in userspace instead.
 - **Don't chase every phase in parallel.** SMP touches nearly every global lock in the kernel; land it before networking and drivers multiply the number of places that need to be re-audited for cross-core safety.
-- **Don't let the constants (`MAX_IO_SIZE`, `MAX_MESSAGE_SIZE`, `MAX_READ_CLUSTERS`, `MAX_ENDPOINTS`) silently become permanent ABI.** Revisit them explicitly as part of A3/A4 rather than discovering three years from now that real software depends on 256-byte syscall reads.
+- **Don't let the constants (`MAX_IO_SIZE`, `MAX_MESSAGE_SIZE`, `MAX_DIRECTORY_CLUSTERS`, `MAX_ENDPOINTS`) silently become permanent ABI.** Revisit them explicitly as part of A3/A4 rather than discovering three years from now that real software depends on 256-byte syscall reads.
 - **Don't let this document go stale like the last one did.** Update the status table in Section 1 at every phase boundary — an inaccurate roadmap actively costs you (or an AI agent) rework.

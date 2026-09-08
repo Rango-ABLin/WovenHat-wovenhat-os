@@ -3419,11 +3419,30 @@ pub fn setup_argv_stack(
 const USER_MMAP_START: u64 = USER_REGION_START + 0x0e_0000;
 const USER_MMAP_STRIDE: u64 = 0x10_000;
 const USER_MMAP_MAX_SIZE: usize = USER_MMAP_STRIDE as usize;
+const USER_MMAP_PAGES: usize = USER_MMAP_MAX_SIZE / 4096;
 const _: () = assert!(
     USER_MMAP_START + MAX_ANONYMOUS_MAPPINGS as u64 * USER_MMAP_STRIDE
         <= USER_REGION_START + USER_STACK_OFFSET - 4096
 );
 
+fn share_mapping_swap_slots(mapping: AnonymousMapping) -> bool {
+    for (index, slot) in mapping.swap_slots.iter().flatten().copied().enumerate() {
+        if crate::swap::share_page(slot) {
+            continue;
+        }
+        for prior in mapping.swap_slots.iter().flatten().take(index).copied() {
+            let _ = crate::swap::release_page(prior);
+        }
+        return false;
+    }
+    true
+}
+
+fn release_mapping_swap_slots(mapping: AnonymousMapping) {
+    for slot in mapping.swap_slots.iter().flatten().copied() {
+        let _ = crate::swap::release_page(slot);
+    }
+}
 #[derive(Clone, Copy)]
 pub struct AnonymousMapping {
     pub address: u64,
@@ -3431,6 +3450,8 @@ pub struct AnonymousMapping {
     pub writable: bool,
     lazy: Option<LazyFile>,
     resident: u16,
+    dirty: u16,
+    swap_slots: [Option<crate::swap::Handle>; USER_MMAP_PAGES],
 }
 
 #[derive(Clone, Copy)]
@@ -3898,6 +3919,8 @@ pub fn map_anonymous(
         writable,
         lazy: None,
         resident: 0,
+        dirty: 0,
+        swap_slots: [None; USER_MMAP_PAGES],
     })
 }
 
@@ -3957,6 +3980,8 @@ pub fn map_file_lazy(
         size,
         writable,
         resident: 0,
+        dirty: 0,
+        swap_slots: [None; USER_MMAP_PAGES],
         lazy: Some(LazyFile {
             file,
             generation,
@@ -4045,6 +4070,19 @@ pub fn populate_file_page(
         return false;
     }
     let page = mapping.address + (index * 4096) as u64;
+    if let Some(slot) = mapping.swap_slots[index] {
+        let mut bytes = [0; 4096];
+        if !crate::swap::read_page(slot, &mut bytes)
+            || !paging::map_private_frame_from_bytes(space.paging, page, &bytes, mapping.writable)
+        {
+            return false;
+        }
+        let _ = crate::swap::release_page(slot);
+        mapping.swap_slots[index] = None;
+        mapping.resident |= bit;
+        mapping.dirty |= bit;
+        return true;
+    }
     let count = backing.length.saturating_sub(index * 4096).min(4096);
     if !crate::file_frames::map(
         space.paging,
@@ -4058,6 +4096,88 @@ pub fn populate_file_page(
         return false;
     }
     mapping.resident |= bit;
+    true
+}
+
+pub fn mark_file_page_dirty(mapping: &mut AnonymousMapping, address: u64) -> bool {
+    let Some(backing) = mapping.lazy else {
+        return false;
+    };
+    if backing.shared
+        || !mapping.writable
+        || address < mapping.address
+        || address >= mapping.address + mapping.size as u64
+    {
+        return false;
+    }
+    let index = ((address - mapping.address) / 4096) as usize;
+    let bit = 1_u16 << index;
+    if mapping.resident & bit == 0 {
+        return false;
+    }
+    mapping.dirty |= bit;
+    true
+}
+
+/// Evict one reconstructable file-backed resident page.
+///
+/// Clean private pages are discarded and refaulted from their retained backing
+/// file. Dirty private pages are copied into a bounded swap slot before unmap.
+/// Shared pages are copied back to the inode before unmap.
+pub fn evict_file_page(space: AddressSpace, mapping: &mut AnonymousMapping, address: u64) -> bool {
+    let Some(backing) = mapping.lazy else {
+        return false;
+    };
+    if address < mapping.address || address >= mapping.address + mapping.size as u64 {
+        return false;
+    }
+    let index = ((address - mapping.address) / 4096) as usize;
+    let bit = 1_u16 << index;
+    if mapping.resident & bit == 0 {
+        return false;
+    }
+    let page = mapping.address + (index * 4096) as u64;
+    let dirty_private = !backing.shared && mapping.dirty & bit != 0;
+    let mut new_swap_slot = None;
+    if dirty_private {
+        let mut bytes = [0; 4096];
+        if paging::read_user_bytes_in(space.paging, page, &mut bytes).is_err() {
+            return false;
+        }
+        let Some(slot) = crate::swap::allocate_page(&bytes) else {
+            return false;
+        };
+        new_swap_slot = Some(slot);
+    } else if backing.shared {
+        let count = backing.length.saturating_sub(index * 4096).min(4096);
+        if count > 0 {
+            let mut bytes = [0; 4096];
+            if paging::read_user_bytes_in(space.paging, page, &mut bytes[..count]).is_err()
+                || crate::vfs::write_mapping_at(
+                    backing.file,
+                    backing.offset + index * 4096,
+                    &bytes[..count],
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    if paging::unmap_user_range_in(space.paging, page, 4096).is_err() {
+        if let Some(slot) = new_swap_slot {
+            let _ = crate::swap::release_page(slot);
+        }
+        return false;
+    }
+    if let Some(old) = mapping.swap_slots[index].take() {
+        let _ = crate::swap::release_page(old);
+    }
+    if let Some(slot) = new_swap_slot {
+        mapping.swap_slots[index] = Some(slot);
+    }
+    mapping.resident &= !bit;
+    crate::file_frames::reclaim_unused();
     true
 }
 
@@ -4078,6 +4198,7 @@ pub fn unmap_anonymous(address_space: AddressSpace, mapping: AnonymousMapping) -
                 return false;
             }
         }
+        release_mapping_swap_slots(mapping);
         let closed = crate::vfs::close_open_file(backing.file).is_ok();
         crate::file_frames::reclaim_unused();
         closed
@@ -4203,6 +4324,21 @@ pub fn clone_address_space(
                 return None;
             }
         }
+    }
+    for (index, mapping) in anonymous.iter().flatten().copied().enumerate() {
+        if share_mapping_swap_slots(mapping) {
+            continue;
+        }
+        for prior in anonymous.iter().flatten().copied().take(index) {
+            release_mapping_swap_slots(prior);
+        }
+        for mapping in anonymous.iter().flatten() {
+            if let Some(backing) = mapping.lazy {
+                let _ = crate::vfs::close_open_file(backing.file);
+            }
+        }
+        release_clone(destination.paging, &completed[..completed_count]);
+        return None;
     }
     Some(destination)
 }
@@ -4616,6 +4752,14 @@ pub fn lazy_file_mmap_self_test() -> bool {
         && paging::user_range_has_protection_in(root, mapping.address + 8192, 4096, false, false)
         && paging::read_user_bytes_in(root, mapping.address + 8192, &mut tail).is_ok()
         && tail == [65, 0, 0, 0, 0, 0, 0, 0];
+    passed &= evict_file_page(space, &mut mapping, USER_MMAP_START + 8192)
+        && mapping.resident == 0
+        && paging::user_range_is_unmapped_in(root, mapping.address + 8192, 4096)
+        && crate::memory::stats().allocated_frames == reservation_frames;
+    passed &= populate_file_page(space, &mut mapping, USER_MMAP_START + 8192, false)
+        && mapping.resident == 4
+        && paging::read_user_bytes_in(root, mapping.address + 8192, &mut tail).is_ok()
+        && tail == [65, 0, 0, 0, 0, 0, 0, 0];
     let mut byte = [0];
     passed &= crate::vfs::read(file, &mut byte) == Ok(1) && byte == [0x33];
     passed &= crate::vfs::close_open_file(file).is_ok();
@@ -4643,6 +4787,72 @@ pub fn lazy_file_mmap_self_test() -> bool {
         && crate::memory::stats().allocated_frames == frames_before
 }
 
+/// Verify dirty private lazy pages survive eviction through swap slots.
+pub fn private_lazy_swap_self_test() -> bool {
+    const PATH: &str = "/tmp/private-swap-mmap-test";
+    static DATA: [u8; 8192] = [65; 8192];
+    let frames_before = crate::memory::stats().allocated_frames;
+    let descriptors_before = crate::vfs::open_file_description_count();
+    if crate::vfs::stat(PATH).is_ok() || crate::vfs::write_file(PATH, &DATA).is_err() {
+        return false;
+    }
+    let Ok(file) = crate::vfs::open(PATH) else {
+        let _ = crate::vfs::remove(PATH);
+        return false;
+    };
+    let Some(root) = paging::create_user_address_space(USER_MMAP_START) else {
+        let _ = crate::vfs::close_open_file(file);
+        let _ = crate::vfs::remove(PATH);
+        return false;
+    };
+    let space = AddressSpace {
+        paging: root,
+        stack_base: 0,
+        mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS],
+        mapping_count: 0,
+    };
+    let anchor = USER_MMAP_START + 15 * USER_MMAP_STRIDE;
+    if paging::map_user_range_in(root, anchor, 4096, false, false).is_err() {
+        let _ = paging::discard_empty_user_address_space(root);
+        let _ = crate::vfs::close_open_file(file);
+        let _ = crate::vfs::remove(PATH);
+        return false;
+    }
+    let reservation_frames = crate::memory::stats().allocated_frames;
+    let Some(mut mapping) = map_file_lazy(space, 0, file, 0, DATA.len(), true) else {
+        let _ = paging::destroy_user_address_space(root, &[(anchor, 4096)]);
+        let _ = crate::vfs::close_open_file(file);
+        let _ = crate::vfs::remove(PATH);
+        return false;
+    };
+    let page = mapping.address + 4096;
+    let mut byte = [0];
+    let mut passed = populate_file_page(space, &mut mapping, page, false)
+        && paging::try_break_cow(root, page)
+        && paging::write_user_bytes(root, page, &[90]).is_ok()
+        && mark_file_page_dirty(&mut mapping, page)
+        && paging::read_user_bytes_in(root, page, &mut byte).is_ok()
+        && byte == [90]
+        && crate::vfs::read_at(file, 4096, &mut byte) == Ok(1)
+        && byte == [65];
+    passed &= evict_file_page(space, &mut mapping, page)
+        && mapping.resident == 0
+        && paging::user_range_is_unmapped_in(root, page, 4096)
+        && crate::memory::stats().allocated_frames == reservation_frames;
+    passed &= populate_file_page(space, &mut mapping, page, false)
+        && mapping.resident == 2
+        && paging::read_user_bytes_in(root, page, &mut byte).is_ok()
+        && byte == [90]
+        && crate::vfs::read_at(file, 4096, &mut byte) == Ok(1)
+        && byte == [65];
+    passed &= unmap_anonymous(space, mapping);
+    passed &= paging::destroy_user_address_space(root, &[(anchor, 4096)]).is_ok();
+    passed &= crate::vfs::close_open_file(file).is_ok();
+    passed &= crate::vfs::remove(PATH).is_ok();
+    passed
+        && crate::vfs::open_file_description_count() == descriptors_before
+        && crate::memory::stats().allocated_frames == frames_before
+}
 /// Test real file mappings before scheduler-dependent boot tests.
 pub fn file_mmap_self_test() -> bool {
     const PATH: &str = "/tmp/file-mmap-test";

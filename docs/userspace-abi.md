@@ -39,6 +39,37 @@ stack. Programs are ELF images loaded by the kernel (`load_elf` /
 | 24 | dup2 | |
 | 25 | getppid | |
 | 26 | kill | 0/9/15 |
+| 27 | lseek | fd seek |
+| 28 | unlink | path, path_len |
+| 29 | sleep | ticks |
+| 30 | rename | old path, old_len|(new_len<<32), new path |
+| 31 | getticks | monotonic ticks |
+| 32 | sync | flush mounted files and device cache |
+| 33 | ioctl | fd, request, argument |
+| 34 | sigaction | signal handler/default/ignore |
+| 35 | getpgrp | |
+| 36 | setpgid | pid, pgid |
+| 37 | socket | UDP/TCP descriptor |
+| 38 | bind | socket, local port |
+| 39 | connect | socket, packed endpoint |
+| 40 | net_send | socket, buf, len |
+| 41 | net_recv | socket, buf, capacity |
+| 42 | net_close | socket |
+| 43 | net_info | network status/config |
+| 44 | dns_start | hostname query |
+| 45 | dns_poll | query completion |
+| 46 | net_peer | socket peer endpoint |
+| 47 | dhcp | static/DHCP mode |
+| 48 | ping_start | packed IPv4 |
+| 49 | ping_poll | query id |
+| 50 | exec_command | command line |
+| 51 | env_get | key lookup |
+| 52 | env_set | key/value update |
+| 53 | env_count | |
+| 54 | env_entry | indexed KEY=VALUE |
+| 55 | process_count | |
+| 56 | process_info | indexed process info |
+| 57 | spawn_command | command line -> child pid |
 
 ## Initial stack
 
@@ -64,8 +95,14 @@ Console, FileRead, FileWrite, Ipc, ProcessCreate.
 
 ## Shell builtins (`/bin/sh`)
 
-`help`, `echo`, `cat`, `ls`, `mkdir`, `cd`, `pwd`, `exit`/`quit`.  
-Any other line is treated as a path: `fork` → `exec` → parent `waitpid`.
+`help`, `echo`, `cat`, `ls`, `mkdir`, `cd`, `pwd`, `stat`, `write`, `persist`,
+`rm`, `rename`, `sync`, `fs`, `blockio`/`iostat`, `mmaptest`, `msynctest`,
+`exit`/`quit`. Any other line is treated as a path: `fork` -> `exec` -> parent
+`waitpid`.
+
+For `/mnt` short-name FAT32 paths, `mkdir`, `unlink`, and `rename` update the
+on-disk directory entries and flush before returning success; cross-mount rename
+and non-empty directory unlink are rejected.
 
 ## Boot flow
 

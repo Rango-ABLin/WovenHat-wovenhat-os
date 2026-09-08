@@ -16,6 +16,7 @@ const ALT_STATUS: u16 = 0x3f6;
 const COMMAND_IDENTIFY: u8 = 0xec;
 const COMMAND_READ_SECTORS: u8 = 0x20;
 const COMMAND_WRITE_SECTORS: u8 = 0x30;
+const ATA_RETRIES: usize = 3;
 const STATUS_ERR: u8 = 1;
 const STATUS_DRQ: u8 = 1 << 3;
 const STATUS_DF: u8 = 1 << 5;
@@ -71,26 +72,13 @@ impl BlockDevice for AtaPio {
             return Err(Error::OutOfBounds);
         }
 
-        unsafe {
-            if !poll_not_busy() {
-                return Err(Error::DeviceFault);
+        for _ in 0..ATA_RETRIES {
+            if unsafe { read_sector_once(lba, sector) }.is_ok() {
+                return Ok(());
             }
-            outb(DRIVE, 0xe0 | ((lba >> 24) as u8 & 0x0f));
-            outb(SECTOR_COUNT, 1);
-            outb(LBA_LOW, lba as u8);
-            outb(LBA_MID, (lba >> 8) as u8);
-            outb(LBA_HIGH, (lba >> 16) as u8);
-            outb(STATUS_COMMAND, COMMAND_READ_SECTORS);
-            if !poll_data_ready() {
-                return Err(Error::DeviceFault);
-            }
-            for index in 0..SECTOR_SIZE / 2 {
-                let bytes = inw(DATA).to_le_bytes();
-                sector[index * 2] = bytes[0];
-                sector[index * 2 + 1] = bytes[1];
-            }
+            unsafe { io_delay() };
         }
-        Ok(())
+        Err(Error::DeviceFault)
     }
 
     fn write_sector(&mut self, lba: u64, sector: &[u8]) -> Result<(), Error> {
@@ -101,34 +89,64 @@ impl BlockDevice for AtaPio {
             return Err(Error::OutOfBounds);
         }
 
-        unsafe {
-            if !poll_not_busy() {
-                return Err(Error::DeviceFault);
+        for _ in 0..ATA_RETRIES {
+            if unsafe { write_sector_once(lba, sector) }.is_ok() {
+                return Ok(());
             }
-            outb(DRIVE, 0xe0 | ((lba >> 24) as u8 & 0x0f));
-            outb(SECTOR_COUNT, 1);
-            outb(LBA_LOW, lba as u8);
-            outb(LBA_MID, (lba >> 8) as u8);
-            outb(LBA_HIGH, (lba >> 16) as u8);
-            outb(STATUS_COMMAND, COMMAND_WRITE_SECTORS);
-            if !poll_data_ready() {
-                return Err(Error::DeviceFault);
-            }
-            for index in 0..SECTOR_SIZE / 2 {
-                let word = u16::from_le_bytes([sector[index * 2], sector[index * 2 + 1]]);
-                outw(DATA, word);
-            }
-            // Wait for the write to complete (BSY clear, no ERR/DF).
-            if !poll_not_busy() {
-                return Err(Error::DeviceFault);
-            }
-            let status = inb(STATUS_COMMAND);
-            if status & (STATUS_ERR | STATUS_DF) != 0 {
-                return Err(Error::DeviceFault);
-            }
+            unsafe { io_delay() };
         }
-        Ok(())
+        Err(Error::DeviceFault)
     }
+}
+
+unsafe fn select_lba(lba: u64) -> Result<(), Error> {
+    if !poll_not_busy() {
+        return Err(Error::DeviceFault);
+    }
+    outb(DRIVE, 0xe0 | ((lba >> 24) as u8 & 0x0f));
+    io_delay();
+    outb(SECTOR_COUNT, 1);
+    outb(LBA_LOW, lba as u8);
+    outb(LBA_MID, (lba >> 8) as u8);
+    outb(LBA_HIGH, (lba >> 16) as u8);
+    Ok(())
+}
+
+unsafe fn read_sector_once(lba: u64, sector: &mut [u8]) -> Result<(), Error> {
+    select_lba(lba)?;
+    outb(STATUS_COMMAND, COMMAND_READ_SECTORS);
+    io_delay();
+    if !poll_data_ready() {
+        return Err(Error::DeviceFault);
+    }
+    for index in 0..SECTOR_SIZE / 2 {
+        let bytes = inw(DATA).to_le_bytes();
+        sector[index * 2] = bytes[0];
+        sector[index * 2 + 1] = bytes[1];
+    }
+    Ok(())
+}
+
+unsafe fn write_sector_once(lba: u64, sector: &[u8]) -> Result<(), Error> {
+    select_lba(lba)?;
+    outb(STATUS_COMMAND, COMMAND_WRITE_SECTORS);
+    io_delay();
+    if !poll_data_ready() {
+        return Err(Error::DeviceFault);
+    }
+    for index in 0..SECTOR_SIZE / 2 {
+        let word = u16::from_le_bytes([sector[index * 2], sector[index * 2 + 1]]);
+        outw(DATA, word);
+    }
+    io_delay();
+    if !poll_not_busy() {
+        return Err(Error::DeviceFault);
+    }
+    let status = inb(STATUS_COMMAND);
+    if status & (STATUS_ERR | STATUS_DF) != 0 {
+        return Err(Error::DeviceFault);
+    }
+    Ok(())
 }
 
 pub fn init() -> Option<u64> {

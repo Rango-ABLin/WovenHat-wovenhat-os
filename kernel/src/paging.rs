@@ -1129,6 +1129,56 @@ pub fn allocate_file_frame(bytes: &[u8; 4096]) -> Option<u64> {
     }
     Some(physical)
 }
+
+pub fn map_private_frame_from_bytes(
+    space: AddressSpace,
+    address: u64,
+    bytes: &[u8; 4096],
+    writable: bool,
+) -> bool {
+    let Some(frame) = memory::allocate_frame() else {
+        return false;
+    };
+    let paging = PAGING.lock();
+    let Ok(mut mapper) = mapper_for(&paging, space) else {
+        let _ = memory::deallocate_frame(frame);
+        return false;
+    };
+    let Ok(page) = Page::<Size4KiB>::from_start_address(VirtAddr::new(address)) else {
+        let _ = memory::deallocate_frame(frame);
+        return false;
+    };
+    if mapper.translate_addr(page.start_address()).is_some() {
+        let _ = memory::deallocate_frame(frame);
+        return false;
+    }
+    let Some(destination) = paging
+        .physical_memory_offset
+        .checked_add(frame.start_address().as_u64())
+        .map(|address| address as *mut u8)
+    else {
+        let _ = memory::deallocate_frame(frame);
+        return false;
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, 4096);
+    }
+    let mut allocator = memory::allocator();
+    match unsafe { mapper.map_to(page, frame, user_flags(writable, false), &mut *allocator) } {
+        Ok(flush) => {
+            if Cr3::read().0 == space.level_4_frame {
+                flush.flush();
+            } else {
+                flush.ignore();
+            }
+            true
+        }
+        Err(_) => {
+            let _ = memory::deallocate_frame(frame);
+            false
+        }
+    }
+}
 pub fn file_frame_references(frame: u64) -> u32 {
     COW_TABLE.lock().refcount(frame)
 }

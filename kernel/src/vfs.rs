@@ -221,7 +221,7 @@ impl Registry {
             .count()
     }
 
-    fn remove(&mut self, path: &str) -> Result<(), Error> {
+    fn removable_index(&self, path: &str) -> Result<usize, Error> {
         validate_absolute_path(path)?;
         if path == "/" {
             return Err(Error::ReadOnly);
@@ -241,6 +241,15 @@ impl Registry {
                 }
             }
         }
+        Ok(index)
+    }
+
+    fn can_remove(&self, path: &str) -> Result<(), Error> {
+        self.removable_index(path).map(|_| ())
+    }
+
+    fn remove(&mut self, path: &str) -> Result<(), Error> {
+        let index = self.removable_index(path)?;
         self.generations[index] = self.generations[index].checked_add(1).ok_or(Error::Full)?;
         let node = &mut self.nodes[index];
         node.occupied = false;
@@ -253,7 +262,7 @@ impl Registry {
         Ok(())
     }
 
-    fn rename(&mut self, old: &str, new: &str) -> Result<(), Error> {
+    fn validate_rename(&self, old: &str, new: &str) -> Result<(), Error> {
         validate_absolute_path(old)?;
         validate_absolute_path(new)?;
         if old == "/" || new == "/" {
@@ -292,7 +301,32 @@ impl Registry {
                     }
                 }
             }
+            if let Some(backing) = node.backing {
+                if directory {
+                    if let Some(suffix) = descendant_suffix(old, backing.as_str()) {
+                        if new.len() + suffix.len() > PATH_CAPACITY {
+                            return Err(Error::InvalidPath);
+                        }
+                    }
+                } else if backing.as_str() == old && new.len() > PATH_CAPACITY {
+                    return Err(Error::InvalidPath);
+                }
+            }
         }
+        Ok(())
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), Error> {
+        self.validate_rename(old, new)?;
+        if old == new {
+            return Ok(());
+        }
+        let index = self
+            .nodes
+            .iter()
+            .position(|n| n.matches(old))
+            .ok_or(Error::NotFound)?;
+        let directory = self.nodes[index].kind == NodeKind::Directory;
         for node in self.nodes.iter_mut().filter(|n| n.occupied) {
             let suffix_start = if node.matches(old)
                 || (directory && descendant_suffix(old, node.path_str()).is_some())
@@ -307,6 +341,24 @@ impl Registry {
                 node.path[..new.len()].copy_from_slice(new.as_bytes());
                 node.path_length = new.len() + suffix_len;
                 node.path[node.path_length..].fill(0);
+            }
+
+            let backing_suffix_start = node.backing.as_ref().and_then(|backing| {
+                let backing_path = backing.as_str();
+                if backing_path == old
+                    || (directory && descendant_suffix(old, backing_path).is_some())
+                {
+                    Some(old.len())
+                } else {
+                    None
+                }
+            });
+            if let (Some(backing), Some(start)) = (node.backing.as_mut(), backing_suffix_start) {
+                let suffix_len = backing.length - start;
+                backing.bytes.copy_within(start..backing.length, new.len());
+                backing.bytes[..new.len()].copy_from_slice(new.as_bytes());
+                backing.length = new.len() + suffix_len;
+                backing.bytes[backing.length..].fill(0);
             }
         }
         Ok(())
@@ -325,6 +377,8 @@ impl Registry {
             if !node.writable {
                 return Err(Error::ReadOnly);
             }
+            node.backing = None;
+            node.data.fill(0);
             node.data[..data.len()].copy_from_slice(data);
             node.length = data.len();
             self.versions[index] = self.versions[index].wrapping_add(1);
@@ -565,11 +619,21 @@ pub fn create_read_only(path: &str, data: &[u8]) -> Result<(), Error> {
 
 /// Import disk metadata without copying the file payload into VFS RAM storage.
 pub fn create_disk_file(path: &str, length: usize) -> Result<(), Error> {
+    create_disk_file_with_writable(path, length, false)
+}
+
+/// Import disk metadata and set whether the VFS copy may be edited before
+/// persistence. The payload stays lazy until first read or partial write.
+pub fn create_disk_file_with_writable(
+    path: &str,
+    length: usize,
+    writable: bool,
+) -> Result<(), Error> {
     if length > NODE_CAPACITY {
         return Err(Error::Full);
     }
     let mut registry = REGISTRY.lock();
-    let index = registry.insert(path, &[], false)?;
+    let index = registry.insert(path, &[], writable)?;
     let mut backing = DiskPath {
         bytes: [0; PATH_CAPACITY],
         length: path.len(),
@@ -583,6 +647,35 @@ pub fn create_disk_file(path: &str, length: usize) -> Result<(), Error> {
 /// Create or overwrite a writable file.
 pub fn write_file(path: &str, data: &[u8]) -> Result<(), Error> {
     REGISTRY.lock().write_file(path, data)
+}
+
+/// Validate removal without mutating the registry.
+pub fn can_remove(path: &str) -> Result<(), Error> {
+    REGISTRY.lock().can_remove(path)
+}
+
+/// Preserve disk-backed bytes for an open file before its directory entry is
+/// removed from the mounted disk. This keeps POSIX-style unlink semantics for
+/// open descriptors even when the backing FAT32 name is about to disappear.
+pub fn prepare_remove(path: &str) -> Result<(), Error> {
+    validate_absolute_path(path)?;
+    let files = OPEN_FILES.lock();
+    let mut registry = REGISTRY.lock();
+    let index = registry
+        .nodes
+        .iter()
+        .position(|node| node.matches(path))
+        .ok_or(Error::NotFound)?;
+    registry.can_remove(path)?;
+    if registry.nodes[index].kind == NodeKind::File
+        && files
+            .entries
+            .iter()
+            .any(|entry| entry.occupied && entry.node == index)
+    {
+        materialize_disk_node(&mut registry.nodes[index])?;
+    }
+    Ok(())
 }
 
 /// Remove a file or empty directory.
@@ -611,6 +704,10 @@ pub fn remove(path: &str) -> Result<(), Error> {
     } else {
         registry.remove(path)
     }
+}
+
+pub fn can_rename(old: &str, new: &str) -> Result<(), Error> {
+    REGISTRY.lock().validate_rename(old, new)
 }
 
 pub fn rename(old: &str, new: &str) -> Result<(), Error> {
@@ -886,6 +983,7 @@ pub fn write(id: OpenFileId, buffer: &[u8]) -> Result<usize, Error> {
     if !node.writable {
         return Err(Error::ReadOnly);
     }
+    materialize_disk_node(node)?;
     if offset > node.length {
         return Err(Error::InvalidDescriptor);
     }
@@ -950,6 +1048,8 @@ pub fn self_test() -> bool {
     let no_parent = scratch.insert("/missing/file", b"x", false) == Err(Error::NotFound);
 
     let path_semantics = path_semantics_self_test(&mut scratch);
+    let disk_write_semantics = disk_write_semantics_self_test();
+    let backing_rename_semantics = backing_rename_semantics_self_test();
 
     // Directory listing on the live registry.
     let root_stat = matches!(
@@ -1061,6 +1161,8 @@ pub fn self_test() -> bool {
         && invalid_path
         && no_parent
         && path_semantics
+        && disk_write_semantics
+        && backing_rename_semantics
         && root_stat
         && etc_stat
         && file_stat
@@ -1073,6 +1175,75 @@ pub fn self_test() -> bool {
         && restored
         && cleaned
         && boot_nodes
+}
+
+fn backing_rename_semantics_self_test() -> bool {
+    static SCRATCH: Mutex<Registry> = Mutex::new(Registry::empty());
+    let mut fs = SCRATCH.lock();
+    for node in &mut fs.nodes {
+        *node = Node::empty();
+    }
+    fs.nodes[0] = Node::directory(b"/");
+    if fs.mkdir("/mnt").is_err()
+        || fs.mkdir("/mnt/docs").is_err()
+        || fs.insert("/mnt/docs/a.txt", &[], true).is_err()
+    {
+        return false;
+    }
+    let Some(index) = fs
+        .nodes
+        .iter()
+        .position(|node| node.matches("/mnt/docs/a.txt"))
+    else {
+        return false;
+    };
+    set_scratch_backing(&mut fs.nodes[index], "/mnt/docs/a.txt", 7);
+    fs.rename("/mnt/docs", "/mnt/archive").is_ok()
+        && fs.nodes[index].matches("/mnt/archive/a.txt")
+        && fs.nodes[index]
+            .backing
+            .is_some_and(|backing| backing.as_str() == "/mnt/archive/a.txt")
+}
+
+fn disk_write_semantics_self_test() -> bool {
+    static SCRATCH: Mutex<Registry> = Mutex::new(Registry::empty());
+    let mut fs = SCRATCH.lock();
+    for node in &mut fs.nodes {
+        *node = Node::empty();
+    }
+    fs.nodes[0] = Node::directory(b"/");
+    if fs.mkdir("/mnt").is_err() {
+        return false;
+    }
+
+    let Ok(ro_index) = fs.insert("/mnt/ro.txt", &[], false) else {
+        return false;
+    };
+    set_scratch_backing(&mut fs.nodes[ro_index], "/mnt/ro.txt", 5);
+    let ro_protected = fs.write_file("/mnt/ro.txt", b"new") == Err(Error::ReadOnly)
+        && fs.nodes[ro_index].backing.is_some()
+        && fs.nodes[ro_index].length == 5;
+
+    let Ok(rw_index) = fs.insert("/mnt/rw.txt", &[], true) else {
+        return false;
+    };
+    set_scratch_backing(&mut fs.nodes[rw_index], "/mnt/rw.txt", 5);
+    let rw_overwritten = fs.write_file("/mnt/rw.txt", b"new").is_ok()
+        && fs.nodes[rw_index].backing.is_none()
+        && fs.nodes[rw_index].length == 3
+        && &fs.nodes[rw_index].data[..3] == b"new";
+
+    ro_protected && rw_overwritten
+}
+
+fn set_scratch_backing(node: &mut Node, path: &str, length: usize) {
+    let mut backing = DiskPath {
+        bytes: [0; PATH_CAPACITY],
+        length: path.len(),
+    };
+    backing.bytes[..path.len()].copy_from_slice(path.as_bytes());
+    node.backing = Some(backing);
+    node.length = length;
 }
 
 /// Exercise path semantics on the statically allocated scratch registry.

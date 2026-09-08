@@ -60,3 +60,10 @@ pub const MAX_OPEN_FILES: usize = 64;
 /// A full queue is treated as an unresolvable user fault; it never grows the
 /// kernel heap while handling an exception.
 pub const MAX_PAGER_REQUESTS: usize = 16;
+
+/// Outstanding asynchronous block-sector requests owned by the storage worker.
+pub const MAX_BLOCK_IO_REQUESTS: usize = 16;
+
+/// Swap slots for evicted private mapped pages.
+/// Slots prefer configured disk backing and fall back to kernel RAM.
+pub const MAX_SWAP_SLOTS: usize = 32;
