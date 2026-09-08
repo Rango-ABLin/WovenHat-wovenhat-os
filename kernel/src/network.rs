@@ -317,12 +317,10 @@ pub fn poll() {
                             .update_servers(&[IpAddress::Ipv4(dns)]);
                     }
                 }
-                Some(None) => {
-                    if runtime.using_dhcp {
-                        apply_static_locked(&mut runtime);
-                    }
+                Some(None) if runtime.using_dhcp => {
+                    apply_static_locked(&mut runtime);
                 }
-                None => {}
+                Some(None) | None => {}
             }
         }
     }

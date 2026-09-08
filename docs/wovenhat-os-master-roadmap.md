@@ -35,7 +35,7 @@ Corrected against source, not the stale docs:
 | Audit | Privileged-syscall audit log | `audit.rs` |
 | GUI | Framebuffer + basic widget/window primitives, **no compositor, no real desktop shell** | `graphics.rs`, `gui.rs` |
 | Networking | **Present** — virtio-net transport + smoltcp (DHCP, DNS, ICMP ping, UDP/TCP sockets) behind a capability-gated syscall ABI; corrected from an earlier "Absent" claim in this doc, see 2026-09-04 note above | `virtio_net.rs`, `network.rs` |
-| SMP | **Absent** — ACPI enumerates CPU count/LAPIC but no AP bring-up | `hal/acpi.rs` |
+| SMP | **Bounded foundation implemented in 0.8.0**: 1-4 CPUs, CPU-owned kernel scheduling, LAPIC/IOAPIC and TLB shootdowns; userspace/I/O remain BSP-owned | `smp.rs`, `task.rs`, `docs/release-0.8.0.md` |
 | Drivers | Hard-coded to QEMU (serial, PS/2, PIT, ATA/PIO) | `ata.rs`, `keyboard.rs`, `timer.rs` |
 | CI | `cargo clippy -D warnings` + QEMU boot + exit-code validation | `.github/workflows/kernel.yml` |
 | Self-tests | 31 boot-time subsystem self-tests gating kernel continuation | `main.rs` |
@@ -47,16 +47,19 @@ Corrected against source, not the stale docs:
 ## 2. Track A — Path to a Fully-Fledged OS
 
 ### Phase A1: Multiprocessor Support (SMP)
-**Why first**: every later phase (networking throughput, GUI compositing, package builds, "distributed" vision) assumes more than one core eventually. Bolting SMP on late means re-auditing every global lock.
 
-- [ ] AP (application processor) trampoline in low real-mode memory, jump to protected → long mode per-core
-- [ ] Per-CPU data structures (GS-base per-CPU block: current task, kernel stack, TSS)
-- [ ] LAPIC driver: timer, IPI send/receive, spurious interrupt handling
-- [ ] IOAPIC-aware interrupt routing (replace the flat 8259 PIC assumption in `pic.rs`/`interrupts.rs`)
-- [ ] Per-CPU run queues + work-stealing or simple load-balancing scheduler policy
-- [ ] Audit every `Mutex`/`spin::Mutex` global in the codebase for cross-core contention hotspots (frame allocator, IPC registry, VFS node table are the obvious ones)
-- [ ] TLB shootdown IPI for page table changes across cores
-- **Definition of done**: kernel boots N cores, self-test suite runs correctly with `>1` core active, a synthetic parallel workload shows near-linear speedup on 2–4 cores.
+0.8.0 implements a bounded foundation; see [release notes](release-0.8.0.md)
+and the [ownership/lock audit](smp-lock-audit.md).
+
+- [x] AP trampoline and 1-4 CPU startup.
+- [x] Per-CPU GDT/TSS/stacks and current-task state (indexed by APIC identity).
+- [x] Calibrated LAPIC timers, IPIs and spurious handling.
+- [x] IOAPIC keyboard routing with ISA overrides; legacy fallback.
+- [x] CPU-owned runnable sets and least-loaded placement for audited kernel jobs.
+- [x] Acknowledged cross-core TLB shootdowns and stale-translation regression.
+- [x] Ownership audit defining which legacy services remain BSP-only.
+- [ ] General multicore userspace, task migration and concurrent I/O service calls.
+- [ ] Measured near-linear speedup, wider hardware coverage, NUMA and hotplug.
 
 ### Phase A2: Real Driver Model & Hardware Portability
 Current drivers are QEMU-specific. A fully-fledged OS needs a driver framework, not one-off hacks.
@@ -88,7 +91,7 @@ Current drivers are QEMU-specific. A fully-fledged OS needs a driver framework, 
 - **Definition of done**: can build and store a real userspace toolchain's output on-disk, survive unclean shutdown without corruption, and enforce per-user file permissions.
 
 ### Phase A4: Networking
-Nonexistent today — the single biggest gap for "fully fledged."
+Virtio-net and the IPv4/socket stack already exist. Broader drivers, interrupt-driven networking and packet-filter policy remain.
 
 - [ ] NIC driver (virtio-net for VM/CI parity, e1000 or similar for broader hardware)
 - [ ] Either integrate `smoltcp` (no_std-friendly Rust TCP/IP stack) or write a minimal one: ARP, IPv4, ICMP, UDP, TCP

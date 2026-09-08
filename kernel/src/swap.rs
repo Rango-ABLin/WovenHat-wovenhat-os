@@ -7,7 +7,7 @@ use spin::Mutex;
 
 pub const PAGE_SIZE: usize = 4096;
 const SECTORS_PER_PAGE: usize = PAGE_SIZE / SECTOR_SIZE;
-const _: () = assert!(PAGE_SIZE % SECTOR_SIZE == 0);
+const _: () = assert!(PAGE_SIZE.is_multiple_of(SECTOR_SIZE));
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Handle {

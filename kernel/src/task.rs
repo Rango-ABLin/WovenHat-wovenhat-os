@@ -21,7 +21,8 @@ static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> =
 static IDLE_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(2);
 static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
-static PREEMPTION_REQUESTED: AtomicBool = AtomicBool::new(false);
+static PREEMPTION_REQUESTED: [AtomicBool; crate::smp::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::smp::MAX_CPUS];
 static PREEMPTION_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static TASK_STACKS: [TaskStack; MAX_TASKS] = [const { TaskStack::new() }; MAX_TASKS];
 static PAGER: Mutex<PagerQueue> = Mutex::new(PagerQueue::empty());
@@ -177,8 +178,8 @@ struct Context {
 #[repr(align(16))]
 struct TaskStack(UnsafeCell<[u8; TASK_STACK_SIZE]>);
 
-// SAFETY: Each stack is assigned to at most one task and the bootstrap kernel
-// is currently single-core. Scheduler metadata never aliases this storage.
+// SAFETY: Each stack belongs to one task pinned to one CPU. Only that CPU
+// saves/restores its context or reaps it after switching away.
 unsafe impl Sync for TaskStack {}
 
 impl TaskStack {
@@ -199,6 +200,7 @@ struct TaskControlBlock {
     user_context: Option<UserTaskContext>,
     address_space: Option<paging::AddressSpace>,
     remaining_ticks: u8,
+    cpu: usize,
 }
 
 impl TaskControlBlock {
@@ -215,6 +217,7 @@ impl TaskControlBlock {
             user_context: None,
             address_space: None,
             remaining_ticks: 0,
+            cpu: 0,
         }
     }
 
@@ -326,7 +329,7 @@ impl TaskControlBlock {
 fn task_bootstrap() -> ! {
     let (entry, user_context) = {
         let scheduler = SCHEDULER.lock();
-        let task = &scheduler.tasks[scheduler.current_slot];
+        let task = &scheduler.tasks[scheduler.current_slot[crate::smp::cpu_index()]];
         (task.entry, task.user_context)
     };
 
@@ -561,20 +564,20 @@ impl PagerQueue {
 }
 struct Scheduler {
     tasks: [TaskControlBlock; MAX_TASKS],
-    current_slot: usize,
+    current_slot: [usize; crate::smp::MAX_CPUS],
     task_count: usize,
     context_switches: u64,
-    last_selected: [usize; 3],
+    last_selected: [[usize; 3]; crate::smp::MAX_CPUS],
 }
 
 impl Scheduler {
     const fn empty() -> Self {
         Self {
             tasks: [const { TaskControlBlock::empty() }; MAX_TASKS],
-            current_slot: 0,
+            current_slot: [0; crate::smp::MAX_CPUS],
             task_count: 0,
             context_switches: 0,
-            last_selected: [0; 3],
+            last_selected: [[0; 3]; crate::smp::MAX_CPUS],
         }
     }
 
@@ -598,26 +601,28 @@ impl Scheduler {
         let best_priority = self
             .tasks
             .iter()
-            .filter(|task| task.state == TaskState::Ready)
+            .filter(|task| task.state == TaskState::Ready && task.cpu == crate::smp::cpu_index())
             .map(|task| task.priority)
             .max()?;
         let priority_index = best_priority.index();
-        let start = self.last_selected[priority_index];
+        let start = self.last_selected[crate::smp::cpu_index()][priority_index];
         let next_slot = (1..=MAX_TASKS)
             .map(|offset| (start + offset) % MAX_TASKS)
             .find(|slot| {
                 let task = &self.tasks[*slot];
-                task.state == TaskState::Ready && task.priority == best_priority
+                task.state == TaskState::Ready
+                    && task.priority == best_priority
+                    && task.cpu == crate::smp::cpu_index()
             })?;
-        self.last_selected[priority_index] = next_slot;
+        self.last_selected[crate::smp::cpu_index()][priority_index] = next_slot;
 
-        let previous_slot = self.current_slot;
+        let previous_slot = self.current_slot[crate::smp::cpu_index()];
         if self.tasks[previous_slot].state == TaskState::Running {
             self.tasks[previous_slot].state = TaskState::Ready;
         }
         self.tasks[next_slot].state = TaskState::Running;
         self.tasks[next_slot].remaining_ticks = self.tasks[next_slot].priority.quantum();
-        self.current_slot = next_slot;
+        self.current_slot[crate::smp::cpu_index()] = next_slot;
         self.context_switches += 1;
 
         let previous_rsp = &mut self.tasks[previous_slot].context.stack_pointer as *mut u64;
@@ -634,7 +639,10 @@ impl Scheduler {
     }
     fn reap_dead(&mut self) {
         for (slot, task) in self.tasks.iter_mut().enumerate() {
-            if slot != self.current_slot && task.state == TaskState::Dead {
+            if slot != self.current_slot[crate::smp::cpu_index()]
+                && task.state == TaskState::Dead
+                && task.cpu == crate::smp::cpu_index()
+            {
                 *task = TaskControlBlock::empty();
             }
         }
@@ -650,13 +658,13 @@ impl Scheduler {
     }
 
     fn summary(&self) -> Summary {
-        let task = &self.tasks[self.current_slot];
+        let task = &self.tasks[self.current_slot[crate::smp::cpu_index()]];
         assert!(task.state == TaskState::Running);
 
         let ready_tasks = self
             .tasks
             .iter()
-            .filter(|task| task.state == TaskState::Ready)
+            .filter(|task| task.state == TaskState::Ready && task.cpu == crate::smp::cpu_index())
             .count();
         let blocked_tasks = self
             .tasks
@@ -944,7 +952,7 @@ pub fn try_handle_file_fault(address: u64, write: bool) -> bool {
 fn block_current_from_exception() {
     let switch = {
         let mut scheduler = SCHEDULER.lock();
-        let slot = scheduler.current_slot;
+        let slot = scheduler.current_slot[crate::smp::cpu_index()];
         assert!(
             scheduler.tasks[slot].id != KERNEL_TASK_ID,
             "kernel task cannot fault-block"
@@ -1134,7 +1142,8 @@ pub fn fork_current(frame: crate::syscall::UserForkFrame) -> Result<ProcessId, P
     let task_id = current_task_id();
     let (parent, capabilities) = {
         let scheduler = SCHEDULER.lock();
-        let capabilities = scheduler.tasks[scheduler.current_slot].capabilities;
+        let capabilities =
+            scheduler.tasks[scheduler.current_slot[crate::smp::cpu_index()]].capabilities;
         let processes = PROCESS_TABLE.lock();
         let parent = processes
             .iter()
@@ -1228,7 +1237,7 @@ pub fn exec_current(program: userspace::UserProgram) -> ! {
     let task_id = current_task_id();
     let (old_address_space, old_mappings) = {
         let mut scheduler = SCHEDULER.lock();
-        let slot = scheduler.current_slot;
+        let slot = scheduler.current_slot[crate::smp::cpu_index()];
         assert!(scheduler.tasks[slot].id == task_id);
 
         let mut processes = PROCESS_TABLE.lock();
@@ -1272,7 +1281,7 @@ pub fn exit_current_process(exit_code: i32) -> ! {
     x86_64::instructions::interrupts::disable();
     let context_switch_result = {
         let mut scheduler = SCHEDULER.lock();
-        let slot = scheduler.current_slot;
+        let slot = scheduler.current_slot[crate::smp::cpu_index()];
         let task_id = scheduler.tasks[slot].id;
         assert!(
             task_id != KERNEL_TASK_ID,
@@ -2156,11 +2165,11 @@ pub fn yield_now() {
 
 pub fn tick() {
     let Some(mut scheduler) = SCHEDULER.try_lock() else {
-        PREEMPTION_REQUESTED.store(true, Ordering::Release);
+        PREEMPTION_REQUESTED[crate::smp::cpu_index()].store(true, Ordering::Release);
         return;
     };
     scheduler.wake_sleeping(timer::ticks());
-    let slot = scheduler.current_slot;
+    let slot = scheduler.current_slot[crate::smp::cpu_index()];
     let task = &mut scheduler.tasks[slot];
     if task.state != TaskState::Running {
         return;
@@ -2169,20 +2178,20 @@ pub fn tick() {
         task.remaining_ticks -= 1;
     } else {
         task.remaining_ticks = 0;
-        PREEMPTION_REQUESTED.store(true, Ordering::Release);
+        PREEMPTION_REQUESTED[crate::smp::cpu_index()].store(true, Ordering::Release);
     }
 }
 pub fn preempt_from_interrupt() {
-    if FILE_IO_DEPTH.load(Ordering::Acquire) != 0 {
+    if crate::smp::cpu_index() == 0 && FILE_IO_DEPTH.load(Ordering::Acquire) != 0 {
         return;
     }
-    if !PREEMPTION_REQUESTED.swap(false, Ordering::AcqRel) {
+    if !PREEMPTION_REQUESTED[crate::smp::cpu_index()].swap(false, Ordering::AcqRel) {
         return;
     }
 
     let switch = {
         let Some(mut scheduler) = SCHEDULER.try_lock() else {
-            PREEMPTION_REQUESTED.store(true, Ordering::Release);
+            PREEMPTION_REQUESTED[crate::smp::cpu_index()].store(true, Ordering::Release);
             return;
         };
         scheduler.wake_sleeping(timer::ticks());
@@ -2198,9 +2207,9 @@ pub fn preempt_from_interrupt() {
 }
 
 pub fn preemption_point() {
-    if PREEMPTION_REQUESTED.load(Ordering::Acquire) {
+    if PREEMPTION_REQUESTED[crate::smp::cpu_index()].load(Ordering::Acquire) {
         yield_now();
-        PREEMPTION_REQUESTED.store(false, Ordering::Release);
+        PREEMPTION_REQUESTED[crate::smp::cpu_index()].store(false, Ordering::Release);
     }
 }
 
@@ -2210,7 +2219,7 @@ pub fn block_current() {
 
     let switch = {
         let mut scheduler = SCHEDULER.lock();
-        let slot = scheduler.current_slot;
+        let slot = scheduler.current_slot[crate::smp::cpu_index()];
         assert!(
             scheduler.tasks[slot].id != KERNEL_TASK_ID,
             "kernel task cannot block"
@@ -2249,7 +2258,7 @@ pub fn sleep_current(ticks: u64) {
 
     let switch = {
         let mut scheduler = SCHEDULER.lock();
-        let slot = scheduler.current_slot;
+        let slot = scheduler.current_slot[crate::smp::cpu_index()];
         assert!(
             scheduler.tasks[slot].id != KERNEL_TASK_ID,
             "kernel task cannot sleep"
@@ -2274,7 +2283,7 @@ pub fn exit_current_task() -> ! {
     x86_64::instructions::interrupts::disable();
     let switch = {
         let mut scheduler = SCHEDULER.lock();
-        let slot = scheduler.current_slot;
+        let slot = scheduler.current_slot[crate::smp::cpu_index()];
         assert!(
             scheduler.tasks[slot].id != KERNEL_TASK_ID,
             "kernel task cannot exit"
@@ -2304,7 +2313,7 @@ pub fn summary() -> Summary {
 pub fn current_task_id() -> TaskId {
     let scheduler = SCHEDULER.lock();
     assert!(scheduler.task_count != 0, "scheduler not initialized");
-    scheduler.tasks[scheduler.current_slot].id
+    scheduler.tasks[scheduler.current_slot[crate::smp::cpu_index()]].id
 }
 
 pub fn current_task_id_if_running() -> Option<TaskId> {
@@ -2312,13 +2321,13 @@ pub fn current_task_id_if_running() -> Option<TaskId> {
     if scheduler.task_count == 0 {
         return None;
     }
-    Some(scheduler.tasks[scheduler.current_slot].id)
+    Some(scheduler.tasks[scheduler.current_slot[crate::smp::cpu_index()]].id)
 }
 
 pub fn current_has(capability: Capability) -> bool {
     let scheduler = SCHEDULER.lock();
     assert!(scheduler.task_count != 0, "scheduler not initialized");
-    scheduler.tasks[scheduler.current_slot]
+    scheduler.tasks[scheduler.current_slot[crate::smp::cpu_index()]]
         .capabilities
         .contains(capability)
 }
@@ -2329,7 +2338,8 @@ pub fn grant(target: TaskId, capability: Capability) -> Result<(), CapabilityErr
         let mut scheduler = SCHEDULER.lock();
         assert!(scheduler.task_count != 0, "scheduler not initialized");
 
-        let authority = scheduler.tasks[scheduler.current_slot].capabilities;
+        let authority =
+            scheduler.tasks[scheduler.current_slot[crate::smp::cpu_index()]].capabilities;
         if !authority.contains(Capability::TaskControl) || !authority.contains(capability) {
             Err(CapabilityError::PermissionDenied)
         } else if let Some(target_task) = scheduler
@@ -2358,7 +2368,7 @@ pub fn revoke(target: TaskId, capability: Capability) -> Result<(), CapabilityEr
         let mut scheduler = SCHEDULER.lock();
         assert!(scheduler.task_count != 0, "scheduler not initialized");
 
-        if !scheduler.tasks[scheduler.current_slot]
+        if !scheduler.tasks[scheduler.current_slot[crate::smp::cpu_index()]]
             .capabilities
             .contains(Capability::TaskControl)
         {
@@ -2729,4 +2739,70 @@ fn map_mutation_file_error(error: crate::storage::MutationError) -> FileError {
         | crate::storage::MutationError::BadName
         | crate::storage::MutationError::Failed => FileError::NotFound,
     }
+}
+
+/// The AP bootstrap becomes its permanent, CPU-owned idle context.
+pub fn init_ap(cpu: usize) {
+    let mut scheduler = SCHEDULER.lock();
+    let slot = scheduler
+        .tasks
+        .iter()
+        .position(|task| task.state == TaskState::Empty)
+        .expect("AP idle slot");
+    let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    scheduler.tasks[slot].initialize(slot, id, "cpu-idle", idle_task, TaskPriority::LOW);
+    scheduler.tasks[slot].cpu = cpu;
+    scheduler.tasks[slot].state = TaskState::Running;
+    scheduler.current_slot[cpu] = slot;
+    scheduler.task_count += 1;
+}
+/// Explicit affinity for kernel jobs whose shared state is multicore-safe.
+///
+/// # Safety
+/// AP entries may use atomics and task yield/sleep/exit primitives. They must
+/// not call legacy allocator, paging, userspace, file, network or GUI services:
+/// those domains still depend on BSP interrupt/preemption ownership.
+pub unsafe fn spawn_on(
+    cpu: usize,
+    name: &'static str,
+    entry: fn() -> !,
+) -> Result<TaskId, SpawnError> {
+    assert!(cpu < crate::smp::online_count());
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut scheduler = SCHEDULER.lock();
+        let slot = scheduler
+            .tasks
+            .iter()
+            .position(|task| task.state == TaskState::Empty)
+            .ok_or(SpawnError::Full)?;
+        let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+        scheduler.tasks[slot].initialize(slot, id, name, entry, TaskPriority::NORMAL);
+        scheduler.tasks[slot].cpu = cpu;
+        scheduler.task_count += 1;
+        Ok(id)
+    })
+}
+
+/// Place an explicitly parallel kernel job on the least-loaded online CPU.
+/// Tasks remain pinned: migration requires a separate ownership protocol.
+///
+/// # Safety
+/// The entry must obey the same restricted service contract as `spawn_on`.
+pub unsafe fn spawn_parallel(name: &'static str, entry: fn() -> !) -> Result<TaskId, SpawnError> {
+    let cpu = {
+        let scheduler = SCHEDULER.lock();
+        (0..crate::smp::online_count())
+            .min_by_key(|cpu| {
+                scheduler
+                    .tasks
+                    .iter()
+                    .filter(|task| {
+                        task.cpu == *cpu
+                            && !matches!(task.state, TaskState::Empty | TaskState::Dead)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    unsafe { spawn_on(cpu, name, entry) }
 }

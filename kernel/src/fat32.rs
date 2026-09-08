@@ -612,7 +612,7 @@ pub fn space_info(device: &mut impl BlockDevice, volume: Volume) -> Result<Space
             Some(info.next_free)
         }
     });
-    let fs_info_matches = fs_info_free_count.map_or(true, |hint| hint == free_clusters);
+    let fs_info_matches = fs_info_free_count.is_none_or(|hint| hint == free_clusters);
 
     Ok(SpaceInfo {
         total_clusters,
@@ -1276,7 +1276,7 @@ pub fn create_file_in_directory(
     let needed_clusters = if data.is_empty() {
         0
     } else {
-        (data.len() + bytes_per_cluster - 1) / bytes_per_cluster
+        data.len().div_ceil(bytes_per_cluster)
     };
     let first_cluster = match allocate_file_chain(device, volume, needed_clusters) {
         Ok(first_cluster) => first_cluster,

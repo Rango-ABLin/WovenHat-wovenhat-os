@@ -243,6 +243,7 @@ pub fn mapping_self_test() -> bool {
         return false;
     };
     flush.flush();
+    crate::smp::shootdown();
 
     let pointer = page.start_address().as_mut_ptr::<u64>();
     // SAFETY: The page is present and writable for this test, and the pointer
@@ -256,6 +257,7 @@ pub fn mapping_self_test() -> bool {
         return false;
     };
     flush.flush();
+    crate::smp::shootdown();
 
     let passed = value == TEST_VALUE && mapper.translate_addr(page.start_address()).is_none();
     paging.mapping_test_passed = passed;
@@ -325,6 +327,7 @@ fn map_range_with_flags(
         let flush = unsafe { mapper.map_to(page, frame, flags, &mut *allocator) }
             .map_err(|_| MapRangeError::MappingFailed)?;
         flush.flush();
+        crate::smp::shootdown();
     }
 
     Ok(())
@@ -377,8 +380,10 @@ pub fn map_user_range_in(
                 Ok(flush) => {
                     if Cr3::read().0 == address_space.level_4_frame {
                         flush.flush();
+                        crate::smp::shootdown();
                     } else {
                         flush.ignore();
+                        crate::smp::shootdown();
                     }
                     mapped_pages += 1;
                     None
@@ -397,8 +402,10 @@ pub fn map_user_range_in(
                 if let Ok((frame, flush)) = mapper.unmap(rollback_page) {
                     if Cr3::read().0 == address_space.level_4_frame {
                         flush.flush();
+                        crate::smp::shootdown();
                     } else {
                         flush.ignore();
+                        crate::smp::shootdown();
                     }
                     let _ = allocator.deallocate_frame(frame);
                 }
@@ -498,9 +505,8 @@ pub fn share_user_range_in(
     let mut destination_mapper = mapper_for(&paging, destination)?;
     let mut allocator = memory::allocator();
     let mut cow = COW_TABLE.lock();
-    let mut mapped_pages = 0usize;
 
-    for page in Page::range_inclusive(start_page, end_page) {
+    for (mapped_pages, page) in Page::range_inclusive(start_page, end_page).enumerate() {
         let TranslateResult::Mapped {
             frame,
             offset,
@@ -509,7 +515,7 @@ pub fn share_user_range_in(
         else {
             rollback_shared(
                 &mut destination_mapper,
-                &mut *allocator,
+                &mut allocator,
                 &mut cow,
                 start_page,
                 mapped_pages,
@@ -519,7 +525,7 @@ pub fn share_user_range_in(
         if offset != 0 || !source_flags.contains(PageTableFlags::USER_ACCESSIBLE) {
             rollback_shared(
                 &mut destination_mapper,
-                &mut *allocator,
+                &mut allocator,
                 &mut cow,
                 start_page,
                 mapped_pages,
@@ -535,7 +541,7 @@ pub fn share_user_range_in(
         {
             rollback_shared(
                 &mut destination_mapper,
-                &mut *allocator,
+                &mut allocator,
                 &mut cow,
                 start_page,
                 mapped_pages,
@@ -548,7 +554,7 @@ pub fn share_user_range_in(
         if cow.share(frame.start_address().as_u64()).is_err() {
             rollback_shared(
                 &mut destination_mapper,
-                &mut *allocator,
+                &mut allocator,
                 &mut cow,
                 start_page,
                 mapped_pages,
@@ -559,12 +565,13 @@ pub fn share_user_range_in(
         match unsafe { destination_mapper.map_to(page, frame, flags, &mut *allocator) } {
             Ok(flush) => {
                 flush.ignore();
+                crate::smp::shootdown();
             }
             Err(_) => {
                 let _ = cow.release(frame.start_address().as_u64());
                 rollback_shared(
                     &mut destination_mapper,
-                    &mut *allocator,
+                    &mut allocator,
                     &mut cow,
                     start_page,
                     mapped_pages,
@@ -578,10 +585,11 @@ pub fn share_user_range_in(
             let ro_flags = user_flags(false, executable);
             if let Ok(flush) = unsafe { source_mapper.update_flags(page, ro_flags) } {
                 flush.flush();
+                crate::smp::shootdown();
             } else {
                 rollback_shared(
                     &mut destination_mapper,
-                    &mut *allocator,
+                    &mut allocator,
                     &mut cow,
                     start_page,
                     mapped_pages + 1,
@@ -589,8 +597,6 @@ pub fn share_user_range_in(
                 return Err(MapRangeError::MappingFailed);
             }
         }
-
-        mapped_pages += 1;
     }
     Ok(())
 }
@@ -606,6 +612,7 @@ fn rollback_shared(
     for _ in 0..mapped_pages {
         if let Ok((frame, flush)) = destination_mapper.unmap(page) {
             flush.ignore();
+            crate::smp::shootdown();
             let phys = frame.start_address().as_u64();
             if cow.release(phys) {
                 let _ = allocator.deallocate_frame(frame);
@@ -658,7 +665,10 @@ pub fn try_break_cow(address_space: AddressSpace, fault_address: u64) -> bool {
     if refs <= 1 {
         // Sole owner: just restore write permission. Keep the frame.
         match unsafe { mapper.update_flags(page, new_flags) } {
-            Ok(flush) => flush.flush(),
+            Ok(flush) => {
+                flush.flush();
+                crate::smp::shootdown();
+            }
             Err(_) => return false,
         }
         if let Some(slot) = cow.find_slot(old_phys) {
@@ -697,11 +707,13 @@ pub fn try_break_cow(address_space: AddressSpace, fault_address: u64) -> bool {
         return false;
     };
     flush.ignore();
+    crate::smp::shootdown();
 
     let mut allocator = memory::allocator();
     match unsafe { mapper.map_to(page, new_frame, new_flags, &mut *allocator) } {
         Ok(flush) => {
             flush.flush();
+            crate::smp::shootdown();
         }
         Err(_) => {
             // Best-effort restore of the old mapping.
@@ -732,7 +744,8 @@ pub fn protect_user_range_in(
     for page in Page::range_inclusive(start_page, end_page) {
         unsafe { mapper.update_flags(page, flags) }
             .map_err(|_| MapRangeError::NotMapped)?
-            .ignore();
+            .flush();
+        crate::smp::shootdown();
     }
     Ok(())
 }
@@ -849,8 +862,10 @@ pub fn unmap_user_range_in(
         let (frame, flush) = mapper.unmap(page).map_err(|_| MapRangeError::NotMapped)?;
         if active {
             flush.flush();
+            crate::smp::shootdown();
         } else {
             flush.ignore();
+            crate::smp::shootdown();
         }
         if !release_frame(frame) {
             return Err(MapRangeError::MappingFailed);
@@ -874,6 +889,7 @@ pub fn destroy_user_address_space(
         for page in Page::range_inclusive(start_page, end_page) {
             let (frame, flush) = mapper.unmap(page).map_err(|_| MapRangeError::NotMapped)?;
             flush.ignore();
+            crate::smp::shootdown();
             if !release_frame(frame) {
                 return Err(MapRangeError::MappingFailed);
             }
@@ -907,6 +923,7 @@ pub fn destroy_user_address_space(
         .map_err(|_| MapRangeError::MappingFailed)?;
 
     root[first_page.p4_index()].set_unused();
+    crate::smp::shootdown();
     for frame in [p1_frame, p2_frame, p3_frame, address_space.level_4_frame] {
         if !memory::deallocate_frame(frame) {
             return Err(MapRangeError::MappingFailed);
@@ -1168,8 +1185,10 @@ pub fn map_private_frame_from_bytes(
         Ok(flush) => {
             if Cr3::read().0 == space.level_4_frame {
                 flush.flush();
+                crate::smp::shootdown();
             } else {
                 flush.ignore();
+                crate::smp::shootdown();
             }
             true
         }
@@ -1233,8 +1252,10 @@ pub fn map_file_frame(space: AddressSpace, address: u64, physical: u64, writable
         Ok(flush) => {
             if Cr3::read().0 == space.level_4_frame {
                 flush.flush();
+                crate::smp::shootdown();
             } else {
                 flush.ignore();
+                crate::smp::shootdown();
             }
             true
         }
@@ -1305,4 +1326,77 @@ pub fn frame_ownership_self_test() -> bool {
         && intact
         && cleaned
         && memory::stats().allocated_frames == baseline
+}
+
+/// Map a device register page through the direct-map offset, uncached and NX.
+pub fn map_mmio(physical: u64) -> Result<u64, MapRangeError> {
+    let mut state = PAGING.lock();
+    let virtual_address = 0xffff_fe00_0000_0000u64
+        .checked_add(physical)
+        .ok_or(MapRangeError::InvalidRange)?;
+    let mapper = state.mapper.as_mut().ok_or(MapRangeError::NotInitialized)?;
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virtual_address));
+    let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(physical));
+    if mapper.translate_addr(page.start_address()).is_none() {
+        let mut allocator = memory::allocator();
+        unsafe {
+            mapper.map_to(
+                page,
+                frame,
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::NO_CACHE
+                    | PageTableFlags::NO_EXECUTE,
+                &mut *allocator,
+            )
+        }
+        .map_err(|_| MapRangeError::MappingFailed)?
+        .flush();
+    }
+    Ok(virtual_address)
+}
+
+/// Replace a shared kernel test mapping, retiring its old frame only after all
+/// online CPUs have invalidated cached translations. Used by the SMP regression.
+pub fn replace_smp_test_page(address: u64, value: u64) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut state = PAGING.lock();
+        let offset = state.physical_memory_offset;
+        let mapper = state.mapper.as_mut().expect("paging initialized");
+        let mut allocator = memory::allocator();
+        let replacement = allocator.allocate_frame().expect("SMP replacement frame");
+        unsafe {
+            ((offset + replacement.start_address().as_u64()) as *mut u64).write_volatile(value);
+        }
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(address));
+        let (old, flush) = mapper.unmap(page).expect("SMP test page mapped");
+        flush.ignore();
+        unsafe {
+            mapper.map_to(
+                page,
+                replacement,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+                &mut *allocator,
+            )
+        }
+        .expect("SMP remap")
+        .flush();
+        crate::smp::shootdown();
+        assert!(allocator.deallocate_frame(old));
+    });
+}
+pub fn remove_smp_test_page(address: u64) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut state = PAGING.lock();
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(address));
+        let (frame, flush) = state
+            .mapper
+            .as_mut()
+            .unwrap()
+            .unmap(page)
+            .expect("SMP cleanup");
+        flush.flush();
+        crate::smp::shootdown();
+        assert!(memory::deallocate_frame(frame));
+    });
 }

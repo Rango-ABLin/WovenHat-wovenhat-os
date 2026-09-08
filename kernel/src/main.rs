@@ -42,6 +42,7 @@ mod serial;
 mod shell;
 mod storage;
 mod swap;
+mod smp;
 mod syscall;
 mod task;
 mod terminal;
@@ -79,6 +80,7 @@ static FAIR_TASKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
 #[allow(unreachable_code)]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    smp::prepare(&boot_info.memory_regions);
     let memory_init = memory::init(&boot_info.memory_regions);
     let physical_memory_offset = match &boot_info.physical_memory_offset {
         Optional::Some(offset) => Some(*offset),
@@ -116,7 +118,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.println("SECURE INTELLIGENCE PLATFORM");
     console.println("");
 
-    console.println("WOVENHAT KERNEL 0.7.0 STAGE 9");
+    console.println("WOVENHAT KERNEL 0.8.0 MULTICORE FOUNDATION");
     console.println("ARCHITECTURE: X86_64");
     console.println("KERNEL BOOT SUCCESSFUL.");
     console.println("");
@@ -272,8 +274,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         }
 
-        pic::unmask(timer::IRQ);
-        pic::unmask(keyboard::IRQ);
+        smp::start(acpi.ok(), physical_memory_offset.unwrap());
+        if !smp::routed_irq() {
+            pic::unmask(timer::IRQ);
+            pic::unmask(keyboard::IRQ);
+        }
         x86_64::instructions::interrupts::enable();
         if !block_io::start_worker() {
             console.println("BLOCK I/O WORKER: START FAILED");
@@ -771,8 +776,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("DEVICE REGISTRY: VALIDATION FAILED");
         halt();
     }
-    pic::unmask(timer::IRQ);
-    pic::unmask(keyboard::IRQ);
+    smp::start(acpi.ok(), physical_memory_offset.unwrap());
+    if !smp::routed_irq() {
+        pic::unmask(timer::IRQ);
+        pic::unmask(keyboard::IRQ);
+    }
     x86_64::instructions::interrupts::enable();
     if !block_io::start_worker() {
         console.println("BLOCK I/O WORKER: START FAILED");
@@ -1110,6 +1118,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.println("BREAKPOINT HANDLER: FAILED");
     }
 
+    smp::self_test();
     serial::write_line(format_args!("[BOOT] ALL VALIDATIONS PASSED"));
     #[cfg(feature = "qemu-test")]
     qemu_test_exit_success();

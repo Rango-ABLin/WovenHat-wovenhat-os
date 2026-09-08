@@ -3404,9 +3404,9 @@ pub fn setup_argv_stack(
     }
 
     paging::write_user_bytes(address_space, rsp, &argc.to_le_bytes()).ok()?;
-    for i in 0..args.len() {
+    for (i, pointer) in argv_ptrs.iter().enumerate().take(args.len()) {
         let addr = rsp + 8 + (i as u64) * 8;
-        paging::write_user_bytes(address_space, addr, &argv_ptrs[i].to_le_bytes()).ok()?;
+        paging::write_user_bytes(address_space, addr, &pointer.to_le_bytes()).ok()?;
     }
     let argv_null = rsp + 8 + (args.len() as u64) * 8;
     paging::write_user_bytes(address_space, argv_null, &0u64.to_le_bytes()).ok()?;
@@ -3663,8 +3663,7 @@ pub fn create_shell_process() -> Option<UserProgram> {
     load_elf_with_argv(&elf, &["/bin/sh"])
 }
 
-/// Install `/bin/sh` into the VFS.
-
+/// Install `/bin/true` into the VFS.
 pub fn install_true_executable() -> bool {
     let stub = unsafe {
         let start = &wovenhat_true_program_start as *const u8;

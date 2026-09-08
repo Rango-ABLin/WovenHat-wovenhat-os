@@ -22,6 +22,9 @@ pub fn init() {
         let mut idt = InterruptDescriptorTable::new();
 
         idt.breakpoint.set_handler_fn(breakpoint_handler);
+        idt.non_maskable_interrupt.set_handler_fn(tlb_nmi_handler);
+        idt[crate::smp::TIMER_VECTOR].set_handler_fn(lapic_timer_handler);
+        idt[crate::smp::SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         // SAFETY: The selected IST entry is initialized with a dedicated,
@@ -233,11 +236,28 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     keyboard::handle_interrupt();
-    pic::notify_end_of_interrupt(keyboard::IRQ);
+    if crate::smp::routed_irq() {
+        crate::smp::eoi();
+    } else {
+        pic::notify_end_of_interrupt(keyboard::IRQ);
+    }
 }
 
 fn halt() -> ! {
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+extern "x86-interrupt" fn tlb_nmi_handler(_frame: InterruptStackFrame) {
+    crate::smp::acknowledge_tlb();
+}
+extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
+extern "x86-interrupt" fn lapic_timer_handler(_frame: InterruptStackFrame) {
+    if crate::smp::cpu_index() == 0 {
+        timer::record_tick();
+    }
+    task::tick();
+    crate::smp::eoi();
+    task::preempt_from_interrupt();
 }

@@ -119,7 +119,7 @@ impl Shell {
                     console.clear();
                 }
             }
-            "version" | "ver" => console.println("WovenHat kernel 0.7.0 Stage 9"),
+            "version" | "ver" => console.println("WovenHat kernel 0.8.0 Multicore Foundation"),
             "ticks" | "uptime" => {
                 if authorize(Capability::TimerRead, console) {
                     console.print("ticks: ");
@@ -130,6 +130,15 @@ impl Shell {
             "tasks" | "ps" => {
                 if authorize(Capability::TaskInspect, console) {
                     cmd_tasks(console);
+                }
+            }
+            "smp" => {
+                if authorize(Capability::TaskInspect, console) { crate::smp::diagnostic(console); }
+            }
+            "smptest" => {
+                if authorize(Capability::TaskControl, console) {
+                    crate::smp::self_test();
+                    console.println("SMP regressions: PASSED");
                 }
             }
             "caps" => cmd_caps(console),
@@ -391,8 +400,8 @@ impl Shell {
 }
 
 fn print_help(console: &mut Console<'_>) {
-    console.println("WovenHat kernel shell 0.7.0 Stage 9");
-    console.println("system:  help clear version ticks|uptime tasks|ps caps devices net netstat");
+    console.println("WovenHat kernel shell 0.8.0 Multicore Foundation");
+    console.println("system:  help clear version ticks|uptime tasks|ps smp smptest caps devices net netstat");
     console.println(
         "         memory|mem heap paging bench fs blockio|iostat mount|umount df fscheck sync syscall",
     );
@@ -402,7 +411,7 @@ fn print_help(console: &mut Console<'_>) {
     console.println("test:    mmaptest (private/shared mappings, fork, msync), msynctest (disk)");
     console.println("nav:     cd [path]  pwd  echo <text>");
     console.println("process: run <elf>  sh  init  spawn  user|ring3  kill <pid> [sig]");
-    console.println("runtime: userland udpecho [port] dhcp <on|off>   (Stage 9 runtime)");
+    console.println("runtime: userland udpecho [port] dhcp <on|off>   (Multicore Foundation runtime)");
 }
 
 fn cmd_tasks(console: &mut Console<'_>) {
@@ -682,7 +691,8 @@ fn ensure_program(path: &str, installer: fn() -> bool) -> bool {
 }
 
 fn install_userland() -> u64 {
-    let programs: [(&str, fn() -> bool); 23] = [
+    type Installer = (&'static str, fn() -> bool);
+    let programs: [Installer; 23] = [
         ("/bin/selftest", userspace::install_stub_executable),
         ("/bin/init", userspace::install_init_executable),
         ("/bin/sh", userspace::install_shell_executable),
@@ -1472,7 +1482,7 @@ fn cmd_sh(console: &mut Console<'_>) {
     let installed = install_userland();
     if installed != 24 {
         console.print("sh: userland incomplete (");
-        print_u64(console, installed as u64);
+        print_u64(console, installed);
         console.println("/24)");
         return;
     }
@@ -1718,7 +1728,7 @@ fn lowercase<'a>(verb: &'a str, buf: &'a mut [u8; 32]) -> &'a str {
         return verb;
     }
     for (i, b) in verb.bytes().enumerate() {
-        buf[i] = if (b'A'..=b'Z').contains(&b) {
+        buf[i] = if b.is_ascii_uppercase() {
             b + 32
         } else {
             b

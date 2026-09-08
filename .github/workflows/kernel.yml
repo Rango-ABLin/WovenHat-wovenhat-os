@@ -3,39 +3,32 @@ name: kernel
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  build-and-boot:
+  release-validation:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
-          targets: x86_64-unknown-none
-          components: clippy
+          toolchain: nightly-2026-07-10
+          targets: x86_64-unknown-none,x86_64-unknown-uefi
+          components: clippy,rust-src,llvm-tools-preview
       - name: Install QEMU and OVMF
         run: sudo apt-get update && sudo apt-get install --yes qemu-system-x86 ovmf
-      - name: Strict lint
-        run: cargo clippy --workspace -- -D warnings
-      - name: Build test image
-        run: cargo build --features qemu-test
-      - name: Boot validation
-        shell: bash
+      - name: Lint, host regressions, and 1/2/4-core boot matrix
         run: |
-          image=$(find target/debug/build -name wovenhat-os-uefi.img -print -quit)
           ovmf=$(find /usr/share/OVMF -name 'OVMF_CODE*.fd' -print -quit)
-          test -n "$image"
           test -n "$ovmf"
-          set +e
-          timeout 90s qemu-system-x86_64 \
-            -machine q35 \
-            -m 256M \
-            -display none \
-            -serial stdio \
-            -no-reboot \
-            -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-            -bios "$ovmf" \
-            -drive format=raw,file="$image"
-          status=$?
-          set -e
-          test "$status" -eq 33
+          python3 scripts/test-release.py --qemu /usr/bin/qemu-system-x86_64 --firmware "$ovmf"
+      - name: Preserve validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-validation
+          path: |
+            target/release-validation/
+            target/memory-regression-*/serial.log
+            target/storage-regression-*/serial.log

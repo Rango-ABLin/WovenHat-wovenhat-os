@@ -25,21 +25,24 @@ struct KernelStack(UnsafeCell<[u8; DOUBLE_FAULT_STACK_SIZE]>);
 // The CPU exclusively writes to it while handling a double fault on this core.
 unsafe impl Sync for KernelStack {}
 
-static DOUBLE_FAULT_STACK: KernelStack = KernelStack(UnsafeCell::new([0; DOUBLE_FAULT_STACK_SIZE]));
+static DOUBLE_FAULT_STACK: [KernelStack; crate::smp::MAX_CPUS] =
+    [const { KernelStack(UnsafeCell::new([0; DOUBLE_FAULT_STACK_SIZE])) }; crate::smp::MAX_CPUS];
 
 #[repr(align(16))]
 struct PrivilegeStack(UnsafeCell<[u8; PRIVILEGE_STACK_SIZE]>);
 
-// SAFETY: The bootstrap kernel is single-core, and this stack is exclusively
-// selected by the CPU for privilege transitions through the TSS.
+// SAFETY: Each CPU has an exclusive privilege stack and TSS slot.
 unsafe impl Sync for PrivilegeStack {}
 
-static PRIVILEGE_STACK: PrivilegeStack = PrivilegeStack(UnsafeCell::new([0; PRIVILEGE_STACK_SIZE]));
+static PRIVILEGE_STACK: [PrivilegeStack; crate::smp::MAX_CPUS] =
+    [const { PrivilegeStack(UnsafeCell::new([0; PRIVILEGE_STACK_SIZE])) }; crate::smp::MAX_CPUS];
 struct RuntimeTss(UnsafeCell<TaskStateSegment>);
-// Only the bootstrap CPU runs tasks. Updates occur with interrupts disabled.
+// Each CPU updates only its own TSS, with local interrupts disabled.
 unsafe impl Sync for RuntimeTss {}
-static TSS: Once<RuntimeTss> = Once::new();
-static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
+static TSS: [Once<RuntimeTss>; crate::smp::MAX_CPUS] =
+    [const { Once::new() }; crate::smp::MAX_CPUS];
+static GDT: [Once<(GlobalDescriptorTable, Selectors)>; crate::smp::MAX_CPUS] =
+    [const { Once::new() }; crate::smp::MAX_CPUS];
 
 struct Selectors {
     code: SegmentSelector,
@@ -50,18 +53,19 @@ struct Selectors {
 }
 
 pub fn init() {
-    let tss = TSS.call_once(|| {
+    let cpu = crate::smp::cpu_index();
+    let tss = TSS[cpu].call_once(|| {
         let mut tss = TaskStateSegment::new();
-        let stack_start = VirtAddr::from_ptr(DOUBLE_FAULT_STACK.0.get());
+        let stack_start = VirtAddr::from_ptr(DOUBLE_FAULT_STACK[cpu].0.get());
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             stack_start + DOUBLE_FAULT_STACK_SIZE as u64;
 
-        let privilege_stack_start = VirtAddr::from_ptr(PRIVILEGE_STACK.0.get());
+        let privilege_stack_start = VirtAddr::from_ptr(PRIVILEGE_STACK[cpu].0.get());
         tss.privilege_stack_table[0] = privilege_stack_start + PRIVILEGE_STACK_SIZE as u64;
         RuntimeTss(UnsafeCell::new(tss))
     });
 
-    let (gdt, selectors) = GDT.call_once(|| {
+    let (gdt, selectors) = GDT[cpu].call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
         let selectors = Selectors {
             code: gdt.append(Descriptor::kernel_code_segment()),
@@ -88,7 +92,7 @@ pub fn init() {
 }
 
 pub fn user_segments() -> (SegmentSelector, SegmentSelector) {
-    let (_, selectors) = GDT
+    let (_, selectors) = GDT[crate::smp::cpu_index()]
         .get()
         .expect("GDT must be initialized before user mode is configured");
     (selectors.user_code, selectors.user_data)
@@ -97,7 +101,7 @@ pub fn user_segments() -> (SegmentSelector, SegmentSelector) {
 /// Select the next task's syscall/interrupt entry stack before returning to it.
 pub fn set_privilege_stack(top: u64) {
     assert!(!x86_64::instructions::interrupts::are_enabled());
-    let tss = TSS
+    let tss = TSS[crate::smp::cpu_index()]
         .get()
         .expect("TSS must be initialized before scheduling");
     // TSS fields are packed; never form an aligned mutable reference. The CPU

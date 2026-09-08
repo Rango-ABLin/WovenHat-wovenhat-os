@@ -133,7 +133,7 @@ impl Registry {
         nodes[3] = Node::directory(b"/mnt");
         nodes[4] = Node::directory(b"/bin");
         nodes[5] = Node::with_data(b"/etc/motd", b"Welcome to WovenHat OS.\n", false);
-        nodes[6] = Node::with_data(b"/etc/version", b"WovenHat kernel 0.7.0 Stage 9\n", false);
+        nodes[6] = Node::with_data(b"/etc/version", b"WovenHat kernel 0.8.0 Multicore Foundation\n", false);
         nodes[7] = Node::with_data(b"/tmp/vfs-self-test", b"", true);
         Self {
             nodes,

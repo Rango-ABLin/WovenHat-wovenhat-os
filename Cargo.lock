@@ -931,7 +931,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wovenhat-kernel"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bootloader_api",
  "smoltcp",
@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "wovenhat-os"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bootloader",
  "ovmf-prebuilt",

@@ -424,8 +424,8 @@ fn setup_queue(io_base: u16, queue: u16, memory: &QueueMemory) -> Result<u16, In
 
 fn post_initial_rx(io_base: u16, qsize: u16) -> Result<(), InitError> {
     let mem = RX_QUEUE_MEMORY.0.get() as *mut u8;
-    for id in 0..ACTIVE_RX_DESCRIPTORS {
-        let packet = RX_PACKETS[id].0.get() as *mut u8;
+    for (id, packet) in RX_PACKETS.iter().enumerate().take(ACTIVE_RX_DESCRIPTORS) {
+        let packet = packet.0.get() as *mut u8;
         let phys = dma_physical(packet as u64, PACKET_BYTES).ok_or(InitError::DmaNotContiguous)?;
         let desc = unsafe { &mut *desc_ptr(mem, id) };
         *desc = VirtqDesc {

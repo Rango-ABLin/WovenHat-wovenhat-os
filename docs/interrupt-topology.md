@@ -22,7 +22,8 @@ The deterministic parser fixture covers an enabled local APIC processor, an I/O 
 an interrupt-source override, a local APIC address override, and rejection of a
 truncated processor entry.
 
-Current limitation: WovenHat still routes hardware IRQs through the legacy 8259 PIC.
-MADT topology is validated and available for the next transition, but local APIC enable,
-I/O APIC redirection entries, override polarity/trigger application, x2APIC mode, and
-multi-processor startup are not implemented yet.
+As of 0.8.0, the bounded topology drives xAPIC CPU startup, per-CPU LAPIC timers
+and keyboard IOAPIC routing (including polarity/trigger overrides). The PIC
+remains a fallback when usable ACPI topology is absent. The current supported
+configuration has at most four CPUs and one IOAPIC; x2APIC, multiple IOAPICs and
+CPU hotplug remain unsupported. See [release notes](release-0.8.0.md).

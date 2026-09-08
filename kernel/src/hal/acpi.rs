@@ -26,6 +26,11 @@ pub struct Summary {
     pub apic: bool,
     pub local_apic_address: u64,
     pub enabled_processors: u16,
+    pub processor_ids: [u32; 16],
+    pub processor_count: usize,
+    pub io_apic_address: u32,
+    pub io_apic_gsi_base: u32,
+    pub isa_gsi: [Option<(u32, u16)>; 16],
     pub io_apics: u16,
     pub interrupt_overrides: u16,
     pub madt_entries: u16,
@@ -190,6 +195,20 @@ fn update_madt_summary(entry: &[u8], summary: &mut Summary) -> Result<(), Error>
             }
             if read_u32(entry, 4) & 3 != 0 {
                 summary.enabled_processors = summary.enabled_processors.saturating_add(1);
+                let id = if entry[0] == 0 {
+                    u32::from(entry[3])
+                } else {
+                    read_u32(entry, 4)
+                };
+                if summary.processor_ids[..summary.processor_count].contains(&id) {
+                    return Err(Error::InvalidLength);
+                }
+                if summary.processor_count < summary.processor_ids.len() {
+                    summary.processor_ids[summary.processor_count] = id;
+                    summary.processor_count += 1;
+                } else {
+                    summary.truncated = true;
+                }
             }
         }
         1 => {
@@ -197,12 +216,20 @@ fn update_madt_summary(entry: &[u8], summary: &mut Summary) -> Result<(), Error>
                 return Err(Error::InvalidLength);
             }
             summary.io_apics = summary.io_apics.saturating_add(1);
+            if summary.io_apics == 1 {
+                summary.io_apic_address = read_u32(entry, 4);
+                summary.io_apic_gsi_base = read_u32(entry, 8);
+            }
         }
         2 => {
             if entry.len() < 10 {
                 return Err(Error::InvalidLength);
             }
             summary.interrupt_overrides = summary.interrupt_overrides.saturating_add(1);
+            if entry[2] == 0 && entry[3] < 16 {
+                summary.isa_gsi[entry[3] as usize] =
+                    Some((read_u32(entry, 4), u16::from_le_bytes([entry[8], entry[9]])));
+            }
         }
         5 => {
             if entry.len() < 12 {
@@ -216,6 +243,20 @@ fn update_madt_summary(entry: &[u8], summary: &mut Summary) -> Result<(), Error>
             }
             if read_u32(entry, 8) & 3 != 0 {
                 summary.enabled_processors = summary.enabled_processors.saturating_add(1);
+                let id = if entry[0] == 0 {
+                    u32::from(entry[3])
+                } else {
+                    read_u32(entry, 4)
+                };
+                if summary.processor_ids[..summary.processor_count].contains(&id) {
+                    return Err(Error::InvalidLength);
+                }
+                if summary.processor_count < summary.processor_ids.len() {
+                    summary.processor_ids[summary.processor_count] = id;
+                    summary.processor_count += 1;
+                } else {
+                    summary.truncated = true;
+                }
             }
         }
         _ => {}

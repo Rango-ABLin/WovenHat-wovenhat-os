@@ -4,8 +4,8 @@
 
 Run these from the repository root:
 
-    cargo clippy --workspace -- -D warnings
-    cargo check --workspace
+    cargo clippy -p wovenhat-kernel --target x86_64-unknown-none -- -D warnings
+    cargo clippy -p wovenhat-os -- -D warnings
     cargo build --release
 
 The root build script consumes the freestanding x86_64 kernel artifact and creates a
@@ -29,16 +29,14 @@ desktop and diagnostic-shell loop.
 
 ## Continuous integration
 
-The kernel workflow installs nightly Rust, the freestanding target, Clippy, QEMU, and
-OVMF. It runs strict lint, builds the feature-gated UEFI image, boots it headlessly with
-serial output, enforces a 90-second timeout, and accepts only exit status 33.
+The workflow runs `scripts/test-release.py` with the pinned toolchain. This
+checks kernel/host lint separately, host regressions, and complete 1/2/4-core
+QEMU boots both with and without disposable ATA disks. It also tests optimized
+four-core images. Every boot requires exact CPU-count and SMP regression
+markers in addition to exit status 33. Logs are retained as CI artifacts.
 
-A representative Linux invocation is:
+QEMU is available on this Windows development host at
+`C:\Program Files\qemu\qemu-system-x86_64.exe`.
 
-    qemu-system-x86_64 -machine q35 -m 256M -display none -serial stdio \
-      -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-      -bios /usr/share/OVMF/OVMF_CODE.fd -drive format=raw,file=<image>
-
-QEMU is not currently installed in the Windows development environment, so runtime
-results must come from CI or a machine with QEMU and OVMF. Static builds do not replace
-the emulator boot gate.
+See [0.8.0 release instructions](release-0.8.0.md) for the complete gate,
+normal-shell keyboard smoke test, and interactive launcher.

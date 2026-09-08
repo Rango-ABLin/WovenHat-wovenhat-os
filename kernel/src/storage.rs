@@ -5,8 +5,7 @@ use crate::{ata, block_io, fat32, gpt, partition, swap, vfs};
 
 const READ_ONLY_ATTRIBUTE: u8 = 0x01;
 const DIRECTORY_ATTRIBUTE: u8 = 0x10;
-const MAX_IMPORT_DEPTH: usize = 2;
-const MAX_DIR_ENTRIES: usize = 32;
+const MAX_BOOT_IMPORT_DEPTH: usize = 2;
 
 const MOUNT_UNKNOWN: u8 = 0;
 const MOUNT_NO_DEVICE: u8 = 1;
@@ -267,6 +266,7 @@ fn import_directory(
     writable_import: bool,
 ) -> Result<usize, fat32::Error> {
     let mut mounted = 0usize;
+    let mut children = alloc::vec::Vec::new();
 
     fat32::for_each_directory_entry(device, volume, dir_cluster, |entry| {
         if entry.attributes & 0x08 != 0 {
@@ -300,15 +300,9 @@ fn import_directory(
                 Err(vfs::Error::AlreadyExists) | Err(vfs::Error::Full) => {}
                 Err(_) => return Err(fat32::Error::DirectoryFull),
             }
-            if depth < MAX_BOOT_IMPORT_DEPTH && entry.first_cluster >= 2 {
-                mounted = mounted.saturating_add(import_directory(
-                    device,
-                    volume,
-                    entry.first_cluster,
-                    path,
-                    depth + 1,
-                    writable_import,
-                )?);
+            if depth < MAX_BOOT_IMPORT_DEPTH && entry.first_cluster >= 2
+                && children.len() < crate::config::MAX_VFS_NODES {
+                    children.push((entry.first_cluster, alloc::string::String::from(path)));
             }
             return Ok(());
         }
@@ -325,6 +319,12 @@ fn import_directory(
         Ok(())
     })?;
 
+    // Release the directory iterator's mutable device borrow before recursion.
+    for (cluster, path) in children {
+        mounted = mounted.saturating_add(import_directory(
+            device, volume, cluster, &path, depth + 1, writable_import,
+        )?);
+    }
     Ok(mounted)
 }
 fn join_path(prefix: &str, name: &str, out: &mut [u8]) -> Option<usize> {

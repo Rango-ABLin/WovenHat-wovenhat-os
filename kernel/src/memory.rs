@@ -78,7 +78,7 @@ impl PhysicalFrameAllocator {
                 continue;
             }
 
-            let start = align_up(region.start, FRAME_SIZE).ok_or(InitError::AddressOverflow)?;
+            let start = align_up(region.start.max(0x10_0000), FRAME_SIZE).ok_or(InitError::AddressOverflow)?;
             let end = align_down(region.end, FRAME_SIZE);
             if start >= end {
                 continue;
