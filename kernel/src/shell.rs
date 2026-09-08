@@ -336,8 +336,28 @@ impl Shell {
                 }
             }
             "mount" => {
+                if authorize(Capability::FileWrite, console) {
+                    cmd_mount(arg, console);
+                }
+            }
+            "remount" | "rescan" => {
+                if authorize(Capability::FileWrite, console) {
+                    cmd_mount("/mnt", console);
+                }
+            }
+            "umount" | "unmount" => {
+                if authorize(Capability::FileWrite, console) {
+                    cmd_umount(arg, console);
+                }
+            }
+            "df" => {
                 if authorize(Capability::FileRead, console) {
-                    cmd_mount(console);
+                    cmd_df(arg, console);
+                }
+            }
+            "fscheck" => {
+                if authorize(Capability::FileRead, console) {
+                    cmd_fscheck(arg, console);
                 }
             }
             "persist" => {
@@ -374,7 +394,7 @@ fn print_help(console: &mut Console<'_>) {
     console.println("WovenHat kernel shell 0.7.0 Stage 9");
     console.println("system:  help clear version ticks|uptime tasks|ps caps devices net netstat");
     console.println(
-        "         memory|mem heap paging bench fs blockio|iostat mount persist sync syscall",
+        "         memory|mem heap paging bench fs blockio|iostat mount|umount df fscheck sync syscall",
     );
     console.println("files:   ls [path]  cat <path>  write <path> <text>");
     console.println("         mkdir <path>  rm <path>  stat <path>");
@@ -592,6 +612,10 @@ fn cmd_persist(arg: &str, console: &mut Console<'_>) {
         console.println("persist: bad path");
         return;
     };
+    if touches_mnt(&path) && !storage::mnt_mounted() {
+        console.println("persist: /mnt is not mounted");
+        return;
+    }
     let result = match vfs::stat(&path) {
         Ok(stat) if stat.kind == vfs::NodeKind::Directory => storage::persist_directory(&path),
         Ok(_) => storage::persist_path(&path),
@@ -602,6 +626,7 @@ fn cmd_persist(arg: &str, console: &mut Console<'_>) {
     };
     match result {
         Ok(()) => console.println("persist: written to FAT32"),
+        Err(storage::PersistError::Unmounted) => console.println("persist: /mnt is not mounted"),
         Err(storage::PersistError::NotSupported) => {
             console.println("persist: path must be under /mnt")
         }
@@ -615,15 +640,17 @@ fn cmd_persist(arg: &str, console: &mut Console<'_>) {
 }
 
 fn cmd_sync(console: &mut Console<'_>) {
-    let Ok(count) = storage::sync_all_mounted() else {
-        console.println("sync: failed; dirty buffers retained for retry");
-        return;
-    };
-    console.print("sync: persisted ");
-    print_u64(console, count as u64);
-    console.println(" file(s) under /mnt");
+    match storage::sync_all_mounted() {
+        Ok(count) => {
+            console.print("sync: persisted ");
+            print_u64(console, count as u64);
+            console.println(" file(s) under /mnt");
+        }
+        Err(storage::PersistError::Unmounted) => console.println("sync: /mnt is not mounted"),
+        Err(storage::PersistError::NoDevice) => console.println("sync: no ATA disk"),
+        Err(_) => console.println("sync: failed; dirty buffers retained for retry"),
+    }
 }
-
 fn cmd_block_io(console: &mut Console<'_>) {
     let stats = block_io::stats();
     console.print("block io: queued=");
@@ -850,6 +877,7 @@ fn cmd_bench(console: &mut Console<'_>) {
 }
 
 fn cmd_fs(console: &mut Console<'_>) {
+    print_mount_info(console);
     if let Some(stats) = crate::ata::with_primary_master(|disk| disk.stats()) {
         console.print("buffer cache: hits=");
         print_u64(console, stats.hits);
@@ -891,33 +919,163 @@ fn cmd_fs(console: &mut Console<'_>) {
     console.newline();
 }
 
-fn cmd_mount(console: &mut Console<'_>) {
-    console.println("storage: ATA primary master (if present)");
-    console.println("boot mounts FAT32 root into /mnt (writable when media allows)");
-    console.println("on-demand: cat/stat/run of /mnt/... pulls missing paths");
-    console.print("vfs nodes under /mnt: ");
-    let mut count = 0usize;
-    let mut index = 0usize;
-    while let Ok(entry) = vfs::readdir("/mnt", index) {
-        let _ = entry;
-        count += 1;
-        index += 1;
-        if index > 64 {
-            break;
-        }
+fn cmd_mount(arg: &str, console: &mut Console<'_>) {
+    let target = arg.trim();
+    if target.is_empty() {
+        print_mount_info(console);
+        return;
     }
-    print_u64(console, count as u64);
+    if target != "/mnt" {
+        console.println("usage: mount [/mnt]");
+        return;
+    }
+    match storage::remount_mnt() {
+        storage::MountStatus::Mounted(count) => {
+            console.print("mount: /mnt mounted; imported ");
+            print_u64(console, count as u64);
+            console.println(" entrie(s)");
+        }
+        storage::MountStatus::NoDevice => console.println("mount: no ATA disk"),
+        storage::MountStatus::NotFat32 => console.println("mount: not a FAT32 volume"),
+        storage::MountStatus::Failed => console.println("mount: failed"),
+    }
+    print_mount_info(console);
+}
+
+fn cmd_umount(arg: &str, console: &mut Console<'_>) {
+    let target = arg.trim();
+    if !target.is_empty() && target != "/mnt" {
+        console.println("usage: umount /mnt");
+        return;
+    }
+    match storage::unmount_mnt() {
+        Ok(()) => console.println("umount: /mnt unmounted"),
+        Err(storage::MountControlError::NoDevice) => console.println("umount: no ATA disk"),
+        Err(storage::MountControlError::NotMounted) => {
+            console.println("umount: /mnt is not mounted")
+        }
+        Err(storage::MountControlError::SyncFailed) => {
+            console.println("umount: sync failed; /mnt remains mounted")
+        }
+        Err(storage::MountControlError::Failed) => console.println("umount: failed"),
+    }
+}
+
+fn cmd_df(arg: &str, console: &mut Console<'_>) {
+    let target = arg.trim();
+    if !target.is_empty() && target != "/mnt" {
+        console.println("usage: df /mnt");
+        return;
+    }
+    match storage::df_mnt() {
+        Ok(info) => {
+            let used = info.total_clusters.saturating_sub(info.free_clusters);
+            let total_bytes = info.total_clusters as u64 * info.bytes_per_cluster as u64;
+            let free_bytes = info.free_clusters as u64 * info.bytes_per_cluster as u64;
+            console.print("df /mnt: clusters total=");
+            print_u64(console, info.total_clusters as u64);
+            console.print(" used=");
+            print_u64(console, used as u64);
+            console.print(" free=");
+            print_u64(console, info.free_clusters as u64);
+            console.print(" cluster_bytes=");
+            print_u64(console, info.bytes_per_cluster as u64);
+            console.newline();
+            console.print("bytes: total=");
+            print_u64(console, total_bytes);
+            console.print(" free=");
+            print_u64(console, free_bytes);
+            console.newline();
+            console.print("fsinfo: free_hint=");
+            if let Some(hint) = info.fs_info_free_count {
+                print_u64(console, hint as u64);
+            } else {
+                console.print("unknown");
+            }
+            console.print(" next_hint=");
+            if let Some(next) = info.fs_info_next_free {
+                print_u64(console, next as u64);
+            } else {
+                console.print("unknown");
+            }
+            console.print(" status=");
+            console.println(if info.fs_info_matches {
+                "ok"
+            } else {
+                "mismatch"
+            });
+        }
+        Err(err) => print_space_error("df", err, console),
+    }
+}
+
+fn cmd_fscheck(arg: &str, console: &mut Console<'_>) {
+    let target = arg.trim();
+    if !target.is_empty() && target != "/mnt" {
+        console.println("usage: fscheck /mnt");
+        return;
+    }
+    match storage::fscheck_mnt() {
+        Ok(report) => {
+            console.print("fscheck /mnt: ok files=");
+            print_u64(console, report.files as u64);
+            console.print(" directories=");
+            print_u64(console, report.directories as u64);
+            console.print(" free_clusters=");
+            print_u64(console, report.free_clusters as u64);
+            console.print("/");
+            print_u64(console, report.total_clusters as u64);
+            console.print(" fsinfo=");
+            console.println(if report.fs_info_matches {
+                "ok"
+            } else {
+                "mismatch"
+            });
+        }
+        Err(err) => print_space_error("fscheck", err, console),
+    }
+}
+
+fn print_mount_info(console: &mut Console<'_>) {
+    let info = storage::mount_info();
+    console.print("/mnt: ");
+    console.print(match info.status {
+        storage::MountLifecycleStatus::Unknown => "unknown",
+        storage::MountLifecycleStatus::NoDevice => "no-device",
+        storage::MountLifecycleStatus::NotFat32 => "not-fat32",
+        storage::MountLifecycleStatus::Mounted => "mounted",
+        storage::MountLifecycleStatus::Failed => "failed",
+        storage::MountLifecycleStatus::Unmounted => "unmounted",
+    });
+    console.print(" imported=");
+    print_u64(console, info.imported_entries as u64);
+    console.print(" dirty=");
+    console.print(if info.dirty { "yes" } else { "no" });
+    console.print(" syncs=");
+    print_u64(console, info.sync_count);
     console.newline();
 }
 
+fn print_space_error(command: &str, err: storage::SpaceError, console: &mut Console<'_>) {
+    console.print(command);
+    console.println(match err {
+        storage::SpaceError::Unmounted => ": /mnt is not mounted",
+        storage::SpaceError::NoDevice => ": no ATA disk",
+        storage::SpaceError::NotFat32 => ": not a FAT32 volume",
+        storage::SpaceError::Failed => ": failed",
+    });
+}
 fn cmd_ls(path: &str, console: &mut Console<'_>) {
     let Some(path) = shell_resolve(path) else {
         console.println("ls: bad path");
         return;
     };
     // Pull directory listing for /mnt if needed.
-    if path == "/mnt" || path.starts_with("/mnt/") {
-        let _ = storage::ensure_path(&path);
+    if touches_mnt(&path) {
+        if let Err(err) = storage::ensure_path(&path) {
+            print_mount_lookup_error("ls", err, console);
+            return;
+        }
     }
     match vfs::stat(&path) {
         Ok(stat) if stat.kind == vfs::NodeKind::Directory => {}
@@ -952,21 +1110,14 @@ fn cmd_ls(path: &str, console: &mut Console<'_>) {
         console.println("(empty)");
     }
 }
-
 fn cmd_cat(path: &str, console: &mut Console<'_>) {
     let Some(path) = shell_resolve(path) else {
         console.println("cat: bad path");
         return;
     };
-    if path.starts_with("/mnt/") {
+    if touches_mnt(&path) {
         if let Err(err) = storage::ensure_path(&path) {
-            console.println(match err {
-                storage::EnsureError::NotFound => "cat: not found on volume",
-                storage::EnsureError::NoDevice => "cat: no block device",
-                storage::EnsureError::NotFat32 => "cat: not a fat32 volume",
-                storage::EnsureError::TooLarge => "cat: file too large",
-                _ => "cat: mount lookup failed",
-            });
+            print_mount_lookup_error("cat", err, console);
             return;
         }
     }
@@ -1004,7 +1155,6 @@ fn cmd_cat(path: &str, console: &mut Console<'_>) {
     }
     let _ = vfs::close_open_file(file);
 }
-
 fn cmd_write(arg: &str, console: &mut Console<'_>) {
     // write <path> <text...>
     let arg = arg.trim();
@@ -1021,8 +1171,25 @@ fn cmd_write(arg: &str, console: &mut Console<'_>) {
         console.println("write: bad path");
         return;
     };
+    if touches_mnt(&path) && !storage::mnt_mounted() {
+        console.println("write: /mnt is not mounted");
+        return;
+    }
+    if is_mnt_child(&path) {
+        if let Some(parent) = shell_parent_path(&path) {
+            if touches_mnt(&parent) {
+                if let Err(err) = storage::ensure_path(&parent) {
+                    print_mount_lookup_error("write", err, console);
+                    return;
+                }
+            }
+        }
+    }
     match vfs::write_file(&path, text.as_bytes()) {
         Ok(()) => {
+            if touches_mnt(&path) {
+                storage::mark_mnt_dirty();
+            }
             console.print("wrote ");
             print_u64(console, text.len() as u64);
             console.println(" bytes");
@@ -1034,7 +1201,6 @@ fn cmd_write(arg: &str, console: &mut Console<'_>) {
         Err(_) => console.println("write: failed"),
     }
 }
-
 fn cmd_rename(args: &str, console: &mut Console<'_>) {
     let mut args = args.split_whitespace();
     let (Some(old), Some(new), None) = (args.next(), args.next(), args.next()) else {
@@ -1047,14 +1213,24 @@ fn cmd_rename(args: &str, console: &mut Console<'_>) {
     };
 
     if touches_mnt(&old) || touches_mnt(&new) {
+        if !storage::mnt_mounted() {
+            console.println("rename: /mnt is not mounted");
+            return;
+        }
         if !is_mnt_child(&old) || !is_mnt_child(&new) {
             console.println("rename: cross-mount not supported");
             return;
         }
-        let _ = storage::ensure_path(&old);
+        if let Err(err) = storage::ensure_path(&old) {
+            print_mount_lookup_error("rename", err, console);
+            return;
+        }
         if let Some(parent) = shell_parent_path(&new) {
-            if parent == "/mnt" || parent.starts_with("/mnt/") {
-                let _ = storage::ensure_path(&parent);
+            if touches_mnt(&parent) {
+                if let Err(err) = storage::ensure_path(&parent) {
+                    print_mount_lookup_error("rename", err, console);
+                    return;
+                }
             }
         }
         match vfs::can_rename(&old, &new) {
@@ -1090,7 +1266,14 @@ fn cmd_rm(path: &str, console: &mut Console<'_>) {
     }
 
     if is_mnt_child(&path) {
-        let _ = storage::ensure_path(&path);
+        if !storage::mnt_mounted() {
+            console.println("rm: /mnt is not mounted");
+            return;
+        }
+        if let Err(err) = storage::ensure_path(&path) {
+            print_mount_lookup_error("rm", err, console);
+            return;
+        }
         match vfs::can_remove(&path) {
             Ok(()) => {}
             Err(err) => {
@@ -1116,22 +1299,46 @@ fn cmd_rm(path: &str, console: &mut Console<'_>) {
         Err(err) => print_rm_vfs_error(err, console),
     }
 }
-
 fn cmd_mkdir(path: &str, console: &mut Console<'_>) {
     let Some(path) = shell_resolve(path) else {
         console.println("mkdir: bad path");
         return;
     };
+    if touches_mnt(&path) && !storage::mnt_mounted() {
+        console.println("mkdir: /mnt is not mounted");
+        return;
+    }
+    if is_mnt_child(&path) {
+        if let Some(parent) = shell_parent_path(&path) {
+            if touches_mnt(&parent) {
+                if let Err(err) = storage::ensure_path(&parent) {
+                    print_mount_lookup_error("mkdir", err, console);
+                    return;
+                }
+            }
+        }
+    }
     match vfs::mkdir(&path) {
         Ok(()) => {
             if is_mnt_child(&path) {
                 match storage::persist_directory(&path) {
                     Ok(()) => console.println("ok"),
-                    Err(storage::PersistError::NoDevice) => console.println("mkdir: no ATA disk"),
+                    Err(storage::PersistError::Unmounted) => {
+                        let _ = vfs::remove(&path);
+                        console.println("mkdir: /mnt is not mounted")
+                    }
+                    Err(storage::PersistError::NoDevice) => {
+                        let _ = vfs::remove(&path);
+                        console.println("mkdir: no ATA disk")
+                    }
                     Err(storage::PersistError::BadName) => {
+                        let _ = vfs::remove(&path);
                         console.println("mkdir: FAT 8.3 path required")
                     }
-                    Err(_) => console.println("mkdir: disk persist failed"),
+                    Err(_) => {
+                        let _ = vfs::remove(&path);
+                        console.println("mkdir: disk persist failed")
+                    }
                 }
             } else {
                 console.println("ok");
@@ -1143,14 +1350,16 @@ fn cmd_mkdir(path: &str, console: &mut Console<'_>) {
         Err(_) => console.println("mkdir: failed"),
     }
 }
-
 fn cmd_stat(path: &str, console: &mut Console<'_>) {
     let Some(path) = shell_resolve(path) else {
         console.println("stat: bad path");
         return;
     };
-    if path.starts_with("/mnt/") {
-        let _ = storage::ensure_path(&path);
+    if touches_mnt(&path) {
+        if let Err(err) = storage::ensure_path(&path) {
+            print_mount_lookup_error("stat", err, console);
+            return;
+        }
     }
     match vfs::stat(&path) {
         Ok(stat) => {
@@ -1170,7 +1379,6 @@ fn cmd_stat(path: &str, console: &mut Console<'_>) {
         Err(_) => console.println("stat: not found"),
     }
 }
-
 fn cmd_userland_command(verb: &str, arg: &str, console: &mut Console<'_>) -> bool {
     if verb.is_empty() || verb.len() > 64 {
         return false;
@@ -1220,9 +1428,9 @@ fn cmd_run(path: &str, console: &mut Console<'_>, foreground: bool) {
         console.println("run: bad path");
         return;
     };
-    if path.starts_with("/mnt/") {
-        if storage::ensure_path(&path).is_err() {
-            console.println("run: load from disk failed");
+    if touches_mnt(&path) {
+        if let Err(err) = storage::ensure_path(&path) {
+            print_mount_lookup_error("run", err, console);
             return;
         }
     }
@@ -1260,7 +1468,6 @@ fn cmd_run(path: &str, console: &mut Console<'_>, foreground: bool) {
         Err(_) => console.println("run: spawn failed"),
     }
 }
-
 fn cmd_sh(console: &mut Console<'_>) {
     let installed = install_userland();
     if installed != 24 {
@@ -1375,6 +1582,18 @@ fn shell_parent_path(path: &str) -> Option<alloc::string::String> {
     }
 }
 
+fn print_mount_lookup_error(command: &str, err: storage::EnsureError, console: &mut Console<'_>) {
+    console.print(command);
+    console.println(match err {
+        storage::EnsureError::Unmounted => ": /mnt is not mounted",
+        storage::EnsureError::NotFound => ": not found on volume",
+        storage::EnsureError::NoDevice => ": no block device",
+        storage::EnsureError::NotFat32 => ": not a FAT32 volume",
+        storage::EnsureError::TooLarge => ": file too large",
+        storage::EnsureError::InvalidPath => ": bad path",
+        _ => ": mount lookup failed",
+    });
+}
 fn print_rename_vfs_error(err: vfs::Error, console: &mut Console<'_>) {
     match err {
         vfs::Error::NotFound => console.println("rename: source or destination parent missing"),
@@ -1387,6 +1606,7 @@ fn print_rename_vfs_error(err: vfs::Error, console: &mut Console<'_>) {
 
 fn print_rename_storage_error(err: storage::MutationError, console: &mut Console<'_>) {
     match err {
+        storage::MutationError::Unmounted => console.println("rename: /mnt is not mounted"),
         storage::MutationError::NotSupported => {
             console.println("rename: cross-mount not supported")
         }
@@ -1413,6 +1633,7 @@ fn print_rm_vfs_error(err: vfs::Error, console: &mut Console<'_>) {
 
 fn print_rm_storage_error(err: storage::MutationError, console: &mut Console<'_>) {
     match err {
+        storage::MutationError::Unmounted => console.println("rm: /mnt is not mounted"),
         storage::MutationError::NotSupported => console.println("rm: refused"),
         storage::MutationError::NotFound => console.println("rm: not found"),
         storage::MutationError::NoDevice => console.println("rm: no ATA disk"),

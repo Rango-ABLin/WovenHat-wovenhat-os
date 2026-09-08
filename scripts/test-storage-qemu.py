@@ -1,4 +1,4 @@
-﻿"""Run WovenHat's live ATA/FAT32 mutation/growth regression in QEMU.
+"""Run WovenHat's live ATA/FAT32 mutation/growth regression in QEMU.
 
 This test uses a disposable FAT32 data disk under target/storage-regression. It waits for the storage serial checkpoint instead of the full boot-suite exit:
 `test-memory-qemu.py` already owns full boot validation, while this runner owns
@@ -68,9 +68,9 @@ def main() -> int:
         while time.monotonic() < deadline:
             if serial.exists():
                 last_log = serial.read_text(errors='replace')
-                storage_passed = '[STORAGE MUTATION] live FAT32 rename/delete/growth: PASSED' in last_log
+                storage_passed = '[STORAGE MUTATION] live FAT32 rename/delete/growth/lifecycle: PASSED' in last_log
                 boot_passed = '[BOOT] ALL VALIDATIONS PASSED' in last_log
-                storage_failed = '[STORAGE MUTATION] live FAT32 rename/delete/growth: FAILED' in last_log
+                storage_failed = '[STORAGE MUTATION] live FAT32 rename/delete/growth/lifecycle: FAILED' in last_log
                 boot_failed = 'FAILED' in last_log and not storage_passed
                 if storage_passed:
                     process.terminate()
@@ -79,7 +79,7 @@ def main() -> int:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=5)
-                    print('QEMU storage mutation/growth suite: PASS')
+                    print('QEMU storage mutation/growth/lifecycle suite: PASS')
                     print('Serial log:', serial)
                     return 0
                 if storage_failed or boot_failed:
@@ -89,7 +89,7 @@ def main() -> int:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=5)
-                    print('QEMU storage mutation/growth suite: FAIL', file=sys.stderr)
+                    print('QEMU storage mutation/growth/lifecycle suite: FAIL', file=sys.stderr)
                     print('Serial log:', serial, file=sys.stderr)
                     print('\n'.join(line for line in last_log.splitlines() if 'FAILED' in line or 'STORAGE MUTATION' in line), file=sys.stderr)
                     return 1
@@ -102,11 +102,11 @@ def main() -> int:
             process.wait(timeout=5)
 
     log = serial.read_text(errors='replace') if serial.exists() else last_log
-    if '[STORAGE MUTATION] live FAT32 rename/delete/growth: PASSED' in log:
-        print('QEMU storage mutation/growth suite: PASS')
+    if '[STORAGE MUTATION] live FAT32 rename/delete/growth/lifecycle: PASSED' in log:
+        print('QEMU storage mutation/growth/lifecycle suite: PASS')
         print('Serial log:', serial)
         return 0
-    print('QEMU storage mutation/growth suite timed out or exited before success.', file=sys.stderr)
+    print('QEMU storage mutation/growth/lifecycle suite timed out or exited before success.', file=sys.stderr)
     print('Serial log:', serial, file=sys.stderr)
     return 1
 

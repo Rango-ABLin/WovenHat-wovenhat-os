@@ -69,8 +69,8 @@ Current drivers are QEMU-specific. A fully-fledged OS needs a driver framework, 
 - **Definition of done**: boots and functions on real hardware (or a second, differently-configured VM/hypervisor) without code changes, not just the one QEMU profile in CI.
 
 ### Phase A3: Filesystem Maturity
-- [x] FAT32 short-name `/mnt` create/overwrite/delete/rename path, including directory creation, cluster allocation/freeing, subtree-safe directory rename, full-directory cluster extension, FSInfo free-space hint updates, safer overwrite rollback, shell/syscall integration, sector-cache flush, and regression coverage.
-- [ ] FAT32 write-path hardening: long filename creation, safe unmount UX, journaling or crash-safe metadata ordering.
+- [x] FAT32 short-name `/mnt` create/overwrite/delete/rename path, including directory creation, cluster allocation/freeing, subtree-safe directory rename, full-directory cluster extension, FSInfo free-space hint updates, safe mount/sync/unmount lifecycle state, `df`/`fscheck` diagnostics, safer overwrite rollback, shell/syscall integration, sector-cache flush, and regression coverage.
+- [ ] FAT32 write-path hardening: long filename creation, journaling or crash-safe metadata ordering.
 - [ ] Journaling or copy-on-write filesystem option (ext-like or a from-scratch CoW design) — FAT32 alone is not a serious modern filesystem (no permissions, no journaling, 4 GB file cap)
 - [x] Replaced the fixed `fat32::MAX_READ_CLUSTERS` file-read ceiling with size/media-bounded streaming reads; directory metadata scans retain a bounded corruption guard.
 - [x] Persistent ATA sector buffer cache with bounded LRU replacement, dirty writeback, failure retry, and diagnostics; see `buffer-cache.md`.

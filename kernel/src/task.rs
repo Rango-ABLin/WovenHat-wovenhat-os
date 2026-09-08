@@ -1669,15 +1669,29 @@ pub fn open_current(path: &str) -> Result<u64, FileError> {
     if !current_has(Capability::FileRead) {
         return Err(FileError::PermissionDenied);
     }
-    let file = match vfs::open(path) {
+    let path = resolve_path_for_current(path)?;
+    if touches_mnt(&path) {
+        if !crate::storage::mnt_mounted() {
+            return Err(FileError::NotFound);
+        }
+        match crate::storage::ensure_path(&path) {
+            Ok(()) => {}
+            Err(crate::storage::EnsureError::NotFound) => ensure_mnt_parent(&path)?,
+            Err(error) => return Err(map_ensure_file_error(error)),
+        }
+    }
+    let file = match vfs::open(&path) {
         Ok(id) => id,
         Err(_) => {
             // POSIX-ish O_CREAT for missing files when writer-capable.
             if !current_has(Capability::FileWrite) {
                 return Err(FileError::NotFound);
             }
-            vfs::write_file(path, &[]).map_err(|_| FileError::NotFound)?;
-            vfs::open(path).map_err(|_| FileError::NotFound)?
+            vfs::write_file(&path, &[]).map_err(|_| FileError::NotFound)?;
+            if is_mnt_child(&path) {
+                crate::storage::mark_mnt_dirty();
+            }
+            vfs::open(&path).map_err(|_| FileError::NotFound)?
         }
     };
     let task_id = current_task_id();
@@ -1693,7 +1707,6 @@ pub fn open_current(path: &str) -> Result<u64, FileError> {
     process.files[descriptor] = Some(FdKind::File(file));
     Ok(descriptor as u64)
 }
-
 pub fn descriptor_is_open(descriptor: u64) -> bool {
     let Ok(descriptor) = usize::try_from(descriptor) else {
         return false;
@@ -1752,7 +1765,15 @@ pub fn write_current(descriptor: u64, buffer: &[u8]) -> Result<usize, FileError>
             if !current_has(Capability::FileWrite) {
                 return Err(FileError::PermissionDenied);
             }
-            vfs::write(id, buffer).map_err(|_| FileError::BadDescriptor)
+            let under_mnt = vfs::open_file_path_starts_with(id, "/mnt/").unwrap_or(false);
+            if under_mnt && !crate::storage::mnt_mounted() {
+                return Err(FileError::NotFound);
+            }
+            let written = vfs::write(id, buffer).map_err(|_| FileError::BadDescriptor);
+            if written.is_ok() && under_mnt {
+                crate::storage::mark_mnt_dirty();
+            }
+            written
         }
         FdKind::PipeWrite(id) => {
             crate::pipe::write(id, buffer).map_err(|_| FileError::BadDescriptor)
@@ -1907,6 +1928,7 @@ pub fn stat_path(path: &str) -> Result<vfs::Stat, FileError> {
         return Err(FileError::PermissionDenied);
     }
     let path = resolve_path_for_current(path)?;
+    ensure_existing_mnt_path(&path)?;
     vfs::stat(&path).map_err(|_| FileError::NotFound)
 }
 
@@ -1915,6 +1937,7 @@ pub fn readdir_path(path: &str, index: usize) -> Result<vfs::DirEntry, FileError
         return Err(FileError::PermissionDenied);
     }
     let path = resolve_path_for_current(path)?;
+    ensure_existing_mnt_path(&path)?;
     vfs::readdir(&path, index).map_err(|_| FileError::NotFound)
 }
 
@@ -1923,16 +1946,25 @@ pub fn mkdir_path(path: &str) -> Result<(), FileError> {
         return Err(FileError::PermissionDenied);
     }
     let path = resolve_path_for_current(path)?;
-    let result = match vfs::mkdir(&path) {
-        Ok(()) => Ok(()),
-        Err(vfs::Error::AlreadyExists) => Err(FileError::AlreadyExists),
-        Err(vfs::Error::Full) => Err(FileError::TooManyFiles),
-        Err(_) => Err(FileError::NotFound),
-    };
-    if result.is_ok() && path.starts_with("/mnt/") {
-        let _ = crate::storage::persist_directory(&path);
+    if touches_mnt(&path) && !crate::storage::mnt_mounted() {
+        return Err(FileError::NotFound);
     }
-    result
+    if is_mnt_child(&path) {
+        ensure_mnt_parent(&path)?;
+    }
+    match vfs::mkdir(&path) {
+        Ok(()) => {}
+        Err(vfs::Error::AlreadyExists) => return Err(FileError::AlreadyExists),
+        Err(vfs::Error::Full) => return Err(FileError::TooManyFiles),
+        Err(_) => return Err(FileError::NotFound),
+    }
+    if is_mnt_child(&path) {
+        if let Err(error) = crate::storage::persist_directory(&path) {
+            let _ = vfs::remove(&path);
+            return Err(map_persist_file_error(error));
+        }
+    }
+    Ok(())
 }
 
 pub fn current_cwd_str(buf: &mut [u8]) -> Result<usize, FileError> {
@@ -1960,6 +1992,7 @@ pub fn chdir_current(path: &str) -> Result<(), FileError> {
         return Err(FileError::PermissionDenied);
     }
     let absolute = resolve_path_for_current(path)?;
+    ensure_existing_mnt_path(&absolute)?;
     match vfs::stat(&absolute) {
         Ok(stat) if stat.kind == vfs::NodeKind::Directory => {}
         _ => return Err(FileError::NotFound),
@@ -1980,7 +2013,6 @@ pub fn chdir_current(path: &str) -> Result<(), FileError> {
     process.cwd_len = bytes.len();
     Ok(())
 }
-
 pub fn resolve_path_for_current(path: &str) -> Result<alloc::string::String, FileError> {
     let cwd = current_cwd();
     resolve_path_with_cwd(path, &cwd)
@@ -2591,7 +2623,10 @@ pub fn unlink_current(path: &str) -> Result<(), FileError> {
     }
     let path = resolve_path_for_current(path)?;
     if is_mnt_child(&path) {
-        let _ = crate::storage::ensure_path(&path);
+        if !crate::storage::mnt_mounted() {
+            return Err(FileError::NotFound);
+        }
+        ensure_existing_mnt_path(&path)?;
         vfs::can_remove(&path).map_err(map_vfs_file_error)?;
         vfs::prepare_remove(&path).map_err(map_vfs_file_error)?;
         crate::storage::delete_path(&path).map_err(map_mutation_file_error)?;
@@ -2606,21 +2641,51 @@ pub fn rename_current(old: &str, new: &str) -> Result<(), FileError> {
     let old = resolve_path_for_current(old)?;
     let new = resolve_path_for_current(new)?;
     if touches_mnt(&old) || touches_mnt(&new) {
+        if !crate::storage::mnt_mounted() {
+            return Err(FileError::NotFound);
+        }
         if !is_mnt_child(&old) || !is_mnt_child(&new) {
             return Err(FileError::NotFound);
         }
-        let _ = crate::storage::ensure_path(&old);
-        if let Some(parent) = parent_path_string(&new) {
-            if parent == "/mnt" || parent.starts_with("/mnt/") {
-                let _ = crate::storage::ensure_path(&parent);
-            }
-        }
+        ensure_existing_mnt_path(&old)?;
+        ensure_mnt_parent(&new)?;
         vfs::can_rename(&old, &new).map_err(map_vfs_file_error)?;
         crate::storage::rename_path(&old, &new).map_err(map_mutation_file_error)?;
     }
     vfs::rename(&old, &new).map_err(map_vfs_file_error)
 }
+fn ensure_existing_mnt_path(path: &str) -> Result<(), FileError> {
+    if touches_mnt(path) {
+        if !crate::storage::mnt_mounted() {
+            return Err(FileError::NotFound);
+        }
+        crate::storage::ensure_path(path).map_err(map_ensure_file_error)?;
+    }
+    Ok(())
+}
 
+fn ensure_mnt_parent(path: &str) -> Result<(), FileError> {
+    if let Some(parent) = parent_path_string(path) {
+        if touches_mnt(&parent) {
+            ensure_existing_mnt_path(&parent)?;
+        }
+    }
+    Ok(())
+}
+
+fn map_ensure_file_error(error: crate::storage::EnsureError) -> FileError {
+    match error {
+        crate::storage::EnsureError::TooLarge => FileError::TooManyFiles,
+        _ => FileError::NotFound,
+    }
+}
+
+fn map_persist_file_error(error: crate::storage::PersistError) -> FileError {
+    match error {
+        crate::storage::PersistError::TooLarge => FileError::TooManyFiles,
+        _ => FileError::NotFound,
+    }
+}
 fn is_mnt_child(path: &str) -> bool {
     path.starts_with("/mnt/")
 }
@@ -2657,7 +2722,8 @@ fn map_mutation_file_error(error: crate::storage::MutationError) -> FileError {
         crate::storage::MutationError::AlreadyExists => FileError::AlreadyExists,
         crate::storage::MutationError::NotEmpty => FileError::NotEmpty,
         crate::storage::MutationError::ReadOnly => FileError::PermissionDenied,
-        crate::storage::MutationError::NoDevice
+        crate::storage::MutationError::Unmounted
+        | crate::storage::MutationError::NoDevice
         | crate::storage::MutationError::NotSupported
         | crate::storage::MutationError::NotFound
         | crate::storage::MutationError::BadName

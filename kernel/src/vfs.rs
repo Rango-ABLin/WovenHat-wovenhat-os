@@ -885,6 +885,17 @@ pub fn file_size(id: OpenFileId) -> Result<usize, Error> {
         .ok_or(Error::InvalidDescriptor)
 }
 
+pub fn open_file_path_starts_with(id: OpenFileId, prefix: &str) -> Result<bool, Error> {
+    let mut table = OPEN_FILES.lock();
+    let entry = table.get_mut(id)?;
+    let registry = REGISTRY.lock();
+    let node = registry
+        .nodes
+        .get(entry.node)
+        .filter(|node| node.occupied)
+        .ok_or(Error::InvalidDescriptor)?;
+    Ok(node.path_str().starts_with(prefix))
+}
 /// Positional reads do not alter the shared open-file offset.
 pub fn read_at(id: OpenFileId, offset: usize, buffer: &mut [u8]) -> Result<usize, Error> {
     read_from(id, Some(offset), buffer, None)

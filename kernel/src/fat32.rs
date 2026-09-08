@@ -17,6 +17,7 @@ const VOLUME_ID_ATTRIBUTE: u8 = 0x08;
 const DIRECTORY_ATTRIBUTE: u8 = 0x10;
 const LONG_NAME_ATTRIBUTE: u8 = 0x0f;
 const MAX_DIRECTORY_CLUSTERS: usize = 128;
+const MAX_FS_CHECK_DEPTH: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -106,6 +107,25 @@ pub enum ClusterLink {
     End,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SpaceInfo {
+    pub total_clusters: u32,
+    pub free_clusters: u32,
+    pub bytes_per_cluster: u32,
+    pub fs_info_free_count: Option<u32>,
+    pub fs_info_next_free: Option<u32>,
+    pub fs_info_matches: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CheckReport {
+    pub files: usize,
+    pub directories: usize,
+    pub total_clusters: u32,
+    pub free_clusters: u32,
+    pub fs_info_free_count: Option<u32>,
+    pub fs_info_matches: bool,
+}
 pub fn mount(device: &mut impl BlockDevice) -> Result<Volume, Error> {
     let mut sector = [0_u8; SECTOR_SIZE];
     device.read_sector(0, &mut sector).map_err(Error::Block)?;
@@ -526,6 +546,177 @@ pub fn read_file_at(
         };
     }
     Ok(copied)
+}
+
+pub fn space_info(device: &mut impl BlockDevice, volume: Volume) -> Result<SpaceInfo, Error> {
+    let total_clusters = volume.cluster_count;
+    let bytes_per_cluster = volume.sectors_per_cluster as u32 * SECTOR_SIZE as u32;
+    let end = total_clusters
+        .checked_add(2)
+        .ok_or(Error::UnsupportedGeometry)?;
+    let entries_per_sector = (SECTOR_SIZE / 4) as u32;
+    let mut free_clusters = 0_u32;
+    let mut cluster = 2_u32;
+    let mut sector = [0_u8; SECTOR_SIZE];
+
+    while cluster < end {
+        volume.cluster_lba(cluster)?;
+        let fat_offset = (cluster as u64).checked_mul(4).ok_or(Error::CorruptChain)?;
+        let fat_sector = volume
+            .first_fat_sector
+            .checked_add(fat_offset / SECTOR_SIZE as u64)
+            .ok_or(Error::CorruptChain)?;
+        if fat_sector >= volume.first_data_sector {
+            return Err(Error::CorruptChain);
+        }
+        device
+            .read_sector(fat_sector, &mut sector)
+            .map_err(Error::Block)?;
+
+        let sector_first_cluster =
+            ((fat_sector - volume.first_fat_sector) * entries_per_sector as u64) as u32;
+        let first_index = (cluster - sector_first_cluster) as usize;
+        for index in first_index..entries_per_sector as usize {
+            let current_cluster = sector_first_cluster + index as u32;
+            if current_cluster >= end {
+                break;
+            }
+            let entry = read_u32(&sector, index * 4) & FAT32_ENTRY_MASK;
+            if entry == 0 {
+                free_clusters = free_clusters.saturating_add(1);
+            }
+        }
+
+        let next = sector_first_cluster.saturating_add(entries_per_sector);
+        if next <= cluster {
+            return Err(Error::CorruptChain);
+        }
+        cluster = next;
+    }
+
+    let fs_info = read_fs_info(device, volume)?;
+    let fs_info_free_count = fs_info.and_then(|info| {
+        if info.free_count == FSINFO_UNKNOWN {
+            None
+        } else {
+            Some(info.free_count)
+        }
+    });
+    let fs_info_next_free = fs_info.and_then(|info| {
+        if info.next_free == FSINFO_UNKNOWN || !is_allocatable_cluster(volume, info.next_free) {
+            None
+        } else {
+            Some(info.next_free)
+        }
+    });
+    let fs_info_matches = fs_info_free_count.map_or(true, |hint| hint == free_clusters);
+
+    Ok(SpaceInfo {
+        total_clusters,
+        free_clusters,
+        bytes_per_cluster,
+        fs_info_free_count,
+        fs_info_next_free,
+        fs_info_matches,
+    })
+}
+
+pub fn check_volume(device: &mut impl BlockDevice, volume: Volume) -> Result<CheckReport, Error> {
+    volume.cluster_lba(volume.root_cluster)?;
+    validate_cluster_chain(device, volume, volume.root_cluster)?;
+
+    let space = space_info(device, volume)?;
+    let mut report = CheckReport {
+        files: 0,
+        directories: 1,
+        total_clusters: space.total_clusters,
+        free_clusters: space.free_clusters,
+        fs_info_free_count: space.fs_info_free_count,
+        fs_info_matches: space.fs_info_matches,
+    };
+    check_directory_tree(device, volume, volume.root_cluster, 0, &mut report)?;
+    Ok(report)
+}
+
+fn check_directory_tree(
+    device: &mut impl BlockDevice,
+    volume: Volume,
+    dir_cluster: u32,
+    depth: usize,
+    report: &mut CheckReport,
+) -> Result<(), Error> {
+    let mut cluster = dir_cluster;
+    let mut visited = [0_u32; MAX_DIRECTORY_CLUSTERS];
+    let mut visited_count = 0_usize;
+    let mut sector = [0_u8; SECTOR_SIZE];
+
+    loop {
+        if visited_count == visited.len() {
+            return Err(Error::ChainTooLong);
+        }
+        if visited[..visited_count].contains(&cluster) {
+            return Err(Error::ChainLoop);
+        }
+        visited[visited_count] = cluster;
+        visited_count += 1;
+
+        let base = volume.cluster_lba(cluster)?;
+        for sector_index in 0..volume.sectors_per_cluster as u64 {
+            device
+                .read_sector(base + sector_index, &mut sector)
+                .map_err(Error::Block)?;
+            for index in 0..DIRECTORY_ENTRIES_PER_SECTOR {
+                let offset = index * DIRECTORY_ENTRY_SIZE;
+                let first = sector[offset];
+                if first == 0 {
+                    return Ok(());
+                }
+                if first == 0xe5 {
+                    continue;
+                }
+                let attributes = sector[offset + 11];
+                if attributes == LONG_NAME_ATTRIBUTE || attributes & VOLUME_ID_ATTRIBUTE != 0 {
+                    continue;
+                }
+
+                let entry = directory_entry_from_sector(&sector, offset)?;
+                if is_dot_directory_short_name(&entry.short_name) {
+                    continue;
+                }
+
+                if entry.attributes & DIRECTORY_ATTRIBUTE != 0 {
+                    validate_cluster_chain(device, volume, entry.first_cluster)?;
+                    report.directories = report.directories.saturating_add(1);
+                    if depth < MAX_FS_CHECK_DEPTH {
+                        check_directory_tree(
+                            device,
+                            volume,
+                            entry.first_cluster,
+                            depth + 1,
+                            report,
+                        )?;
+                    }
+                } else {
+                    if entry.first_cluster >= 2 {
+                        validate_cluster_chain(device, volume, entry.first_cluster)?;
+                    }
+                    report.files = report.files.saturating_add(1);
+                }
+            }
+        }
+
+        cluster = match next_cluster(device, volume, cluster)? {
+            ClusterLink::Next(next) => next,
+            ClusterLink::End => return Ok(()),
+        };
+    }
+}
+
+fn is_dot_directory_short_name(short_name: &[u8; 11]) -> bool {
+    (short_name[0] == b'.' && short_name[1..].iter().all(|byte| *byte == b' '))
+        || (short_name[0] == b'.'
+            && short_name[1] == b'.'
+            && short_name[2..].iter().all(|byte| *byte == b' '))
 }
 
 struct ChainCycleGuard {

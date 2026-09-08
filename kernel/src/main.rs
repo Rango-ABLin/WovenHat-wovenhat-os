@@ -791,17 +791,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     match storage::live_mutation_self_test() {
         storage::LiveMutationTestStatus::Passed => {
             serial::write_line(format_args!(
-                "[STORAGE MUTATION] live FAT32 rename/delete/growth: PASSED"
+                "[STORAGE MUTATION] live FAT32 rename/delete/growth/lifecycle: PASSED"
             ));
         }
         storage::LiveMutationTestStatus::Skipped => {
             serial::write_line(format_args!(
-                "[STORAGE MUTATION] live FAT32 rename/delete/growth: SKIPPED"
+                "[STORAGE MUTATION] live FAT32 rename/delete/growth/lifecycle: SKIPPED"
             ));
         }
         storage::LiveMutationTestStatus::Failed(stage) => {
             serial::write_line(format_args!(
-                "[STORAGE MUTATION] live FAT32 rename/delete/growth: FAILED at {}",
+                "[STORAGE MUTATION] live FAT32 rename/delete/growth/lifecycle: FAILED at {}",
                 stage
             ));
             halt();

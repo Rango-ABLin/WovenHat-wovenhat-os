@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+
 use crate::block::BlockDevice;
 use crate::{ata, block_io, fat32, gpt, partition, swap, vfs};
 
@@ -6,6 +8,51 @@ const DIRECTORY_ATTRIBUTE: u8 = 0x10;
 const MAX_IMPORT_DEPTH: usize = 2;
 const MAX_DIR_ENTRIES: usize = 32;
 
+const MOUNT_UNKNOWN: u8 = 0;
+const MOUNT_NO_DEVICE: u8 = 1;
+const MOUNT_NOT_FAT32: u8 = 2;
+const MOUNT_MOUNTED: u8 = 3;
+const MOUNT_FAILED: u8 = 4;
+const MOUNT_UNMOUNTED: u8 = 5;
+
+static MNT_STATUS: AtomicU8 = AtomicU8::new(MOUNT_UNKNOWN);
+static MNT_DIRTY: AtomicBool = AtomicBool::new(false);
+static MNT_IMPORTED: AtomicUsize = AtomicUsize::new(0);
+static MNT_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountLifecycleStatus {
+    Unknown,
+    NoDevice,
+    NotFat32,
+    Mounted,
+    Failed,
+    Unmounted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MountInfo {
+    pub status: MountLifecycleStatus,
+    pub imported_entries: usize,
+    pub dirty: bool,
+    pub sync_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountControlError {
+    NoDevice,
+    NotMounted,
+    SyncFailed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpaceError {
+    Unmounted,
+    NoDevice,
+    NotFat32,
+    Failed,
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MountStatus {
     NoDevice,
@@ -14,8 +61,100 @@ pub enum MountStatus {
     Failed,
 }
 
+fn status_code(status: MountStatus) -> u8 {
+    match status {
+        MountStatus::NoDevice => MOUNT_NO_DEVICE,
+        MountStatus::NotFat32 => MOUNT_NOT_FAT32,
+        MountStatus::Mounted(_) => MOUNT_MOUNTED,
+        MountStatus::Failed => MOUNT_FAILED,
+    }
+}
+
+fn lifecycle_from_code(code: u8) -> MountLifecycleStatus {
+    match code {
+        MOUNT_NO_DEVICE => MountLifecycleStatus::NoDevice,
+        MOUNT_NOT_FAT32 => MountLifecycleStatus::NotFat32,
+        MOUNT_MOUNTED => MountLifecycleStatus::Mounted,
+        MOUNT_FAILED => MountLifecycleStatus::Failed,
+        MOUNT_UNMOUNTED => MountLifecycleStatus::Unmounted,
+        _ => MountLifecycleStatus::Unknown,
+    }
+}
+
+fn record_mount_status(status: MountStatus) {
+    MNT_STATUS.store(status_code(status), Ordering::Release);
+    match status {
+        MountStatus::Mounted(count) => {
+            MNT_IMPORTED.store(count, Ordering::Release);
+            MNT_DIRTY.store(false, Ordering::Release);
+        }
+        _ => {
+            MNT_IMPORTED.store(0, Ordering::Release);
+            MNT_DIRTY.store(false, Ordering::Release);
+        }
+    }
+}
+
+pub fn mount_info() -> MountInfo {
+    MountInfo {
+        status: lifecycle_from_code(MNT_STATUS.load(Ordering::Acquire)),
+        imported_entries: MNT_IMPORTED.load(Ordering::Acquire),
+        dirty: MNT_DIRTY.load(Ordering::Acquire),
+        sync_count: MNT_SYNCS.load(Ordering::Acquire),
+    }
+}
+
+pub fn mnt_mounted() -> bool {
+    MNT_STATUS.load(Ordering::Acquire) == MOUNT_MOUNTED
+}
+
+pub fn mark_mnt_dirty() {
+    if mnt_mounted() {
+        MNT_DIRTY.store(true, Ordering::Release);
+    }
+}
+
+fn mark_mnt_clean() {
+    MNT_DIRTY.store(false, Ordering::Release);
+}
+
+fn mnt_path(path: &str) -> bool {
+    path == "/mnt" || path.starts_with("/mnt/")
+}
+
+fn unavailable_ensure_error() -> EnsureError {
+    match lifecycle_from_code(MNT_STATUS.load(Ordering::Acquire)) {
+        MountLifecycleStatus::NoDevice => EnsureError::NoDevice,
+        MountLifecycleStatus::NotFat32 => EnsureError::NotFat32,
+        MountLifecycleStatus::Failed => EnsureError::Failed,
+        _ => EnsureError::Unmounted,
+    }
+}
+
+fn unavailable_persist_error() -> PersistError {
+    match lifecycle_from_code(MNT_STATUS.load(Ordering::Acquire)) {
+        MountLifecycleStatus::NoDevice => PersistError::NoDevice,
+        _ => PersistError::Unmounted,
+    }
+}
+
+fn unavailable_mutation_error() -> MutationError {
+    match lifecycle_from_code(MNT_STATUS.load(Ordering::Acquire)) {
+        MountLifecycleStatus::NoDevice => MutationError::NoDevice,
+        _ => MutationError::Unmounted,
+    }
+}
+
+fn unavailable_space_error() -> SpaceError {
+    match lifecycle_from_code(MNT_STATUS.load(Ordering::Acquire)) {
+        MountLifecycleStatus::NoDevice => SpaceError::NoDevice,
+        MountLifecycleStatus::NotFat32 => SpaceError::NotFat32,
+        MountLifecycleStatus::Failed => SpaceError::Failed,
+        _ => SpaceError::Unmounted,
+    }
+}
 pub fn mount_ata_root() -> MountStatus {
-    ata::with_primary_master(|disk| {
+    let status = ata::with_primary_master(|disk| {
         let direct = mount_device(disk);
         if direct != MountStatus::NotFat32 {
             if matches!(direct, MountStatus::Mounted(_)) {
@@ -45,7 +184,9 @@ pub fn mount_ata_root() -> MountStatus {
             Err(_) => MountStatus::Failed,
         }
     })
-    .unwrap_or(MountStatus::NoDevice)
+    .unwrap_or(MountStatus::NoDevice);
+    record_mount_status(status);
+    status
 }
 
 fn mount_partition(
@@ -249,6 +390,9 @@ pub fn self_test() -> bool {
 /// primary ATA master, mounts FAT32 (superfloppy / MBR / GPT), resolves the relative
 /// path, and imports the file or directory into the VFS.
 pub fn ensure_path(path: &str) -> Result<(), EnsureError> {
+    if mnt_path(path) && !mnt_mounted() {
+        return Err(unavailable_ensure_error());
+    }
     if vfs::stat(path).is_ok() {
         return Ok(());
     }
@@ -363,6 +507,7 @@ fn map_fat_err(err: fat32::Error) -> EnsureError {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EnsureError {
+    Unmounted,
     NoDevice,
     NotFat32,
     NotFound,
@@ -375,6 +520,7 @@ pub enum EnsureError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistError {
+    Unmounted,
     NotSupported,
     NotFound,
     NoDevice,
@@ -385,6 +531,7 @@ pub enum PersistError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationError {
+    Unmounted,
     NotSupported,
     NotFound,
     NoDevice,
@@ -466,6 +613,32 @@ pub fn live_mutation_self_test() -> LiveMutationTestStatus {
 
     if let Err(stage) = live_directory_growth_self_test() {
         return LiveMutationTestStatus::Failed(stage);
+    }
+    if df_mnt().is_err() {
+        return LiveMutationTestStatus::Failed("df");
+    }
+    match fscheck_mnt() {
+        Ok(report) if report.fs_info_matches => {}
+        Ok(_) => return LiveMutationTestStatus::Failed("fsinfo mismatch"),
+        Err(_) => return LiveMutationTestStatus::Failed("fscheck"),
+    }
+    if sync_all_mounted().is_err() {
+        return LiveMutationTestStatus::Failed("sync");
+    }
+    if mount_info().dirty {
+        return LiveMutationTestStatus::Failed("sync dirty");
+    }
+    if unmount_mnt().is_err() {
+        return LiveMutationTestStatus::Failed("umount");
+    }
+    if ensure_path("/mnt/cache.txt") != Err(EnsureError::Unmounted) {
+        return LiveMutationTestStatus::Failed("umount ensure guard");
+    }
+    if persist_path("/mnt/cache.txt") != Err(PersistError::Unmounted) {
+        return LiveMutationTestStatus::Failed("umount persist guard");
+    }
+    if !matches!(remount_mnt(), MountStatus::Mounted(_)) || !mnt_mounted() {
+        return LiveMutationTestStatus::Failed("remount");
     }
 
     LiveMutationTestStatus::Passed
@@ -621,6 +794,9 @@ pub fn persist_path(path: &str) -> Result<(), PersistError> {
     if !path.starts_with("/mnt/") {
         return Err(PersistError::NotSupported);
     }
+    if !mnt_mounted() {
+        return Err(unavailable_persist_error());
+    }
     let relative = &path[5..];
     if relative.is_empty() {
         return Err(PersistError::BadName);
@@ -661,7 +837,11 @@ fn persist_on_device(
     FILE_PAGES.lock().invalidate();
     let result = persist_on_cached_device(device, path, data);
     let flushed = device.flush().map_err(|_| PersistError::Failed);
-    result.and(flushed)
+    let status = result.and(flushed);
+    if status.is_ok() {
+        mark_mnt_dirty();
+    }
+    status
 }
 
 fn persist_on_cached_device(
@@ -700,10 +880,17 @@ fn persist_on_cached_device(
 /// Persist a VFS directory under `/mnt/`, creating missing FAT32 components.
 pub fn persist_directory(path: &str) -> Result<(), PersistError> {
     if path == "/mnt" {
-        return Ok(());
+        return if mnt_mounted() {
+            Ok(())
+        } else {
+            Err(unavailable_persist_error())
+        };
     }
     if !path.starts_with("/mnt/") {
         return Err(PersistError::NotSupported);
+    }
+    if !mnt_mounted() {
+        return Err(unavailable_persist_error());
     }
     let relative = &path[5..];
     if relative.is_empty() {
@@ -725,7 +912,11 @@ pub fn persist_directory(path: &str) -> Result<(), PersistError> {
     FILE_PAGES.lock().invalidate();
     let result = mkdir_on_cached_device(&mut disk, relative);
     let flushed = disk.flush().map_err(|_| PersistError::Failed);
-    result.and(flushed)
+    let status = result.and(flushed);
+    if status.is_ok() {
+        mark_mnt_dirty();
+    }
+    status
 }
 
 fn mkdir_on_cached_device(
@@ -758,6 +949,9 @@ pub fn delete_path(path: &str) -> Result<(), MutationError> {
     if path == "/mnt" || !path.starts_with("/mnt/") {
         return Err(MutationError::NotSupported);
     }
+    if !mnt_mounted() {
+        return Err(unavailable_mutation_error());
+    }
     let relative = &path[5..];
     validate_fat_relative(relative)?;
     if !block_io::primary_ata_present() {
@@ -770,7 +964,11 @@ pub fn delete_path(path: &str) -> Result<(), MutationError> {
     FILE_PAGES.lock().invalidate();
     let result = delete_on_cached_device(&mut disk, relative);
     let flushed = disk.flush().map_err(|_| MutationError::Failed);
-    result.and(flushed)
+    let status = result.and(flushed);
+    if status.is_ok() {
+        mark_mnt_dirty();
+    }
+    status
 }
 
 fn delete_on_cached_device(
@@ -803,6 +1001,9 @@ pub fn rename_path(old: &str, new: &str) -> Result<(), MutationError> {
     if old == "/mnt" || new == "/mnt" || !old.starts_with("/mnt/") || !new.starts_with("/mnt/") {
         return Err(MutationError::NotSupported);
     }
+    if !mnt_mounted() {
+        return Err(unavailable_mutation_error());
+    }
     let old_relative = &old[5..];
     let new_relative = &new[5..];
     validate_fat_relative(old_relative)?;
@@ -817,7 +1018,11 @@ pub fn rename_path(old: &str, new: &str) -> Result<(), MutationError> {
     FILE_PAGES.lock().invalidate();
     let result = rename_on_cached_device(&mut disk, old_relative, new_relative);
     let flushed = disk.flush().map_err(|_| MutationError::Failed);
-    result.and(flushed)
+    let status = result.and(flushed);
+    if status.is_ok() {
+        mark_mnt_dirty();
+    }
+    status
 }
 
 fn rename_on_cached_device(
@@ -895,12 +1100,132 @@ fn map_persist_err(err: fat32::Error) -> PersistError {
 
 #[allow(dead_code)]
 pub fn fat32_writable() -> bool {
-    true
+    mnt_mounted() && block_io::primary_ata_present()
+}
+
+pub fn remount_mnt() -> MountStatus {
+    FILE_PAGES.lock().invalidate();
+    mount_ata_root()
+}
+
+pub fn unmount_mnt() -> Result<(), MountControlError> {
+    if !mnt_mounted() {
+        return Err(
+            match lifecycle_from_code(MNT_STATUS.load(Ordering::Acquire)) {
+                MountLifecycleStatus::NoDevice => MountControlError::NoDevice,
+                _ => MountControlError::NotMounted,
+            },
+        );
+    }
+    sync_all_mounted().map_err(|_| MountControlError::SyncFailed)?;
+    FILE_PAGES.lock().invalidate();
+    if !block_io::primary_ata_present() {
+        record_mount_status(MountStatus::NoDevice);
+        return Err(MountControlError::NoDevice);
+    }
+    let mut disk = block_io::primary_ata();
+    if disk.flush().is_err() {
+        return Err(MountControlError::Failed);
+    }
+    MNT_STATUS.store(MOUNT_UNMOUNTED, Ordering::Release);
+    MNT_IMPORTED.store(0, Ordering::Release);
+    mark_mnt_clean();
+    Ok(())
+}
+
+pub fn df_mnt() -> Result<fat32::SpaceInfo, SpaceError> {
+    if !mnt_mounted() {
+        return Err(unavailable_space_error());
+    }
+    if !block_io::primary_ata_present() {
+        return Err(SpaceError::NoDevice);
+    }
+    let mut disk = block_io::primary_ata();
+    df_on_device(&mut disk)
+}
+
+pub fn fscheck_mnt() -> Result<fat32::CheckReport, SpaceError> {
+    if !mnt_mounted() {
+        return Err(unavailable_space_error());
+    }
+    if !block_io::primary_ata_present() {
+        return Err(SpaceError::NoDevice);
+    }
+    let mut disk = block_io::primary_ata();
+    check_on_device(&mut disk)
+}
+
+fn df_on_device(
+    device: &mut impl crate::block::BlockDevice,
+) -> Result<fat32::SpaceInfo, SpaceError> {
+    match fat32::mount(device) {
+        Ok(volume) => return fat32::space_info(device, volume).map_err(map_space_err),
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
+        Err(_) => return Err(SpaceError::Failed),
+    }
+    match partition::find_fat32(device) {
+        Ok(Some(part)) => {
+            let mut view =
+                partition::PartitionDevice::new(device, part).map_err(|_| SpaceError::Failed)?;
+            let volume = fat32::mount(&mut view).map_err(map_space_err)?;
+            fat32::space_info(&mut view, volume).map_err(map_space_err)
+        }
+        Ok(None) => match gpt::find_fat_partition(device) {
+            Ok(Some(part)) => {
+                let mut view = partition::PartitionDevice::new(device, part)
+                    .map_err(|_| SpaceError::Failed)?;
+                let volume = fat32::mount(&mut view).map_err(map_space_err)?;
+                fat32::space_info(&mut view, volume).map_err(map_space_err)
+            }
+            Ok(None) | Err(gpt::Error::MissingProtectiveMbr) => Err(SpaceError::NotFat32),
+            Err(_) => Err(SpaceError::Failed),
+        },
+        Err(_) => Err(SpaceError::Failed),
+    }
+}
+
+fn check_on_device(
+    device: &mut impl crate::block::BlockDevice,
+) -> Result<fat32::CheckReport, SpaceError> {
+    match fat32::mount(device) {
+        Ok(volume) => return fat32::check_volume(device, volume).map_err(map_space_err),
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
+        Err(_) => return Err(SpaceError::Failed),
+    }
+    match partition::find_fat32(device) {
+        Ok(Some(part)) => {
+            let mut view =
+                partition::PartitionDevice::new(device, part).map_err(|_| SpaceError::Failed)?;
+            let volume = fat32::mount(&mut view).map_err(map_space_err)?;
+            fat32::check_volume(&mut view, volume).map_err(map_space_err)
+        }
+        Ok(None) => match gpt::find_fat_partition(device) {
+            Ok(Some(part)) => {
+                let mut view = partition::PartitionDevice::new(device, part)
+                    .map_err(|_| SpaceError::Failed)?;
+                let volume = fat32::mount(&mut view).map_err(map_space_err)?;
+                fat32::check_volume(&mut view, volume).map_err(map_space_err)
+            }
+            Ok(None) | Err(gpt::Error::MissingProtectiveMbr) => Err(SpaceError::NotFat32),
+            Err(_) => Err(SpaceError::Failed),
+        },
+        Err(_) => Err(SpaceError::Failed),
+    }
+}
+
+fn map_space_err(error: fat32::Error) -> SpaceError {
+    match error {
+        fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry => SpaceError::NotFat32,
+        _ => SpaceError::Failed,
+    }
 }
 
 /// Best-effort walk of every VFS file under `/mnt/` and persist each one.
 /// Returns the number of files successfully written.
 pub fn sync_all_mounted() -> Result<usize, PersistError> {
+    if !mnt_mounted() {
+        return Err(unavailable_persist_error());
+    }
     // Snapshot names while holding VFS; persistence reacquires VFS to read data.
     // Never call persist_path from the registry's locked callback.
     let mut paths = alloc::vec::Vec::new();
@@ -921,14 +1246,18 @@ pub fn sync_all_mounted() -> Result<usize, PersistError> {
         if disk.flush().is_err() {
             failed = true;
         }
+    } else {
+        failed = true;
     }
     if failed {
+        mark_mnt_dirty();
         Err(PersistError::Failed)
     } else {
+        mark_mnt_clean();
+        MNT_SYNCS.fetch_add(1, Ordering::AcqRel);
         Ok(ok)
     }
 }
-
 // Lock order: ATA device, then file pages. Never call VFS while holding pages.
 static FILE_PAGES: spin::Mutex<crate::page_cache::PageCache<16>> =
     spin::Mutex::new(crate::page_cache::PageCache::new());
@@ -942,6 +1271,9 @@ pub fn read_disk_file(
     offset: usize,
     output: &mut [u8],
 ) -> Result<usize, crate::block::Error> {
+    if !mnt_mounted() {
+        return Err(crate::block::Error::DeviceFault);
+    }
     let relative = path
         .strip_prefix("/mnt/")
         .ok_or(crate::block::Error::InvalidBuffer)?;

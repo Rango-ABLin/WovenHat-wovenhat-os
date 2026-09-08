@@ -86,6 +86,17 @@ and directory moves into their own descendants are rejected before metadata is
 changed where possible. Successful mutations invalidate file pages and flush the
 sector cache before returning.
 
+`/mnt` now has an explicit lifecycle state independent of whatever VFS entries
+remain in RAM. `sync` walks VFS files below `/mnt`, persists them to FAT32,
+flushes ATA, and clears the mount dirty flag only on success. `umount /mnt`
+runs that sync, invalidates clean file pages, flushes again, and marks the mount
+unavailable; shell and userspace file paths then reject `/mnt` reads, writes,
+mkdir, rm, rename, stat, cd, and executable loads until `mount /mnt`, `remount`,
+or `rescan` successfully imports the FAT32 volume again. `df /mnt` reports actual
+free clusters by scanning the FAT and compares them with FSInfo hints.
+`fscheck /mnt` validates the root and bounded directory tree chains, reports file
+and directory counts, and flags FSInfo free-count mismatches.
+
 Current FAT32 mutation limits are deliberate: only short 8.3 names are created,
 long-filename entries are skipped rather than generated, and there is no journal
 or power-loss-atomic metadata transaction. Full directories now grow by linking a
@@ -98,7 +109,7 @@ Next storage increments:
 1. Backup-GPT validation and extended/logical MBR partitions.
 2. Secondary-channel and slave-device ATA discovery.
 3. Hardware interrupt/DMA-backed completion for AHCI, NVMe, or virtio-blk.
-4. FAT32 long filename creation, safe unmount UX, and crash-safe metadata
+4. FAT32 long filename creation and crash-safe metadata
    ordering.
 5. Deeper than 2-level import / on-demand path resolution into VFS.
 
@@ -114,4 +125,4 @@ writes, and VFS disk-backing rename semantics. `scripts/test-storage-qemu.py`
 adds a live disposable-ATA regression that creates `/mnt/tmutd/a.txt`, persists
 it, renames the directory to `/mnt/tmuta`, verifies the old path is gone and the
 new file reads back, then fills real FAT32 directories enough to force growth and
-renames a file into a full destination directory.
+renames a file into a full destination directory, runs `df` and `fscheck`, syncs the mounted VFS view, verifies unmounted `/mnt` paths are rejected, and remounts the volume.
