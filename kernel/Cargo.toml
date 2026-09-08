@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 qemu-test = []
+legacy-pic-test = ["qemu-test"]
 
 [dependencies]
 bootloader_api = "0.11.17"

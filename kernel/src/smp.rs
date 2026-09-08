@@ -148,6 +148,12 @@ pub fn routed_irq() -> bool {
 }
 
 pub fn start(topology: Option<crate::hal::acpi::Summary>, offset: u64) {
+    // Test the missing-topology fallback without disabling ACPI in UEFI itself.
+    let topology = if cfg!(feature = "legacy-pic-test") {
+        None
+    } else {
+        topology
+    };
     let Some(topology) = topology else {
         serial::write_line(format_args!(
             "[SMP] online=1 expected=1 legacy PIC fallback"

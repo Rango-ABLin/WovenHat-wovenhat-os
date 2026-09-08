@@ -28,7 +28,7 @@ Run from the repository root:
 
 ```powershell
 python scripts/test-release.py
-python scripts/test-shell-qemu.py
+python scripts/package-release.py
 ```
 
 Linux/alternate installations must supply `--qemu` and `--firmware` paths.
@@ -39,10 +39,12 @@ The automated gates cover:
 
 1. Strict kernel and host Clippy checks.
 2. Standalone cache, file-mapping and FAT32 host regressions.
-3. Complete debug boot on 1, 2 and 4 CPUs, both diskless and with disposable ATA/FAT32.
-4. Optimized 4-CPU boot, both diskless and with disposable ATA/FAT32.
-5. Normal optimized image build.
-6. A separate normal-image keyboard smoke test: QMP injects PS/2 keys for `smptest`,
+3. A forced missing-topology/PIC fallback boot (`legacy-pic-test`); ACPI remains
+   enabled for the UEFI firmware so the test exercises the kernel fallback.
+4. Complete debug boot on 1, 2 and 4 CPUs, both diskless and with disposable ATA/FAT32.
+5. Optimized 4-CPU boot, both diskless and with disposable ATA/FAT32.
+6. Normal optimized image build.
+7. A normal-image keyboard smoke test: QMP injects PS/2 keys for `smptest`,
    which must execute through the IOAPIC and complete all SMP checks.
 
 SMP checkpoints require an exact online CPU count, an all-CPU execution barrier,
@@ -54,6 +56,10 @@ Storage tests now require the complete boot-suite success marker and QEMU exit 3
 rather than terminating as soon as the first storage checkpoint appears. They
 only recreate disks under `target/storage-regression-*`; the runtime data disk
 is not used by these tests.
+
+The package command verifies the recorded image/source hashes and writes the
+UEFI image, checksum, release notes and validation evidence under
+`target/releases/0.8.0/`. This is local packaging, not publication or signing.
 
 ## Try the release
 

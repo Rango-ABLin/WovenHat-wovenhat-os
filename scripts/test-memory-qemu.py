@@ -25,7 +25,7 @@ def main():
         parser.error('Set --qemu and --firmware to existing QEMU and OVMF files.')
     env = os.environ.copy()
     image = subprocess.check_output(
-        ['cargo', 'run', '--quiet'] + (['--release'] if args.release else []) + ['--features', 'qemu-test', '--', '--print-image'],
+        ['cargo', 'run', '--quiet'] + (['--release'] if args.release else []) + ['--features', 'legacy-pic-test' if args.legacy_irq else 'qemu-test', '--', '--print-image'],
         cwd=root, env=env, text=True).strip()
     out = root / 'target' / f'memory-regression-{args.cpus}-{"release" if args.release else "debug"}{"-legacy" if args.legacy_irq else ""}'
     out.mkdir(parents=True, exist_ok=True)
@@ -37,8 +37,6 @@ def main():
                '-drive', f'if=pflash,format=raw,readonly=on,file={firmware}',
                '-drive', f'if=none,id=boot,format=raw,readonly=on,file={image}',
                '-device', 'virtio-blk-pci,drive=boot,bootindex=1']
-    if args.legacy_irq:
-        command.extend(['-no-acpi'])
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     try:
         result = subprocess.run(command, cwd=root, capture_output=True, text=True,

@@ -1,5 +1,6 @@
 """Build and verify the WovenHat multicore foundation release; fail on any gate."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,16 @@ def main():
         run(f'{suite}-4-release', [sys.executable, f'scripts/test-{suite}-qemu.py', '--cpus', '4', '--release'] + options)
     run('build-release', ['cargo', 'build', '--release'])
     run('shell-smoke', [sys.executable, 'scripts/test-shell-qemu.py'] + options)
+    image = Path(subprocess.check_output(['cargo', 'run', '--quiet', '--release', '--', '--print-image'], cwd=root, text=True).strip())
+    sources = [root / name for name in ('Cargo.toml', 'Cargo.lock', 'kernel/Cargo.toml', 'build.rs', 'rust-toolchain.toml', '.cargo/config.toml')]
+    sources += sorted((root / 'kernel' / 'src').rglob('*.rs'))
+    sources += sorted((root / 'kernel' / 'src').rglob('*.S'))
+    sources += sorted((root / 'src').rglob('*.rs'))
+    sources += sorted((root / 'scripts').glob('test-*.py'))
+    manifest = dict(image=str(image), image_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                    checks_sha256=hashlib.sha256((out / 'results.json').read_bytes()).hexdigest(),
+                    sources={str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources})
+    (out / 'validated-image.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     print('All release gates passed. Report:', out / 'results.json')
     return 0
 
