@@ -55,3 +55,8 @@ pub const MAX_HEAP_ALLOCATIONS: usize = 512;
 
 /// Global open-file description table capacity (refcount-shared across processes).
 pub const MAX_OPEN_FILES: usize = 64;
+
+/// Outstanding lazy file-page faults owned by the bounded pager worker.
+/// A full queue is treated as an unresolvable user fault; it never grows the
+/// kernel heap while handling an exception.
+pub const MAX_PAGER_REQUESTS: usize = 16;

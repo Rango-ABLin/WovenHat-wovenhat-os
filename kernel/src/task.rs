@@ -8,7 +8,7 @@ use spin::Mutex;
 
 use crate::{
     capability::{Capability, CapabilitySet},
-    config::{MAX_FILE_DESCRIPTORS, MAX_PROCESSES, MAX_TASKS, TASK_STACK_SIZE},
+    config::{MAX_FILE_DESCRIPTORS, MAX_PAGER_REQUESTS, MAX_PROCESSES, MAX_TASKS, TASK_STACK_SIZE},
     gdt, ipc, paging, timer, userspace, vfs,
 };
 
@@ -24,6 +24,10 @@ static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 static PREEMPTION_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PREEMPTION_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static TASK_STACKS: [TaskStack; MAX_TASKS] = [const { TaskStack::new() }; MAX_TASKS];
+static PAGER: Mutex<PagerQueue> = Mutex::new(PagerQueue::empty());
+static PAGER_TASK: Mutex<Option<TaskId>> = Mutex::new(None);
+static PAGER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 
 global_asm!(
     ".global wovenhat_context_switch",
@@ -496,6 +500,65 @@ struct ContextSwitch {
     next_rsp: u64,
     next_address_space: paging::AddressSpace,
 }
+#[derive(Clone, Copy)]
+struct PagerRequest {
+    task: TaskId,
+    space: userspace::AddressSpace,
+    slot: usize,
+    mapping: userspace::AnonymousMapping,
+    address: u64,
+    write: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PagerCompletion {
+    task: TaskId,
+    address: u64,
+    succeeded: bool,
+}
+
+struct PagerQueue {
+    entries: [Option<PagerRequest>; MAX_PAGER_REQUESTS],
+    completions: [Option<PagerCompletion>; MAX_PAGER_REQUESTS],
+}
+
+impl PagerQueue {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; MAX_PAGER_REQUESTS],
+            completions: [None; MAX_PAGER_REQUESTS],
+        }
+    }
+
+    fn push(&mut self, request: PagerRequest) -> bool {
+        let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) else {
+            return false;
+        };
+        *slot = Some(request);
+        true
+    }
+
+    fn pop(&mut self) -> Option<PagerRequest> {
+        self.entries.iter_mut().find_map(Option::take)
+    }
+
+    fn finish(&mut self, completion: PagerCompletion) -> bool {
+        let Some(slot) = self.completions.iter_mut().find(|entry| entry.is_none()) else {
+            return false;
+        };
+        *slot = Some(completion);
+        true
+    }
+
+    fn take_completion(&mut self, task: TaskId, address: u64) -> Option<bool> {
+        let slot = self.completions.iter().position(|entry| {
+            entry.is_some_and(|completion| completion.task == task && completion.address == address)
+        })?;
+        self.completions[slot]
+            .take()
+            .map(|completion| completion.succeeded)
+    }
+}
 struct Scheduler {
     tasks: [TaskControlBlock; MAX_TASKS],
     current_slot: usize,
@@ -799,11 +862,15 @@ pub fn file_fault_io<T>(operation: impl FnOnce() -> T) -> T {
     x86_64::instructions::interrupts::disable();
     FILE_IO_DEPTH.fetch_add(1, Ordering::AcqRel);
     let initialized = SCHEDULER.lock().task_count != 0;
-    if initialized { x86_64::instructions::interrupts::enable(); }
+    if initialized {
+        x86_64::instructions::interrupts::enable();
+    }
     let result = operation();
     x86_64::instructions::interrupts::disable();
     FILE_IO_DEPTH.fetch_sub(1, Ordering::AcqRel);
-    if enabled { x86_64::instructions::interrupts::enable(); }
+    if enabled {
+        x86_64::instructions::interrupts::enable();
+    }
     result
 }
 
@@ -812,33 +879,141 @@ pub fn file_fault_io_self_test() -> bool {
     let id = current_task_id();
     let passed = file_fault_io(|| {
         let start = timer::ticks();
-        while timer::ticks().wrapping_sub(start) < 2 { x86_64::instructions::hlt(); }
-        x86_64::instructions::interrupts::are_enabled() && current_task_id() == id
+        while timer::ticks().wrapping_sub(start) < 2 {
+            x86_64::instructions::hlt();
+        }
+        x86_64::instructions::interrupts::are_enabled()
+            && current_task_id() == id
             && FILE_IO_DEPTH.load(Ordering::Acquire) == 1
     });
-    passed && x86_64::instructions::interrupts::are_enabled() == enabled
+    passed
+        && x86_64::instructions::interrupts::are_enabled() == enabled
         && FILE_IO_DEPTH.load(Ordering::Acquire) == 0
 }
 
+/// Queue an absent lazy file page for the pager task and suspend this task's
+/// exception frame. When it runs again, the same page-fault handler returns
+/// normally and `iretq` retries the original user instruction.
 pub fn try_handle_file_fault(address: u64, write: bool) -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let task_id = current_task_id();
-        let (space, slot, mut mapping) = {
+        let (space, slot, mapping) = {
             let processes = PROCESS_TABLE.lock();
-            let Some(process) = processes.iter().flatten().find(|p| p.task_id == task_id) else { return false; };
-            let Some(space) = process.address_space else { return false; };
-            let Some((slot, mapping)) = process.memory_mappings.iter().enumerate().find_map(|(slot, m)|
-                m.filter(|m| address >= m.address && address < m.address + m.size as u64).map(|m| (slot, m))) else { return false; };
+            let Some(process) = processes.iter().flatten().find(|p| p.task_id == task_id) else {
+                return false;
+            };
+            let Some(space) = process.address_space else {
+                return false;
+            };
+            let Some((slot, mapping)) =
+                process
+                    .memory_mappings
+                    .iter()
+                    .enumerate()
+                    .find_map(|(slot, m)| {
+                        m.filter(|m| address >= m.address && address < m.address + m.size as u64)
+                            .map(|m| (slot, m))
+                    })
+            else {
+                return false;
+            };
             (space, slot, mapping)
         };
-        if !userspace::populate_file_page(space, &mut mapping, address, write) { return false; }
-        let mut processes = PROCESS_TABLE.lock();
-        let Some(process) = processes.iter_mut().flatten().find(|p| p.task_id == task_id) else { return false; };
-        process.memory_mappings[slot] = Some(mapping);
-        true
+        if !PAGER.lock().push(PagerRequest {
+            task: task_id,
+            space,
+            slot,
+            mapping,
+            address,
+            write,
+        }) {
+            return false;
+        }
+        PAGER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        if let Some(pager) = *PAGER_TASK.lock() {
+            let _ = wake_task(pager);
+        }
+        block_current_from_exception();
+        PAGER
+            .lock()
+            .take_completion(task_id, address)
+            .unwrap_or(false)
     })
 }
 
+fn block_current_from_exception() {
+    let switch = {
+        let mut scheduler = SCHEDULER.lock();
+        let slot = scheduler.current_slot;
+        assert!(
+            scheduler.tasks[slot].id != KERNEL_TASK_ID,
+            "kernel task cannot fault-block"
+        );
+        scheduler.tasks[slot].state = TaskState::Blocked;
+        scheduler.prepare_switch()
+    };
+    if let Some(context_switch) = switch {
+        // The saved context includes the CPU exception frame. Resuming this
+        // task returns to the page-fault handler, then hardware retries RIP.
+        unsafe { switch_stacks(context_switch) };
+    }
+}
+
+fn pager_task() -> ! {
+    loop {
+        let Some(request) = PAGER.lock().pop() else {
+            sleep_current(1);
+            continue;
+        };
+        let mut mapping = request.mapping;
+        let succeeded = userspace::populate_file_page(
+            request.space,
+            &mut mapping,
+            request.address,
+            request.write,
+        );
+        if succeeded {
+            let mut processes = PROCESS_TABLE.lock();
+            if let Some(process) = processes
+                .iter_mut()
+                .flatten()
+                .find(|p| p.task_id == request.task)
+            {
+                process.memory_mappings[request.slot] = Some(mapping);
+            }
+        }
+        let recorded = PAGER.lock().finish(PagerCompletion {
+            task: request.task,
+            address: request.address,
+            succeeded,
+        });
+        PAGER_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+        if recorded {
+            let _ = wake_task(request.task);
+        }
+    }
+}
+
+/// Start the single BSP pager worker after scheduler and timer initialization.
+pub fn start_pager() -> bool {
+    if PAGER_TASK.lock().is_some() {
+        return true;
+    }
+    match spawn_with_priority("pager", pager_task, TaskPriority::LOW) {
+        Ok(id) => {
+            *PAGER_TASK.lock() = Some(id);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn pager_stats() -> (u64, u64) {
+    (
+        PAGER_REQUESTS.load(Ordering::Acquire),
+        PAGER_COMPLETIONS.load(Ordering::Acquire),
+    )
+}
 /// Attempt to resolve a user write fault via copy-on-write.
 /// Returns true if the fault was handled and the process may resume.
 pub fn try_handle_cow_fault(fault_address: u64) -> bool {
@@ -1356,7 +1531,8 @@ pub fn mmap_file_current(
         userspace::map_file_lazy(address_space, slot, file, offset, length, writable)
     } else {
         userspace::map_file_private(address_space, slot, file, offset, length, writable)
-    }.ok_or(MemoryError::MappingFailed)?;
+    }
+    .ok_or(MemoryError::MappingFailed)?;
     let mut processes = PROCESS_TABLE.lock();
     if let Some(process) = processes[index].as_mut().filter(|p| p.task_id == task_id) {
         if process.memory_mappings[slot].is_none() {
@@ -1369,16 +1545,39 @@ pub fn mmap_file_current(
 }
 
 pub fn msync_current(address: u64, length: u64) -> Result<(), MemoryError> {
-    if !current_has(Capability::FileWrite) { return Err(MemoryError::PermissionDenied); }
-    let size = length.checked_add(4095).filter(|_| length != 0).ok_or(MemoryError::InvalidLength)? & !4095;
+    if !current_has(Capability::FileWrite) {
+        return Err(MemoryError::PermissionDenied);
+    }
+    let size = length
+        .checked_add(4095)
+        .filter(|_| length != 0)
+        .ok_or(MemoryError::InvalidLength)?
+        & !4095;
     let task_id = current_task_id();
     let (space, mapping) = {
         let processes = PROCESS_TABLE.lock();
-        let process = processes.iter().flatten().find(|p| p.task_id == task_id).ok_or(MemoryError::NoProcess)?;
-        let mapping = process.memory_mappings.iter().flatten().find(|m| m.address == address && size == m.size as u64).copied().ok_or(MemoryError::NotFound)?;
-        (process.address_space.ok_or(MemoryError::NoProcess)?, mapping)
+        let process = processes
+            .iter()
+            .flatten()
+            .find(|p| p.task_id == task_id)
+            .ok_or(MemoryError::NoProcess)?;
+        let mapping = process
+            .memory_mappings
+            .iter()
+            .flatten()
+            .find(|m| m.address == address && size == m.size as u64)
+            .copied()
+            .ok_or(MemoryError::NotFound)?;
+        (
+            process.address_space.ok_or(MemoryError::NoProcess)?,
+            mapping,
+        )
     };
-    if userspace::sync_file_mapping(space, mapping, true) { Ok(()) } else { Err(MemoryError::MappingFailed) }
+    if userspace::sync_file_mapping(space, mapping, true) {
+        Ok(())
+    } else {
+        Err(MemoryError::MappingFailed)
+    }
 }
 
 pub fn munmap_current(address: u64, length: u64) -> Result<(), MemoryError> {
@@ -1901,7 +2100,9 @@ pub fn tick() {
     }
 }
 pub fn preempt_from_interrupt() {
-    if FILE_IO_DEPTH.load(Ordering::Acquire) != 0 { return; }
+    if FILE_IO_DEPTH.load(Ordering::Acquire) != 0 {
+        return;
+    }
     if !PREEMPTION_REQUESTED.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -1958,15 +2159,14 @@ pub fn block_current() {
 
 pub fn wake_task(id: TaskId) -> bool {
     let mut scheduler = SCHEDULER.lock();
-    let Some(task) = scheduler
-        .tasks
-        .iter_mut()
-        .find(|task| task.id == id && task.state == TaskState::Blocked)
-    else {
+    let Some(task) = scheduler.tasks.iter_mut().find(|task| {
+        task.id == id && matches!(task.state, TaskState::Blocked | TaskState::Sleeping)
+    }) else {
         return false;
     };
 
     task.state = TaskState::Ready;
+    task.wake_tick = 0;
     true
 }
 

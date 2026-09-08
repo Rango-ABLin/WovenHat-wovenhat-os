@@ -253,10 +253,20 @@ impl Shell {
                 }
             }
             "msynctest" => {
-                if authorize(Capability::FileRead, console) && authorize(Capability::FileWrite, console) {
-                    let passed = userspace::shared_disk_mmap_self_test() && userspace::disk_unlink_mmap_self_test();
-                    console.println(if passed { "MSYNC DISK: PASS" } else { "MSYNC DISK: FAIL (check ATA disk or existing /mnt/vmsync.txt)" });
-                    crate::serial::write_line(format_args!("[MSYNC DISK] {}", if passed { "PASSED" } else { "FAILED" }));
+                if authorize(Capability::FileRead, console)
+                    && authorize(Capability::FileWrite, console)
+                {
+                    let passed = userspace::shared_disk_mmap_self_test()
+                        && userspace::disk_unlink_mmap_self_test();
+                    console.println(if passed {
+                        "MSYNC DISK: PASS"
+                    } else {
+                        "MSYNC DISK: FAIL (check ATA disk or existing /mnt/vmsync.txt)"
+                    });
+                    crate::serial::write_line(format_args!(
+                        "[MSYNC DISK] {}",
+                        if passed { "PASSED" } else { "FAILED" }
+                    ));
                 }
             }
             "mmaptest" => {

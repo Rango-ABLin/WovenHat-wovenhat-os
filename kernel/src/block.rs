@@ -10,17 +10,27 @@ pub enum Error {
 
 pub trait BlockDevice {
     fn sector_count(&self) -> u64;
-    fn is_read_only(&self) -> bool { false }
+    fn is_read_only(&self) -> bool {
+        false
+    }
     /// Drain software buffers to the device. Hardware durability is device-specific.
-    fn flush(&mut self) -> Result<(), Error> { Ok(()) }
+    fn flush(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
     fn read_sector(&mut self, lba: u64, sector: &mut [u8]) -> Result<(), Error>;
     fn write_sector(&mut self, lba: u64, sector: &[u8]) -> Result<(), Error>;
 }
 
 impl<D: BlockDevice + ?Sized> BlockDevice for &mut D {
-    fn sector_count(&self) -> u64 { (**self).sector_count() }
-    fn is_read_only(&self) -> bool { (**self).is_read_only() }
-    fn flush(&mut self) -> Result<(), Error> { (**self).flush() }
+    fn sector_count(&self) -> u64 {
+        (**self).sector_count()
+    }
+    fn is_read_only(&self) -> bool {
+        (**self).is_read_only()
+    }
+    fn flush(&mut self) -> Result<(), Error> {
+        (**self).flush()
+    }
     fn read_sector(&mut self, lba: u64, sector: &mut [u8]) -> Result<(), Error> {
         (**self).read_sector(lba, sector)
     }
@@ -48,7 +58,9 @@ impl<const SECTORS: usize> RamDisk<SECTORS> {
 }
 
 impl<const SECTORS: usize> BlockDevice for RamDisk<SECTORS> {
-    fn is_read_only(&self) -> bool { self.read_only }
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
     fn sector_count(&self) -> u64 {
         SECTORS as u64
     }

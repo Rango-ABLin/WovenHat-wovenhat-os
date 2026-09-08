@@ -262,14 +262,22 @@ pub fn read(id: usize, buf: &mut [u8]) -> Result<usize, Error> {
 
 pub fn clone_reader(id: usize) -> Result<(), Error> {
     let mut table = TABLE.lock();
-    let pipe = table.pipes.get_mut(id).filter(|p| p.occupied).ok_or(Error::Invalid)?;
+    let pipe = table
+        .pipes
+        .get_mut(id)
+        .filter(|p| p.occupied)
+        .ok_or(Error::Invalid)?;
     pipe.readers = pipe.readers.saturating_add(1);
     Ok(())
 }
 
 pub fn clone_writer(id: usize) -> Result<(), Error> {
     let mut table = TABLE.lock();
-    let pipe = table.pipes.get_mut(id).filter(|p| p.occupied).ok_or(Error::Invalid)?;
+    let pipe = table
+        .pipes
+        .get_mut(id)
+        .filter(|p| p.occupied)
+        .ok_or(Error::Invalid)?;
     pipe.writers = pipe.writers.saturating_add(1);
     Ok(())
 }

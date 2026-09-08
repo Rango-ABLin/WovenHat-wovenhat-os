@@ -9,8 +9,16 @@ pub struct Color {
 
 impl Color {
     pub const BLACK: Self = Self { r: 0, g: 0, b: 0 };
-    pub const WHITE: Self = Self { r: 255, g: 255, b: 255 };
-    pub const CYAN: Self = Self { r: 40, g: 220, b: 230 };
+    pub const WHITE: Self = Self {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
+    pub const CYAN: Self = Self {
+        r: 40,
+        g: 220,
+        b: 230,
+    };
     pub const DARK_BLUE: Self = Self { r: 4, g: 12, b: 28 };
 }
 

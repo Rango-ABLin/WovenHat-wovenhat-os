@@ -6,8 +6,8 @@
 //! also prevents the kernel debug shell from stealing PS/2 input while `/bin/sh`
 //! is running.
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use bootloader_api::info::{FrameBufferInfo, PixelFormat};
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::console::glyph;
@@ -21,7 +21,11 @@ const FG_B: u8 = 230;
 const NO_FOREGROUND: u64 = 0;
 
 #[derive(Clone, Copy)]
-enum Format { Rgb, Bgr, Other }
+enum Format {
+    Rgb,
+    Bgr,
+    Other,
+}
 
 struct State {
     ptr: usize,
@@ -41,9 +45,18 @@ struct State {
 impl State {
     const fn empty() -> Self {
         Self {
-            ptr: 0, len: 0, width: 0, height: 0, stride: 0, bytes_per_pixel: 0,
-            format: Format::Other, cursor_x: 40, cursor_y: 40, start_x: 40,
-            scale: 2, initialized: false,
+            ptr: 0,
+            len: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            bytes_per_pixel: 0,
+            format: Format::Other,
+            cursor_x: 40,
+            cursor_y: 40,
+            start_x: 40,
+            scale: 2,
+            initialized: false,
         }
     }
 
@@ -67,16 +80,22 @@ impl State {
     }
 
     fn clear(&mut self) {
-        if !self.initialized { return; }
+        if !self.initialized {
+            return;
+        }
         for y in 0..self.height {
-            for x in 0..self.width { self.pixel(x, y, BG_R, BG_G, BG_B); }
+            for x in 0..self.width {
+                self.pixel(x, y, BG_R, BG_G, BG_B);
+            }
         }
         self.cursor_x = self.start_x;
         self.cursor_y = 40;
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        if !self.initialized { return; }
+        if !self.initialized {
+            return;
+        }
         let mut i = 0usize;
         while i < bytes.len() {
             // Minimal ANSI support used by `/bin/sh`: clear screen + home.
@@ -96,7 +115,9 @@ impl State {
                 b'\r' => self.cursor_x = self.start_x,
                 8 => self.backspace(),
                 b'\t' => {
-                    for _ in 0..4 { self.put_char(' '); }
+                    for _ in 0..4 {
+                        self.put_char(' ');
+                    }
                 }
                 value if value.is_ascii_graphic() || value == b' ' => self.put_char(value as char),
                 _ => {}
@@ -110,20 +131,26 @@ impl State {
         let shape = glyph(c);
         for (row, bits) in shape.iter().enumerate() {
             for col in 0..5 {
-                if bits & (1 << (4 - col)) == 0 { continue; }
+                if bits & (1 << (4 - col)) == 0 {
+                    continue;
+                }
                 for sy in 0..self.scale {
                     for sx in 0..self.scale {
                         self.pixel(
                             self.cursor_x + col * self.scale + sx,
                             self.cursor_y + row * self.scale + sy,
-                            FG_R, FG_G, FG_B,
+                            FG_R,
+                            FG_G,
+                            FG_B,
                         );
                     }
                 }
             }
         }
         self.cursor_x += 6 * self.scale;
-        if self.cursor_x + 6 * self.scale >= self.width { self.newline(); }
+        if self.cursor_x + 6 * self.scale >= self.width {
+            self.newline();
+        }
     }
 
     fn newline(&mut self) {
@@ -134,7 +161,9 @@ impl State {
 
     fn backspace(&mut self) {
         let char_width = 6 * self.scale;
-        if self.cursor_x <= self.start_x { return; }
+        if self.cursor_x <= self.start_x {
+            return;
+        }
         self.cursor_x -= char_width;
         for y in self.cursor_y..core::cmp::min(self.cursor_y + 8 * self.scale, self.height) {
             for x in self.cursor_x..core::cmp::min(self.cursor_x + char_width, self.width) {
@@ -145,17 +174,24 @@ impl State {
 
     fn ensure_room(&mut self) {
         let line_height = 9 * self.scale;
-        if self.cursor_y + 8 * self.scale < self.height { return; }
+        if self.cursor_y + 8 * self.scale < self.height {
+            return;
+        }
         self.scroll(line_height);
         self.cursor_y = self.cursor_y.saturating_sub(line_height);
     }
 
     fn scroll(&mut self, rows: usize) {
-        if rows == 0 || rows >= self.height || self.bytes_per_pixel == 0 { self.clear(); return; }
+        if rows == 0 || rows >= self.height || self.bytes_per_pixel == 0 {
+            self.clear();
+            return;
+        }
         let row_bytes = self.stride.saturating_mul(self.bytes_per_pixel);
         let move_bytes = (self.height - rows).saturating_mul(row_bytes);
         let src_offset = rows.saturating_mul(row_bytes);
-        if src_offset + move_bytes > self.len { return; }
+        if src_offset + move_bytes > self.len {
+            return;
+        }
         unsafe {
             core::ptr::copy(
                 (self.ptr as *const u8).add(src_offset),
@@ -164,26 +200,42 @@ impl State {
             );
         }
         for y in self.height - rows..self.height {
-            for x in 0..self.width { self.pixel(x, y, BG_R, BG_G, BG_B); }
+            for x in 0..self.width {
+                self.pixel(x, y, BG_R, BG_G, BG_B);
+            }
         }
     }
 
     fn pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
-        if x >= self.width || y >= self.height || self.bytes_per_pixel == 0 { return; }
-        let Some(offset) = (y * self.stride + x).checked_mul(self.bytes_per_pixel) else { return; };
-        if offset + self.bytes_per_pixel > self.len { return; }
+        if x >= self.width || y >= self.height || self.bytes_per_pixel == 0 {
+            return;
+        }
+        let Some(offset) = (y * self.stride + x).checked_mul(self.bytes_per_pixel) else {
+            return;
+        };
+        if offset + self.bytes_per_pixel > self.len {
+            return;
+        }
         let p = (self.ptr + offset) as *mut u8;
         unsafe {
             match self.format {
                 Format::Rgb => {
                     *p = r;
-                    if self.bytes_per_pixel > 1 { *p.add(1) = g; }
-                    if self.bytes_per_pixel > 2 { *p.add(2) = b; }
+                    if self.bytes_per_pixel > 1 {
+                        *p.add(1) = g;
+                    }
+                    if self.bytes_per_pixel > 2 {
+                        *p.add(2) = b;
+                    }
                 }
                 Format::Bgr => {
                     *p = b;
-                    if self.bytes_per_pixel > 1 { *p.add(1) = g; }
-                    if self.bytes_per_pixel > 2 { *p.add(2) = r; }
+                    if self.bytes_per_pixel > 1 {
+                        *p.add(1) = g;
+                    }
+                    if self.bytes_per_pixel > 2 {
+                        *p.add(2) = r;
+                    }
                 }
                 Format::Other => {}
             }
@@ -194,9 +246,13 @@ impl State {
 static TERMINAL: Mutex<State> = Mutex::new(State::empty());
 static FOREGROUND_PID: AtomicU64 = AtomicU64::new(NO_FOREGROUND);
 
-pub fn init(buffer: &mut [u8], info: FrameBufferInfo) { TERMINAL.lock().init(buffer, info); }
+pub fn init(buffer: &mut [u8], info: FrameBufferInfo) {
+    TERMINAL.lock().init(buffer, info);
+}
 
-pub fn write_bytes(bytes: &[u8]) { TERMINAL.lock().write(bytes); }
+pub fn write_bytes(bytes: &[u8]) {
+    TERMINAL.lock().write(bytes);
+}
 
 pub fn set_cursor_position(x: usize, y: usize) {
     let mut terminal = TERMINAL.lock();
@@ -222,7 +278,8 @@ pub fn set_foreground(pid: u64) {
 }
 
 pub fn release_foreground(pid: u64) {
-    let _ = FOREGROUND_PID.compare_exchange(pid, NO_FOREGROUND, Ordering::AcqRel, Ordering::Acquire);
+    let _ =
+        FOREGROUND_PID.compare_exchange(pid, NO_FOREGROUND, Ordering::AcqRel, Ordering::Acquire);
 }
 
 pub fn foreground_pid() -> Option<u64> {
@@ -232,4 +289,6 @@ pub fn foreground_pid() -> Option<u64> {
     }
 }
 
-pub fn foreground_active() -> bool { foreground_pid().is_some() }
+pub fn foreground_active() -> bool {
+    foreground_pid().is_some()
+}

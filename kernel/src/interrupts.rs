@@ -150,11 +150,19 @@ extern "x86-interrupt" fn page_fault_handler(
     let fault_address = address.ok().map(|addr| addr.as_u64());
 
     if error_code.contains(PageFaultErrorCode::USER_MODE)
-        && !error_code.intersects(PageFaultErrorCode::PROTECTION_VIOLATION
-            | PageFaultErrorCode::INSTRUCTION_FETCH | PageFaultErrorCode::MALFORMED_TABLE)
+        && !error_code.intersects(
+            PageFaultErrorCode::PROTECTION_VIOLATION
+                | PageFaultErrorCode::INSTRUCTION_FETCH
+                | PageFaultErrorCode::MALFORMED_TABLE,
+        )
     {
         if let Some(addr) = fault_address {
-            if task::try_handle_file_fault(addr, error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)) { return; }
+            if task::try_handle_file_fault(
+                addr,
+                error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+            ) {
+                return;
+            }
         }
     }
 

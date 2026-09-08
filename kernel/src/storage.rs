@@ -301,7 +301,6 @@ pub enum EnsureError {
     Failed,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistError {
     NotSupported,
@@ -325,7 +324,11 @@ pub fn persist_path(path: &str) -> Result<(), PersistError> {
         return Err(PersistError::BadName);
     }
     for component in relative.split('/') {
-        if component.is_empty() || component == "." || component == ".." || fat32::encode_short_name(component).is_none() {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || fat32::encode_short_name(component).is_none()
+        {
             return Err(PersistError::BadName);
         }
     }
@@ -363,20 +366,24 @@ fn persist_on_cached_device(
 ) -> Result<(), PersistError> {
     // Same mount order as import: superfloppy → MBR → GPT.
     match fat32::mount(device) {
-        Ok(volume) => return fat32::create_path_file(device, volume, path, data).map_err(map_persist_err),
+        Ok(volume) => {
+            return fat32::create_path_file(device, volume, path, data).map_err(map_persist_err);
+        }
         Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
         Err(_) => return Err(PersistError::Failed),
     }
 
     if let Ok(Some(part)) = partition::find_fat32(device) {
-        let mut view = partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+        let mut view =
+            partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
         let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
         return fat32::create_path_file(&mut view, volume, path, data).map_err(map_persist_err);
     }
 
     match gpt::find_fat_partition(device) {
         Ok(Some(part)) => {
-            let mut view = partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+            let mut view =
+                partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
             let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
             fat32::create_path_file(&mut view, volume, path, data).map_err(map_persist_err)
         }
@@ -387,12 +394,22 @@ fn persist_on_cached_device(
 
 /// Persist a VFS directory under `/mnt/`, creating missing FAT32 components.
 pub fn persist_directory(path: &str) -> Result<(), PersistError> {
-    if path == "/mnt" { return Ok(()); }
-    if !path.starts_with("/mnt/") { return Err(PersistError::NotSupported); }
+    if path == "/mnt" {
+        return Ok(());
+    }
+    if !path.starts_with("/mnt/") {
+        return Err(PersistError::NotSupported);
+    }
     let relative = &path[5..];
-    if relative.is_empty() { return Err(PersistError::BadName); }
+    if relative.is_empty() {
+        return Err(PersistError::BadName);
+    }
     for component in relative.split('/') {
-        if component.is_empty() || component == "." || component == ".." || fat32::encode_short_name(component).is_none() {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || fat32::encode_short_name(component).is_none()
+        {
             return Err(PersistError::BadName);
         }
     }
@@ -401,7 +418,8 @@ pub fn persist_directory(path: &str) -> Result<(), PersistError> {
         let result = mkdir_on_cached_device(disk, relative);
         let flushed = disk.flush().map_err(|_| PersistError::Failed);
         result.and(flushed)
-    }).unwrap_or(Err(PersistError::NoDevice))
+    })
+    .unwrap_or(Err(PersistError::NoDevice))
 }
 
 fn mkdir_on_cached_device(
@@ -414,13 +432,15 @@ fn mkdir_on_cached_device(
         Err(_) => return Err(PersistError::Failed),
     }
     if let Ok(Some(part)) = partition::find_fat32(device) {
-        let mut view = partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+        let mut view =
+            partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
         let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
         return fat32::mkdir_path(&mut view, volume, path).map_err(map_persist_err);
     }
     match gpt::find_fat_partition(device) {
         Ok(Some(part)) => {
-            let mut view = partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
+            let mut view =
+                partition::PartitionDevice::new(device, part).map_err(|_| PersistError::Failed)?;
             let volume = fat32::mount(&mut view).map_err(map_persist_err)?;
             fat32::mkdir_path(&mut view, volume, path).map_err(map_persist_err)
         }
@@ -455,49 +475,80 @@ pub fn sync_all_mounted() -> Result<usize, PersistError> {
     let mut ok = 0usize;
     let mut failed = false;
     for path in paths {
-        if persist_path(&path).is_ok() { ok += 1; } else { failed = true; }
+        if persist_path(&path).is_ok() {
+            ok += 1;
+        } else {
+            failed = true;
+        }
     }
     if ata::with_primary_master(|disk| disk.flush()).is_some_and(|r| r.is_err()) {
         failed = true;
     }
-    if failed { Err(PersistError::Failed) } else { Ok(ok) }
+    if failed {
+        Err(PersistError::Failed)
+    } else {
+        Ok(ok)
+    }
 }
 
 // Lock order: ATA device, then file pages. Never call VFS while holding pages.
 static FILE_PAGES: spin::Mutex<crate::page_cache::PageCache<16>> =
     spin::Mutex::new(crate::page_cache::PageCache::new());
 
-pub fn page_cache_stats() -> crate::page_cache::Stats { FILE_PAGES.lock().stats() }
-
-pub fn read_disk_file(path: &str, offset: usize, output: &mut [u8]) -> Result<usize, crate::block::Error> {
-    let relative = path.strip_prefix("/mnt/").ok_or(crate::block::Error::InvalidBuffer)?;
-    ata::with_primary_master(|disk| {
-        FILE_PAGES.lock().read(path, offset, output, |start, page| {
-            read_disk_page(disk, relative, start, page).map_err(|_| crate::block::Error::DeviceFault)
-        })
-    }).unwrap_or(Err(crate::block::Error::DeviceFault))
+pub fn page_cache_stats() -> crate::page_cache::Stats {
+    FILE_PAGES.lock().stats()
 }
 
-fn read_volume_page(device: &mut impl crate::block::BlockDevice, volume: fat32::Volume,
-    path: &str, offset: usize, output: &mut [u8]) -> Result<usize, fat32::Error> {
+pub fn read_disk_file(
+    path: &str,
+    offset: usize,
+    output: &mut [u8],
+) -> Result<usize, crate::block::Error> {
+    let relative = path
+        .strip_prefix("/mnt/")
+        .ok_or(crate::block::Error::InvalidBuffer)?;
+    ata::with_primary_master(|disk| {
+        FILE_PAGES.lock().read(path, offset, output, |start, page| {
+            read_disk_page(disk, relative, start, page)
+                .map_err(|_| crate::block::Error::DeviceFault)
+        })
+    })
+    .unwrap_or(Err(crate::block::Error::DeviceFault))
+}
+
+fn read_volume_page(
+    device: &mut impl crate::block::BlockDevice,
+    volume: fat32::Volume,
+    path: &str,
+    offset: usize,
+    output: &mut [u8],
+) -> Result<usize, fat32::Error> {
     let entry = fat32::resolve_path(device, volume, path)?;
-    if entry.attributes & DIRECTORY_ATTRIBUTE != 0 { return Err(fat32::Error::NotFound); }
+    if entry.attributes & DIRECTORY_ATTRIBUTE != 0 {
+        return Err(fat32::Error::NotFound);
+    }
     fat32::read_file_at(device, volume, entry, offset, output)
 }
 
-fn read_disk_page(device: &mut impl crate::block::BlockDevice, path: &str,
-    offset: usize, output: &mut [u8]) -> Result<usize, fat32::Error> {
+fn read_disk_page(
+    device: &mut impl crate::block::BlockDevice,
+    path: &str,
+    offset: usize,
+    output: &mut [u8],
+) -> Result<usize, fat32::Error> {
     match fat32::mount(device) {
         Ok(volume) => return read_volume_page(device, volume, path, offset, output),
-        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {},
+        Err(fat32::Error::InvalidBootSector | fat32::Error::UnsupportedGeometry) => {}
         Err(error) => return Err(error),
     }
     let part = match partition::find_fat32(device) {
         Ok(Some(part)) => part,
-        _ => gpt::find_fat_partition(device).map_err(|_| fat32::Error::InvalidBootSector)?
+        _ => gpt::find_fat_partition(device)
+            .map_err(|_| fat32::Error::InvalidBootSector)?
             .ok_or(fat32::Error::InvalidBootSector)?,
     };
-    let mut view = partition::PartitionDevice::new(device, part).map_err(|_| fat32::Error::InvalidBootSector)?;
+    let mut view = partition::PartitionDevice::new(device, part)
+        .map_err(|_| fat32::Error::InvalidBootSector)?;
     let volume = fat32::mount(&mut view)?;
     read_volume_page(&mut view, volume, path, offset, output)
 }

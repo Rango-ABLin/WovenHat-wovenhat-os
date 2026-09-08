@@ -57,7 +57,10 @@ impl CowTable {
     /// Register a newly shared frame. First share sets refcount to 2 (parent + child).
     fn share(&mut self, frame: u64) -> Result<(), MapRangeError> {
         if let Some(slot) = self.find_slot(frame) {
-            self.entries[slot].refcount = self.entries[slot].refcount.checked_add(1).ok_or(MapRangeError::OutOfFrames)?;
+            self.entries[slot].refcount = self.entries[slot]
+                .refcount
+                .checked_add(1)
+                .ok_or(MapRangeError::OutOfFrames)?;
             return Ok(());
         }
         let slot = self
@@ -372,7 +375,11 @@ pub fn map_user_range_in(
         } else if let Some(frame) = allocator.allocate_frame() {
             match unsafe { mapper.map_to(page, frame, flags, &mut *allocator) } {
                 Ok(flush) => {
-                    if Cr3::read().0 == address_space.level_4_frame { flush.flush(); } else { flush.ignore(); }
+                    if Cr3::read().0 == address_space.level_4_frame {
+                        flush.flush();
+                    } else {
+                        flush.ignore();
+                    }
                     mapped_pages += 1;
                     None
                 }
@@ -388,7 +395,11 @@ pub fn map_user_range_in(
         if let Some(error) = failure {
             for rollback_page in Page::range_inclusive(start_page, end_page).take(mapped_pages) {
                 if let Ok((frame, flush)) = mapper.unmap(rollback_page) {
-                    if Cr3::read().0 == address_space.level_4_frame { flush.flush(); } else { flush.ignore(); }
+                    if Cr3::read().0 == address_space.level_4_frame {
+                        flush.flush();
+                    } else {
+                        flush.ignore();
+                    }
                     let _ = allocator.deallocate_frame(frame);
                 }
             }
@@ -535,7 +546,13 @@ pub fn share_user_range_in(
         // Reserve ownership before publishing a PTE. If the ref table is full,
         // rollback must never release an unregistered reference to a live frame.
         if cow.share(frame.start_address().as_u64()).is_err() {
-            rollback_shared(&mut destination_mapper, &mut *allocator, &mut cow, start_page, mapped_pages);
+            rollback_shared(
+                &mut destination_mapper,
+                &mut *allocator,
+                &mut cow,
+                start_page,
+                mapped_pages,
+            );
             return Err(MapRangeError::OutOfFrames);
         }
         // Map destination to the same frame.
@@ -991,16 +1008,18 @@ pub fn copy_to_current_user(start: u64, source: &[u8]) -> Result<(), UserMemoryE
         let virtual_address = start
             .checked_add(copied as u64)
             .ok_or(UserMemoryError::AddressOverflow)?;
-        let (physical_address, count, flags) = match
-            translated_chunk(&mapper, virtual_address, source.len() - copied) {
-            Ok(chunk) => chunk,
-            Err(UserMemoryError::NotMapped) => {
-                drop(paging);
-                if crate::task::try_handle_file_fault(virtual_address, true) { continue; }
-                return Err(UserMemoryError::NotMapped);
-            }
-            Err(error) => return Err(error),
-        };
+        let (physical_address, count, flags) =
+            match translated_chunk(&mapper, virtual_address, source.len() - copied) {
+                Ok(chunk) => chunk,
+                Err(UserMemoryError::NotMapped) => {
+                    drop(paging);
+                    if crate::task::try_handle_file_fault(virtual_address, true) {
+                        continue;
+                    }
+                    return Err(UserMemoryError::NotMapped);
+                }
+                Err(error) => return Err(error),
+            };
         if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
             return Err(UserMemoryError::PermissionDenied);
         }
@@ -1032,24 +1051,26 @@ fn copy_current_user(
 ) -> Result<(), UserMemoryError> {
     let mut copied = 0;
     while copied < destination.len() {
-    let paging = PAGING.lock();
-    let address_space = AddressSpace {
-        level_4_frame: Cr3::read().0,
-    };
-    let mapper = mapper_for(&paging, address_space).map_err(|_| UserMemoryError::NotMapped)?;
+        let paging = PAGING.lock();
+        let address_space = AddressSpace {
+            level_4_frame: Cr3::read().0,
+        };
+        let mapper = mapper_for(&paging, address_space).map_err(|_| UserMemoryError::NotMapped)?;
         let virtual_address = start
             .checked_add(copied as u64)
             .ok_or(UserMemoryError::AddressOverflow)?;
-        let (physical_address, count, flags) = match
-            translated_chunk(&mapper, virtual_address, destination.len() - copied) {
-            Ok(chunk) => chunk,
-            Err(UserMemoryError::NotMapped) => {
-                drop(paging);
-                if crate::task::try_handle_file_fault(virtual_address, require_writable) { continue; }
-                return Err(UserMemoryError::NotMapped);
-            }
-            Err(error) => return Err(error),
-        };
+        let (physical_address, count, flags) =
+            match translated_chunk(&mapper, virtual_address, destination.len() - copied) {
+                Ok(chunk) => chunk,
+                Err(UserMemoryError::NotMapped) => {
+                    drop(paging);
+                    if crate::task::try_handle_file_fault(virtual_address, require_writable) {
+                        continue;
+                    }
+                    return Err(UserMemoryError::NotMapped);
+                }
+                Err(error) => return Err(error),
+            };
         if !flags.contains(PageTableFlags::USER_ACCESSIBLE)
             || (require_writable && !flags.contains(PageTableFlags::WRITABLE))
         {
@@ -1103,74 +1124,135 @@ pub fn allocate_file_frame(bytes: &[u8; 4096]) -> Option<u64> {
     let physical = frame.start_address().as_u64();
     let paging = PAGING.lock();
     let destination = paging.physical_memory_offset.checked_add(physical)? as *mut u8;
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, 4096); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, 4096);
+    }
     Some(physical)
 }
-pub fn file_frame_references(frame: u64) -> u32 { COW_TABLE.lock().refcount(frame) }
+pub fn file_frame_references(frame: u64) -> u32 {
+    COW_TABLE.lock().refcount(frame)
+}
 pub fn release_file_frame(frame: u64) -> bool {
-    let Ok(frame) = PhysFrame::from_start_address(x86_64::PhysAddr::new(frame)) else { return false; };
+    let Ok(frame) = PhysFrame::from_start_address(x86_64::PhysAddr::new(frame)) else {
+        return false;
+    };
     release_frame(frame)
 }
 pub fn read_file_frame(frame: u64, offset: usize, bytes: &mut [u8]) {
     assert!(offset <= 4096 && bytes.len() <= 4096 - offset);
     let paging = PAGING.lock();
-    unsafe { core::ptr::copy_nonoverlapping((paging.physical_memory_offset + frame + offset as u64) as *const u8, bytes.as_mut_ptr(), bytes.len()); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (paging.physical_memory_offset + frame + offset as u64) as *const u8,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+        );
+    }
 }
 pub fn write_file_frame(frame: u64, offset: usize, bytes: &[u8]) {
     assert!(offset <= 4096 && bytes.len() <= 4096 - offset);
     let paging = PAGING.lock();
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (paging.physical_memory_offset + frame + offset as u64) as *mut u8, bytes.len()); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (paging.physical_memory_offset + frame + offset as u64) as *mut u8,
+            bytes.len(),
+        );
+    }
 }
 pub fn map_file_frame(space: AddressSpace, address: u64, physical: u64, writable: bool) -> bool {
     let paging = PAGING.lock();
-    let Ok(mut mapper) = mapper_for(&paging, space) else { return false; };
-    let Ok(page) = Page::<Size4KiB>::from_start_address(VirtAddr::new(address)) else { return false; };
-    if mapper.translate_addr(page.start_address()).is_some() { return false; }
-    let Ok(frame) = PhysFrame::from_start_address(x86_64::PhysAddr::new(physical)) else { return false; };
+    let Ok(mut mapper) = mapper_for(&paging, space) else {
+        return false;
+    };
+    let Ok(page) = Page::<Size4KiB>::from_start_address(VirtAddr::new(address)) else {
+        return false;
+    };
+    if mapper.translate_addr(page.start_address()).is_some() {
+        return false;
+    }
+    let Ok(frame) = PhysFrame::from_start_address(x86_64::PhysAddr::new(physical)) else {
+        return false;
+    };
     let mut allocator = memory::allocator();
     let mut refs = COW_TABLE.lock();
-    if refs.share(physical).is_err() { return false; }
+    if refs.share(physical).is_err() {
+        return false;
+    }
     match unsafe { mapper.map_to(page, frame, user_flags(writable, false), &mut *allocator) } {
-        Ok(flush) => { if Cr3::read().0 == space.level_4_frame { flush.flush(); } else { flush.ignore(); } true }
-        Err(_) => { let _ = refs.release(physical); false }
+        Ok(flush) => {
+            if Cr3::read().0 == space.level_4_frame {
+                flush.flush();
+            } else {
+                flush.ignore();
+            }
+            true
+        }
+        Err(_) => {
+            let _ = refs.release(physical);
+            false
+        }
     }
 }
 
 pub fn user_frame_in(space: AddressSpace, address: u64) -> Option<u64> {
     let paging = PAGING.lock();
     let mapper = mapper_for(&paging, space).ok()?;
-    mapper.translate_addr(VirtAddr::new(address & !4095)).map(|frame| frame.as_u64())
+    mapper
+        .translate_addr(VirtAddr::new(address & !4095))
+        .map(|frame| frame.as_u64())
 }
 
 /// Boot-only exhaustion test: run before scheduling, with no shared frames live.
 pub fn frame_ownership_self_test() -> bool {
     const BASE: u64 = 0x4000_000e_0000;
     let baseline = memory::stats().allocated_frames;
-    if COW_TABLE.lock().entries.iter().any(|entry| entry.occupied) { return false; }
-    let Some(source) = create_user_address_space(BASE) else { return false; };
-    let Some(destination) = create_user_address_space(BASE) else { return false; };
+    if COW_TABLE.lock().entries.iter().any(|entry| entry.occupied) {
+        return false;
+    }
+    let Some(source) = create_user_address_space(BASE) else {
+        return false;
+    };
+    let Some(destination) = create_user_address_space(BASE) else {
+        return false;
+    };
     if map_user_range_in(source, BASE, 4096, true, false).is_err()
-        || write_user_bytes(source, BASE, &[0x71]).is_err() { return false; }
+        || write_user_bytes(source, BASE, &[0x71]).is_err()
+    {
+        return false;
+    }
     let before_failure = memory::stats().allocated_frames;
     let overflow_rejected = {
         let mut table = COW_TABLE.lock();
         for (index, entry) in table.entries.iter_mut().enumerate() {
-            *entry = CowEntry { frame: 0x1000_0000_0000 + (index as u64 * 4096), refcount: 2, occupied: true };
+            *entry = CowEntry {
+                frame: 0x1000_0000_0000 + (index as u64 * 4096),
+                refcount: 2,
+                occupied: true,
+            };
         }
         let frame = table.entries[0].frame;
         table.entries[0].refcount = u32::MAX;
-        table.share(frame) == Err(MapRangeError::OutOfFrames) && table.entries[0].refcount == u32::MAX
+        table.share(frame) == Err(MapRangeError::OutOfFrames)
+            && table.entries[0].refcount == u32::MAX
     };
     let failed_safely = share_user_range_in(source, destination, BASE, 4096, true, false)
         == Err(MapRangeError::OutOfFrames)
         && memory::stats().allocated_frames == before_failure
         && user_range_is_unmapped_in(destination, BASE, 4096);
     // Remove only the artificial entries installed above, before normal cleanup.
-    for entry in COW_TABLE.lock().entries.iter_mut() { *entry = CowEntry::empty(); }
+    for entry in COW_TABLE.lock().entries.iter_mut() {
+        *entry = CowEntry::empty();
+    }
     let mut byte = [0];
-    let intact = read_user_bytes_in(source, BASE, &mut byte).is_ok() && byte == [0x71]
+    let intact = read_user_bytes_in(source, BASE, &mut byte).is_ok()
+        && byte == [0x71]
         && user_range_has_protection_in(source, BASE, 4096, true, false);
     let cleaned = discard_empty_user_address_space(destination)
         && destroy_user_address_space(source, &[(BASE, 4096)]).is_ok();
-    overflow_rejected && failed_safely && intact && cleaned && memory::stats().allocated_frames == baseline
+    overflow_rejected
+        && failed_safely
+        && intact
+        && cleaned
+        && memory::stats().allocated_frames == baseline
 }

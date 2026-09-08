@@ -46,10 +46,17 @@ const VIRTIO_NET_HDR_BYTES: usize = 10;
 const PAGE_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PciLocation { pub bus: u8, pub device: u8, pub function: u8 }
+pub struct PciLocation {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProbeStatus { Missing, Found(PciLocation) }
+pub enum ProbeStatus {
+    Missing,
+    Found(PciLocation),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitError {
@@ -87,23 +94,40 @@ struct VirtqDesc {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct VirtqUsedElem { id: u32, len: u32 }
+struct VirtqUsedElem {
+    id: u32,
+    len: u32,
+}
 
 #[repr(align(4096))]
 struct QueueMemory(UnsafeCell<[u8; QUEUE_MEMORY_BYTES]>);
 unsafe impl Sync for QueueMemory {}
-impl QueueMemory { const fn new() -> Self { Self(UnsafeCell::new([0; QUEUE_MEMORY_BYTES])) } }
+impl QueueMemory {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; QUEUE_MEMORY_BYTES]))
+    }
+}
 
 #[repr(align(2048))]
 struct PacketMemory(UnsafeCell<[u8; PACKET_BYTES]>);
 unsafe impl Sync for PacketMemory {}
-impl PacketMemory { const fn new() -> Self { Self(UnsafeCell::new([0; PACKET_BYTES])) } }
+impl PacketMemory {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; PACKET_BYTES]))
+    }
+}
 
 static RX_QUEUE_MEMORY: QueueMemory = QueueMemory::new();
 static TX_QUEUE_MEMORY: QueueMemory = QueueMemory::new();
 static RX_PACKETS: [PacketMemory; ACTIVE_RX_DESCRIPTORS] = [
-    PacketMemory::new(), PacketMemory::new(), PacketMemory::new(), PacketMemory::new(),
-    PacketMemory::new(), PacketMemory::new(), PacketMemory::new(), PacketMemory::new(),
+    PacketMemory::new(),
+    PacketMemory::new(),
+    PacketMemory::new(),
+    PacketMemory::new(),
+    PacketMemory::new(),
+    PacketMemory::new(),
+    PacketMemory::new(),
+    PacketMemory::new(),
 ];
 static TX_PACKET: PacketMemory = PacketMemory::new();
 
@@ -130,11 +154,23 @@ impl Transport {
     const fn empty() -> Self {
         Self {
             initialized: false,
-            location: PciLocation { bus: 0, device: 0, function: 0 },
-            io_base: 0, host_features: 0, rx_queue_size: 0, tx_queue_size: 0,
-            rx_last_used: 0, tx_last_used: 0, tx_outstanding: false,
+            location: PciLocation {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            io_base: 0,
+            host_features: 0,
+            rx_queue_size: 0,
+            tx_queue_size: 0,
+            rx_last_used: 0,
+            tx_last_used: 0,
+            tx_outstanding: false,
             mac: [0x02, 0x57, 0x48, 0, 0, 1],
-            rx_frames: 0, tx_frames: 0, rx_dropped: 0, tx_busy: 0,
+            rx_frames: 0,
+            tx_frames: 0,
+            rx_dropped: 0,
+            tx_busy: 0,
         }
     }
 }
@@ -148,7 +184,11 @@ pub fn probe() -> ProbeStatus {
             && matches!(dev.device_id, VIRTIO_NET_LEGACY | VIRTIO_NET_MODERN)
             && dev.class == 0x02
         {
-            return ProbeStatus::Found(PciLocation { bus: dev.bus, device: dev.device, function: dev.function });
+            return ProbeStatus::Found(PciLocation {
+                bus: dev.bus,
+                device: dev.device,
+                function: dev.function,
+            });
         }
         index += 1;
     }
@@ -161,19 +201,32 @@ pub fn init() -> Result<(), InitError> {
         ProbeStatus::Found(location) => location,
     };
     let dev = find_device(location).ok_or(InitError::Missing)?;
-    if dev.device_id != VIRTIO_NET_LEGACY { return Err(InitError::ModernOnly); }
+    if dev.device_id != VIRTIO_NET_LEGACY {
+        return Err(InitError::ModernOnly);
+    }
 
     pci::enable_io_bus_master(location.bus, location.device, location.function);
     let io_base = pci::bar0_io_base(location.bus, location.device, location.function)
         .ok_or(InitError::NoIoBar)?;
 
-    unsafe { outb(io_base + VIRTIO_PCI_STATUS, 0); }
-    unsafe { outb(io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE); }
-    unsafe { outb(io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER); }
+    unsafe {
+        outb(io_base + VIRTIO_PCI_STATUS, 0);
+    }
+    unsafe {
+        outb(io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE);
+    }
+    unsafe {
+        outb(
+            io_base + VIRTIO_PCI_STATUS,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER,
+        );
+    }
 
     let host_features = unsafe { inl(io_base + VIRTIO_PCI_HOST_FEATURES) };
     // Start conservatively: no checksum/GSO/event-index/indirect features.
-    unsafe { outl(io_base + VIRTIO_PCI_GUEST_FEATURES, 0); }
+    unsafe {
+        outl(io_base + VIRTIO_PCI_GUEST_FEATURES, 0);
+    }
 
     let rx_queue_size = setup_queue(io_base, RX_QUEUE, &RX_QUEUE_MEMORY)?;
     let tx_queue_size = setup_queue(io_base, TX_QUEUE, &TX_QUEUE_MEMORY)?;
@@ -188,34 +241,61 @@ pub fn init() -> Result<(), InitError> {
         }
     }
 
-    unsafe { outb(io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK); }
+    unsafe {
+        outb(
+            io_base + VIRTIO_PCI_STATUS,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK,
+        );
+    }
 
     *TRANSPORT.lock() = Transport {
-        initialized: true, location, io_base, host_features,
-        rx_queue_size, tx_queue_size, rx_last_used: 0, tx_last_used: 0,
-        tx_outstanding: false, mac, rx_frames: 0, tx_frames: 0,
-        rx_dropped: 0, tx_busy: 0,
+        initialized: true,
+        location,
+        io_base,
+        host_features,
+        rx_queue_size,
+        tx_queue_size,
+        rx_last_used: 0,
+        tx_last_used: 0,
+        tx_outstanding: false,
+        mac,
+        rx_frames: 0,
+        tx_frames: 0,
+        rx_dropped: 0,
+        tx_busy: 0,
     };
     Ok(())
 }
 
-pub fn is_initialized() -> bool { TRANSPORT.lock().initialized }
+pub fn is_initialized() -> bool {
+    TRANSPORT.lock().initialized
+}
 
-pub fn mac_address() -> [u8; 6] { TRANSPORT.lock().mac }
+pub fn mac_address() -> [u8; 6] {
+    TRANSPORT.lock().mac
+}
 
 pub fn stats() -> Stats {
     let t = *TRANSPORT.lock();
     Stats {
-        initialized: t.initialized, rx_frames: t.rx_frames, tx_frames: t.tx_frames,
-        rx_dropped: t.rx_dropped, tx_busy: t.tx_busy, host_features: t.host_features,
-        io_base: t.io_base, rx_queue_size: t.rx_queue_size, tx_queue_size: t.tx_queue_size,
+        initialized: t.initialized,
+        rx_frames: t.rx_frames,
+        tx_frames: t.tx_frames,
+        rx_dropped: t.rx_dropped,
+        tx_busy: t.tx_busy,
+        host_features: t.host_features,
+        io_base: t.io_base,
+        rx_queue_size: t.rx_queue_size,
+        tx_queue_size: t.tx_queue_size,
         mac: t.mac,
     }
 }
 
 pub fn poll() {
     let mut t = TRANSPORT.lock();
-    if !t.initialized { return; }
+    if !t.initialized {
+        return;
+    }
     reap_tx(&mut t);
     // Reading ISR acknowledges any pending legacy interrupt. We still use the
     // used-ring indices as the source of truth, so polling remains race-safe.
@@ -224,10 +304,14 @@ pub fn poll() {
 
 pub fn receive_into(out: &mut [u8]) -> Option<usize> {
     let mut t = TRANSPORT.lock();
-    if !t.initialized { return None; }
+    if !t.initialized {
+        return None;
+    }
     let mem = RX_QUEUE_MEMORY.0.get() as *mut u8;
     let used_idx = unsafe { read_u16(used_idx_ptr(mem, t.rx_queue_size)) };
-    if used_idx == t.rx_last_used { return None; }
+    if used_idx == t.rx_last_used {
+        return None;
+    }
 
     fence(Ordering::Acquire);
     let ring_slot = (t.rx_last_used as usize) % t.rx_queue_size as usize;
@@ -251,16 +335,26 @@ pub fn receive_into(out: &mut [u8]) -> Option<usize> {
         return None;
     }
     let packet = RX_PACKETS[id].0.get() as *const u8;
-    unsafe { core::ptr::copy_nonoverlapping(packet.add(VIRTIO_NET_HDR_BYTES), out.as_mut_ptr(), frame_len); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            packet.add(VIRTIO_NET_HDR_BYTES),
+            out.as_mut_ptr(),
+            frame_len,
+        );
+    }
     t.rx_frames = t.rx_frames.saturating_add(1);
     repost_rx(&mut t, id as u16);
     Some(frame_len)
 }
 
 pub fn transmit(frame: &[u8]) -> bool {
-    if frame.is_empty() || frame.len() > MAX_FRAME { return false; }
+    if frame.is_empty() || frame.len() > MAX_FRAME {
+        return false;
+    }
     let mut t = TRANSPORT.lock();
-    if !t.initialized { return false; }
+    if !t.initialized {
+        return false;
+    }
     reap_tx(&mut t);
     if t.tx_outstanding {
         t.tx_busy = t.tx_busy.saturating_add(1);
@@ -270,7 +364,11 @@ pub fn transmit(frame: &[u8]) -> bool {
     let packet = TX_PACKET.0.get() as *mut u8;
     unsafe {
         core::ptr::write_bytes(packet, 0, VIRTIO_NET_HDR_BYTES);
-        core::ptr::copy_nonoverlapping(frame.as_ptr(), packet.add(VIRTIO_NET_HDR_BYTES), frame.len());
+        core::ptr::copy_nonoverlapping(
+            frame.as_ptr(),
+            packet.add(VIRTIO_NET_HDR_BYTES),
+            frame.len(),
+        );
     }
     let mem = TX_QUEUE_MEMORY.0.get() as *mut u8;
     let desc = unsafe { &mut *desc_ptr(mem, 0) };
@@ -278,27 +376,49 @@ pub fn transmit(frame: &[u8]) -> bool {
     desc.flags = 0;
     desc.next = 0;
 
-    unsafe { push_avail(mem, t.tx_queue_size, 0); }
+    unsafe {
+        push_avail(mem, t.tx_queue_size, 0);
+    }
     fence(Ordering::SeqCst);
-    unsafe { outw(t.io_base + VIRTIO_PCI_QUEUE_NOTIFY, TX_QUEUE); }
+    unsafe {
+        outw(t.io_base + VIRTIO_PCI_QUEUE_NOTIFY, TX_QUEUE);
+    }
     t.tx_outstanding = true;
     t.tx_frames = t.tx_frames.saturating_add(1);
     true
 }
 
 fn setup_queue(io_base: u16, queue: u16, memory: &QueueMemory) -> Result<u16, InitError> {
-    unsafe { outw(io_base + VIRTIO_PCI_QUEUE_SEL, queue); }
+    unsafe {
+        outw(io_base + VIRTIO_PCI_QUEUE_SEL, queue);
+    }
     let size = unsafe { inw(io_base + VIRTIO_PCI_QUEUE_NUM) };
-    if size == 0 { fail(io_base); return Err(InitError::QueueUnavailable); }
-    if size as usize > MAX_QUEUE_SIZE { fail(io_base); return Err(InitError::QueueTooLarge); }
+    if size == 0 {
+        fail(io_base);
+        return Err(InitError::QueueUnavailable);
+    }
+    if size as usize > MAX_QUEUE_SIZE {
+        fail(io_base);
+        return Err(InitError::QueueTooLarge);
+    }
 
     let total = queue_total_bytes(size);
-    if total > QUEUE_MEMORY_BYTES { fail(io_base); return Err(InitError::QueueTooLarge); }
+    if total > QUEUE_MEMORY_BYTES {
+        fail(io_base);
+        return Err(InitError::QueueTooLarge);
+    }
     let ptr = memory.0.get() as *mut u8;
-    unsafe { core::ptr::write_bytes(ptr, 0, QUEUE_MEMORY_BYTES); }
+    unsafe {
+        core::ptr::write_bytes(ptr, 0, QUEUE_MEMORY_BYTES);
+    }
     let phys = dma_physical(ptr as u64, total).ok_or(InitError::DmaNotContiguous)?;
-    if phys & (PAGE_SIZE as u64 - 1) != 0 { fail(io_base); return Err(InitError::DmaNotContiguous); }
-    unsafe { outl(io_base + VIRTIO_PCI_QUEUE_PFN, (phys >> 12) as u32); }
+    if phys & (PAGE_SIZE as u64 - 1) != 0 {
+        fail(io_base);
+        return Err(InitError::DmaNotContiguous);
+    }
+    unsafe {
+        outl(io_base + VIRTIO_PCI_QUEUE_PFN, (phys >> 12) as u32);
+    }
     Ok(size)
 }
 
@@ -308,11 +428,20 @@ fn post_initial_rx(io_base: u16, qsize: u16) -> Result<(), InitError> {
         let packet = RX_PACKETS[id].0.get() as *mut u8;
         let phys = dma_physical(packet as u64, PACKET_BYTES).ok_or(InitError::DmaNotContiguous)?;
         let desc = unsafe { &mut *desc_ptr(mem, id) };
-        *desc = VirtqDesc { addr: phys, len: PACKET_BYTES as u32, flags: DESC_F_WRITE, next: 0 };
-        unsafe { push_avail(mem, qsize, id as u16); }
+        *desc = VirtqDesc {
+            addr: phys,
+            len: PACKET_BYTES as u32,
+            flags: DESC_F_WRITE,
+            next: 0,
+        };
+        unsafe {
+            push_avail(mem, qsize, id as u16);
+        }
     }
     fence(Ordering::SeqCst);
-    unsafe { outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, RX_QUEUE); }
+    unsafe {
+        outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, RX_QUEUE);
+    }
     Ok(())
 }
 
@@ -320,19 +449,32 @@ fn setup_tx_descriptor(_qsize: u16) -> Result<(), InitError> {
     let mem = TX_QUEUE_MEMORY.0.get() as *mut u8;
     let packet = TX_PACKET.0.get() as *mut u8;
     let phys = dma_physical(packet as u64, PACKET_BYTES).ok_or(InitError::DmaNotContiguous)?;
-    unsafe { *desc_ptr(mem, 0) = VirtqDesc { addr: phys, len: 0, flags: 0, next: 0 }; }
+    unsafe {
+        *desc_ptr(mem, 0) = VirtqDesc {
+            addr: phys,
+            len: 0,
+            flags: 0,
+            next: 0,
+        };
+    }
     Ok(())
 }
 
 fn repost_rx(t: &mut Transport, id: u16) {
     let mem = RX_QUEUE_MEMORY.0.get() as *mut u8;
-    unsafe { push_avail(mem, t.rx_queue_size, id); }
+    unsafe {
+        push_avail(mem, t.rx_queue_size, id);
+    }
     fence(Ordering::SeqCst);
-    unsafe { outw(t.io_base + VIRTIO_PCI_QUEUE_NOTIFY, RX_QUEUE); }
+    unsafe {
+        outw(t.io_base + VIRTIO_PCI_QUEUE_NOTIFY, RX_QUEUE);
+    }
 }
 
 fn reap_tx(t: &mut Transport) {
-    if !t.tx_outstanding { return; }
+    if !t.tx_outstanding {
+        return;
+    }
     let mem = TX_QUEUE_MEMORY.0.get() as *mut u8;
     let used_idx = unsafe { read_u16(used_idx_ptr(mem, t.tx_queue_size)) };
     if used_idx != t.tx_last_used {
@@ -351,7 +493,9 @@ fn dma_physical(virtual_address: u64, size: usize) -> Option<u64> {
     let mut page = start_page;
     while page <= end_page {
         let phys = paging::translate_kernel_address(page)? & !(PAGE_SIZE as u64 - 1);
-        if phys != first_page_phys.checked_add(page - start_page)? { return None; }
+        if phys != first_page_phys.checked_add(page - start_page)? {
+            return None;
+        }
         page = page.checked_add(PAGE_SIZE as u64)?;
     }
     Some(first)
@@ -360,7 +504,10 @@ fn dma_physical(virtual_address: u64, size: usize) -> Option<u64> {
 fn find_device(location: PciLocation) -> Option<pci::Device> {
     let mut index = 0usize;
     while let Some(dev) = pci::device(index) {
-        if dev.bus == location.bus && dev.device == location.device && dev.function == location.function {
+        if dev.bus == location.bus
+            && dev.device == location.device
+            && dev.function == location.function
+        {
             return Some(dev);
         }
         index += 1;
@@ -368,27 +515,59 @@ fn find_device(location: PciLocation) -> Option<pci::Device> {
     None
 }
 
-const fn align_up(value: usize, alignment: usize) -> usize { (value + alignment - 1) & !(alignment - 1) }
-const fn used_offset(qsize: u16) -> usize { align_up(size_of::<VirtqDesc>() * qsize as usize + 6 + 2 * qsize as usize, PAGE_SIZE) }
-const fn queue_total_bytes(qsize: u16) -> usize { used_offset(qsize) + 6 + size_of::<VirtqUsedElem>() * qsize as usize }
+const fn align_up(value: usize, alignment: usize) -> usize {
+    (value + alignment - 1) & !(alignment - 1)
+}
+const fn used_offset(qsize: u16) -> usize {
+    align_up(
+        size_of::<VirtqDesc>() * qsize as usize + 6 + 2 * qsize as usize,
+        PAGE_SIZE,
+    )
+}
+const fn queue_total_bytes(qsize: u16) -> usize {
+    used_offset(qsize) + 6 + size_of::<VirtqUsedElem>() * qsize as usize
+}
 
-unsafe fn desc_ptr(mem: *mut u8, id: usize) -> *mut VirtqDesc { unsafe { mem.add(id * size_of::<VirtqDesc>()) as *mut VirtqDesc } }
-unsafe fn avail_idx_ptr(mem: *mut u8, qsize: u16) -> *mut u16 { let _ = qsize; unsafe { mem.add(size_of::<VirtqDesc>() * qsize as usize + 2) as *mut u16 } }
-unsafe fn avail_ring_ptr(mem: *mut u8, qsize: u16, slot: usize) -> *mut u16 { unsafe { mem.add(size_of::<VirtqDesc>() * qsize as usize + 4 + slot * 2) as *mut u16 } }
-unsafe fn used_idx_ptr(mem: *mut u8, qsize: u16) -> *mut u16 { unsafe { mem.add(used_offset(qsize) + 2) as *mut u16 } }
-unsafe fn used_elem_ptr(mem: *mut u8, qsize: u16, slot: usize) -> *mut VirtqUsedElem { unsafe { mem.add(used_offset(qsize) + 4 + slot * size_of::<VirtqUsedElem>()) as *mut VirtqUsedElem } }
+unsafe fn desc_ptr(mem: *mut u8, id: usize) -> *mut VirtqDesc {
+    unsafe { mem.add(id * size_of::<VirtqDesc>()) as *mut VirtqDesc }
+}
+unsafe fn avail_idx_ptr(mem: *mut u8, qsize: u16) -> *mut u16 {
+    let _ = qsize;
+    unsafe { mem.add(size_of::<VirtqDesc>() * qsize as usize + 2) as *mut u16 }
+}
+unsafe fn avail_ring_ptr(mem: *mut u8, qsize: u16, slot: usize) -> *mut u16 {
+    unsafe { mem.add(size_of::<VirtqDesc>() * qsize as usize + 4 + slot * 2) as *mut u16 }
+}
+unsafe fn used_idx_ptr(mem: *mut u8, qsize: u16) -> *mut u16 {
+    unsafe { mem.add(used_offset(qsize) + 2) as *mut u16 }
+}
+unsafe fn used_elem_ptr(mem: *mut u8, qsize: u16, slot: usize) -> *mut VirtqUsedElem {
+    unsafe {
+        mem.add(used_offset(qsize) + 4 + slot * size_of::<VirtqUsedElem>()) as *mut VirtqUsedElem
+    }
+}
 
 unsafe fn push_avail(mem: *mut u8, qsize: u16, descriptor: u16) {
     let idx_ptr = unsafe { avail_idx_ptr(mem, qsize) };
     let idx = unsafe { read_u16(idx_ptr) };
     let slot = idx as usize % qsize as usize;
-    unsafe { core::ptr::write_volatile(avail_ring_ptr(mem, qsize, slot), descriptor); }
+    unsafe {
+        core::ptr::write_volatile(avail_ring_ptr(mem, qsize, slot), descriptor);
+    }
     fence(Ordering::Release);
-    unsafe { core::ptr::write_volatile(idx_ptr, idx.wrapping_add(1)); }
+    unsafe {
+        core::ptr::write_volatile(idx_ptr, idx.wrapping_add(1));
+    }
 }
-unsafe fn read_u16(ptr: *mut u16) -> u16 { unsafe { core::ptr::read_volatile(ptr) } }
+unsafe fn read_u16(ptr: *mut u16) -> u16 {
+    unsafe { core::ptr::read_volatile(ptr) }
+}
 
-fn fail(io_base: u16) { unsafe { outb(io_base + VIRTIO_PCI_STATUS, STATUS_FAILED); } }
+fn fail(io_base: u16) {
+    unsafe {
+        outb(io_base + VIRTIO_PCI_STATUS, STATUS_FAILED);
+    }
+}
 
 pub fn self_test() -> bool {
     size_of::<VirtqDesc>() == 16
@@ -397,9 +576,39 @@ pub fn self_test() -> bool {
         && ACTIVE_RX_DESCRIPTORS <= MAX_QUEUE_SIZE
 }
 
-unsafe fn inb(port: u16) -> u8 { let value: u8; unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags)); } value }
-unsafe fn inw(port: u16) -> u16 { let value: u16; unsafe { core::arch::asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack, preserves_flags)); } value }
-unsafe fn inl(port: u16) -> u32 { let value: u32; unsafe { core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags)); } value }
-unsafe fn outb(port: u16, value: u8) { unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags)); } }
-unsafe fn outw(port: u16, value: u16) { unsafe { core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags)); } }
-unsafe fn outl(port: u16, value: u32) { unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags)); } }
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    unsafe {
+        core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe {
+        core::arch::asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+unsafe fn outb(port: u16, value: u8) {
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+    }
+}
+unsafe fn outw(port: u16, value: u16) {
+    unsafe {
+        core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+unsafe fn outl(port: u16, value: u32) {
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
+    }
+}

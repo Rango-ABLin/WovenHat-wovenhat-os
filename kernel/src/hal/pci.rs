@@ -102,7 +102,10 @@ pub fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 
 pub fn write_config_dword(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     unsafe {
-        outl(CONFIG_ADDRESS, config_address(bus, device, function, offset));
+        outl(
+            CONFIG_ADDRESS,
+            config_address(bus, device, function, offset),
+        );
         outl(CONFIG_DATA, value);
     }
 }
@@ -115,7 +118,9 @@ pub fn enable_io_bus_master(bus: u8, device: u8, function: u8) {
 
 pub fn bar0_io_base(bus: u8, device: u8, function: u8) -> Option<u16> {
     let bar = read_config(bus, device, function, 0x10);
-    if bar & 1 == 0 { return None; }
+    if bar & 1 == 0 {
+        return None;
+    }
     let base = bar & 0xffff_fffc;
     u16::try_from(base).ok().filter(|base| *base != 0)
 }

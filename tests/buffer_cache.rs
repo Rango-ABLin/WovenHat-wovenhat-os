@@ -14,8 +14,14 @@ fn partition_flush_reaches_cache_and_device() {
     {
         let mut cache = block_cache::CachedDevice::<_, 2>::new(&mut disk);
         {
-            let part = partition::Partition { start_lba: 1, sectors: 2, kind: 0x0b };
-            let mut view = partition::PartitionDevice::new(&mut cache, part).ok().unwrap();
+            let part = partition::Partition {
+                start_lba: 1,
+                sectors: 2,
+                kind: 0x0b,
+            };
+            let mut view = partition::PartitionDevice::new(&mut cache, part)
+                .ok()
+                .unwrap();
             assert!(view.write_sector(0, &[4; block::SECTOR_SIZE]).is_ok());
             assert!(view.flush().is_ok());
         }

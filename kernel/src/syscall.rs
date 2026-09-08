@@ -1304,22 +1304,27 @@ pub extern "C" fn wovenhat_syscall_dispatch(
         value if value == Number::ProcessInfo as u64 => sys_process_info(arg0, arg1),
         value if value == Number::SpawnCommand as u64 => sys_spawn_command(arg0, arg1),
         value if value == Number::MmapFileShared as u64 => {
-            crate::task::mmap_file_current(arg0, arg1, arg2, true, true, true).unwrap_or(SYSCALL_ERROR)
+            crate::task::mmap_file_current(arg0, arg1, arg2, true, true, true)
+                .unwrap_or(SYSCALL_ERROR)
         }
-        value if value == Number::Msync as u64 => {
-            crate::task::msync_current(arg0, arg1).map(|_| 0).unwrap_or(SYSCALL_ERROR)
-        }
+        value if value == Number::Msync as u64 => crate::task::msync_current(arg0, arg1)
+            .map(|_| 0)
+            .unwrap_or(SYSCALL_ERROR),
         value if value == Number::MmapFileLazy as u64 => {
-            crate::task::mmap_file_current(arg0, arg1, arg2, false, true, false).unwrap_or(SYSCALL_ERROR)
+            crate::task::mmap_file_current(arg0, arg1, arg2, false, true, false)
+                .unwrap_or(SYSCALL_ERROR)
         }
         value if value == Number::MmapFileLazyWritable as u64 => {
-            crate::task::mmap_file_current(arg0, arg1, arg2, true, true, false).unwrap_or(SYSCALL_ERROR)
+            crate::task::mmap_file_current(arg0, arg1, arg2, true, true, false)
+                .unwrap_or(SYSCALL_ERROR)
         }
         value if value == Number::MmapFile as u64 => {
-            crate::task::mmap_file_current(arg0, arg1, arg2, false, false, false).unwrap_or(SYSCALL_ERROR)
+            crate::task::mmap_file_current(arg0, arg1, arg2, false, false, false)
+                .unwrap_or(SYSCALL_ERROR)
         }
         value if value == Number::MmapFileWritable as u64 => {
-            crate::task::mmap_file_current(arg0, arg1, arg2, true, false, false).unwrap_or(SYSCALL_ERROR)
+            crate::task::mmap_file_current(arg0, arg1, arg2, true, false, false)
+                .unwrap_or(SYSCALL_ERROR)
         }
         value if value == Number::Fork as u64 => sys_fork(frame),
         value if value == Number::MessageSend as u64 => sys_message_send(arg0, arg1, arg2),

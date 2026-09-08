@@ -3419,8 +3419,10 @@ pub fn setup_argv_stack(
 const USER_MMAP_START: u64 = USER_REGION_START + 0x0e_0000;
 const USER_MMAP_STRIDE: u64 = 0x10_000;
 const USER_MMAP_MAX_SIZE: usize = USER_MMAP_STRIDE as usize;
-const _: () = assert!(USER_MMAP_START + MAX_ANONYMOUS_MAPPINGS as u64 * USER_MMAP_STRIDE
-    <= USER_REGION_START + USER_STACK_OFFSET - 4096);
+const _: () = assert!(
+    USER_MMAP_START + MAX_ANONYMOUS_MAPPINGS as u64 * USER_MMAP_STRIDE
+        <= USER_REGION_START + USER_STACK_OFFSET - 4096
+);
 
 #[derive(Clone, Copy)]
 pub struct AnonymousMapping {
@@ -3933,26 +3935,54 @@ pub fn map_file_private(
 
 /// Reserve an arena slot without allocating or reading any payload pages.
 pub fn map_file_lazy(
-    address_space: AddressSpace, slot: usize, file: crate::vfs::OpenFileId,
-    offset: usize, length: usize, writable: bool,
+    address_space: AddressSpace,
+    slot: usize,
+    file: crate::vfs::OpenFileId,
+    offset: usize,
+    length: usize,
+    writable: bool,
 ) -> Option<AnonymousMapping> {
-    if slot >= MAX_ANONYMOUS_MAPPINGS { return None; }
+    if slot >= MAX_ANONYMOUS_MAPPINGS {
+        return None;
+    }
     let size = crate::file_mapping::mapped_size(crate::vfs::file_size(file).ok()?, offset, length)?;
     let address = USER_MMAP_START.checked_add((slot as u64).checked_mul(USER_MMAP_STRIDE)?)?;
-    if !paging::user_range_is_unmapped_in(address_space.paging, address, size) { return None; }
+    if !paging::user_range_is_unmapped_in(address_space.paging, address, size) {
+        return None;
+    }
     let generation = crate::vfs::file_generation(file).ok()?;
     let file = crate::vfs::clone_open_file(file).ok()?;
-    Some(AnonymousMapping { address, size, writable, resident: 0,
-        lazy: Some(LazyFile { file, generation, offset, length, shared: false }) })
+    Some(AnonymousMapping {
+        address,
+        size,
+        writable,
+        resident: 0,
+        lazy: Some(LazyFile {
+            file,
+            generation,
+            offset,
+            length,
+            shared: false,
+        }),
+    })
 }
 
-pub fn map_file_shared(space: AddressSpace, slot: usize, file: crate::vfs::OpenFileId,
-    offset: usize, length: usize) -> Option<AnonymousMapping> {
+pub fn map_file_shared(
+    space: AddressSpace,
+    slot: usize,
+    file: crate::vfs::OpenFileId,
+    offset: usize,
+    length: usize,
+) -> Option<AnonymousMapping> {
     let size = crate::vfs::file_size(file).ok()?;
     crate::file_mapping::mapped_size(size, offset, length)?;
-    if slot >= MAX_ANONYMOUS_MAPPINGS { return None; }
+    if slot >= MAX_ANONYMOUS_MAPPINGS {
+        return None;
+    }
     // Shared aliases use the same complete backing page and EOF tail.
-    if !length.is_multiple_of(4096) && offset.checked_add(length)? != size { return None; }
+    if !length.is_multiple_of(4096) && offset.checked_add(length)? != size {
+        return None;
+    }
     crate::vfs::prepare_shared_file(file).ok()?;
     let mut mapping = map_file_lazy(space, slot, file, offset, length, true)?;
     mapping.lazy.as_mut()?.shared = true;
@@ -3960,43 +3990,93 @@ pub fn map_file_shared(space: AddressSpace, slot: usize, file: crate::vfs::OpenF
 }
 
 pub fn sync_file_mapping(space: AddressSpace, mapping: AnonymousMapping, durable: bool) -> bool {
-    let Some(backing) = mapping.lazy.filter(|b| b.shared) else { return false; };
-    let Ok(length) = crate::vfs::file_size(backing.file) else { return false; };
+    let Some(backing) = mapping.lazy.filter(|b| b.shared) else {
+        return false;
+    };
+    let Ok(length) = crate::vfs::file_size(backing.file) else {
+        return false;
+    };
     for index in 0..mapping.size / 4096 {
-        if mapping.resident & (1_u16 << index) == 0 { continue; }
+        if mapping.resident & (1_u16 << index) == 0 {
+            continue;
+        }
         let offset = backing.offset + index * 4096;
-        let count = length.saturating_sub(offset).min(backing.length.saturating_sub(index * 4096)).min(4096);
-        if count == 0 { continue; }
+        let count = length
+            .saturating_sub(offset)
+            .min(backing.length.saturating_sub(index * 4096))
+            .min(4096);
+        if count == 0 {
+            continue;
+        }
         let mut bytes = [0; 4096];
-        if paging::read_user_bytes_in(space.paging, mapping.address + (index * 4096) as u64, &mut bytes[..count]).is_err()
-            || crate::vfs::write_mapping_at(backing.file, offset, &bytes[..count]).is_err() { return false; }
+        if paging::read_user_bytes_in(
+            space.paging,
+            mapping.address + (index * 4096) as u64,
+            &mut bytes[..count],
+        )
+        .is_err()
+            || crate::vfs::write_mapping_at(backing.file, offset, &bytes[..count]).is_err()
+        {
+            return false;
+        }
     }
     !durable || crate::task::file_fault_io(|| crate::vfs::persist_mapping(backing.file)).is_ok()
 }
 
 /// Populate one absent page. Callers serialize this with process mapping updates.
-pub fn populate_file_page(space: AddressSpace, mapping: &mut AnonymousMapping, address: u64, write: bool) -> bool {
-    let Some(backing) = mapping.lazy else { return false; };
-    if address < mapping.address || address >= mapping.address + mapping.size as u64
-        || (write && !mapping.writable) { return false; }
+pub fn populate_file_page(
+    space: AddressSpace,
+    mapping: &mut AnonymousMapping,
+    address: u64,
+    write: bool,
+) -> bool {
+    let Some(backing) = mapping.lazy else {
+        return false;
+    };
+    if address < mapping.address
+        || address >= mapping.address + mapping.size as u64
+        || (write && !mapping.writable)
+    {
+        return false;
+    }
     let index = ((address - mapping.address) / 4096) as usize;
     let bit = 1_u16 << index;
-    if mapping.resident & bit != 0 { return false; }
+    if mapping.resident & bit != 0 {
+        return false;
+    }
     let page = mapping.address + (index * 4096) as u64;
     let count = backing.length.saturating_sub(index * 4096).min(4096);
-    if !crate::file_frames::map(space.paging, page, backing.file, backing.generation,
-        backing.offset + index * 4096, count, backing.shared) { return false; }
+    if !crate::file_frames::map(
+        space.paging,
+        page,
+        backing.file,
+        backing.generation,
+        backing.offset + index * 4096,
+        count,
+        backing.shared,
+    ) {
+        return false;
+    }
     mapping.resident |= bit;
     true
 }
 
 pub fn unmap_anonymous(address_space: AddressSpace, mapping: AnonymousMapping) -> bool {
     if let Some(backing) = mapping.lazy {
-        if backing.shared && !sync_file_mapping(address_space, mapping, false) { return false; }
+        if backing.shared && !sync_file_mapping(address_space, mapping, false) {
+            return false;
+        }
         for index in 0..mapping.size / 4096 {
             if mapping.resident & (1_u16 << index) != 0
-                && paging::unmap_user_range_in(address_space.paging,
-                    mapping.address + (index * 4096) as u64, 4096).is_err() { return false; }
+                && paging::unmap_user_range_in(
+                    address_space.paging,
+                    mapping.address + (index * 4096) as u64,
+                    4096,
+                )
+                .is_err()
+            {
+                return false;
+            }
         }
         let closed = crate::vfs::close_open_file(backing.file).is_ok();
         crate::file_frames::reclaim_unused();
@@ -4082,15 +4162,25 @@ pub fn clone_address_space(
 
     for mapping in anonymous.iter().flatten() {
         for index in 0..mapping.size / 4096 {
-            if mapping.lazy.is_some() && mapping.resident & (1_u16 << index) == 0 { continue; }
+            if mapping.lazy.is_some() && mapping.resident & (1_u16 << index) == 0 {
+                continue;
+            }
             let page = mapping.address + (index * 4096) as u64;
             let shared = mapping.lazy.is_some_and(|b| b.shared);
             let copied = if shared {
-                paging::user_frame_in(source.paging, page).is_some_and(|frame|
-                    paging::map_file_frame(destination.paging, page, frame, true))
+                paging::user_frame_in(source.paging, page).is_some_and(|frame| {
+                    paging::map_file_frame(destination.paging, page, frame, true)
+                })
             } else {
-                paging::share_user_range_in(source.paging, destination.paging,
-                    page, 4096, mapping.writable, false).is_ok()
+                paging::share_user_range_in(
+                    source.paging,
+                    destination.paging,
+                    page,
+                    4096,
+                    mapping.writable,
+                    false,
+                )
+                .is_ok()
             };
             if !copied {
                 release_clone(destination.paging, &completed[..completed_count]);
@@ -4105,7 +4195,9 @@ pub fn clone_address_space(
         if let Some(backing) = mapping.and_then(|m| m.lazy) {
             if crate::vfs::clone_open_file(backing.file).is_err() {
                 for prior in anonymous[..index].iter().flatten() {
-                    if let Some(backing) = prior.lazy { let _ = crate::vfs::close_open_file(backing.file); }
+                    if let Some(backing) = prior.lazy {
+                        let _ = crate::vfs::close_open_file(backing.file);
+                    }
                 }
                 release_clone(destination.paging, &completed[..completed_count]);
                 return None;
@@ -4295,23 +4387,37 @@ pub fn shared_disk_mmap_self_test() -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| {
         const PATH: &str = "/mnt/vmsync.txt";
         const MARKER: &[u8] = b"WOVENHAT MSYNC OK\n";
-        if !crate::storage::fat32_writable() { return false; }
+        if !crate::storage::fat32_writable() {
+            return false;
+        }
         if crate::vfs::stat(PATH).is_ok() {
             let mut bytes = [0; 64];
-            return crate::task::file_fault_io(|| crate::storage::read_disk_file(PATH, 0, &mut bytes)) == Ok(MARKER.len())
+            return crate::task::file_fault_io(|| {
+                crate::storage::read_disk_file(PATH, 0, &mut bytes)
+            }) == Ok(MARKER.len())
                 && &bytes[..MARKER.len()] == MARKER;
         }
-        if crate::vfs::write_file(PATH, &[0; MARKER.len()]).is_err() { return false; }
-        let Ok(file) = crate::vfs::open(PATH) else { return false; };
-        let Some(root) = paging::create_user_address_space(USER_MMAP_START) else {
-            let _ = crate::vfs::close_open_file(file); return false;
+        if crate::vfs::write_file(PATH, &[0; MARKER.len()]).is_err() {
+            return false;
+        }
+        let Ok(file) = crate::vfs::open(PATH) else {
+            return false;
         };
-        let space = AddressSpace { paging: root, stack_base: 0,
-            mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS], mapping_count: 0 };
+        let Some(root) = paging::create_user_address_space(USER_MMAP_START) else {
+            let _ = crate::vfs::close_open_file(file);
+            return false;
+        };
+        let space = AddressSpace {
+            paging: root,
+            stack_base: 0,
+            mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS],
+            mapping_count: 0,
+        };
         let anchor = USER_MMAP_START + 15 * USER_MMAP_STRIDE;
         if paging::map_user_range_in(root, anchor, 4096, false, false).is_err() {
             let _ = paging::discard_empty_user_address_space(root);
-            let _ = crate::vfs::close_open_file(file); return false;
+            let _ = crate::vfs::close_open_file(file);
+            return false;
         }
         let mut passed = false;
         if let Some(mut mapping) = map_file_shared(space, 0, file, 0, MARKER.len()) {
@@ -4323,7 +4429,9 @@ pub fn shared_disk_mmap_self_test() -> bool {
         passed &= paging::destroy_user_address_space(root, &[(anchor, 4096)]).is_ok();
         passed &= crate::vfs::close_open_file(file).is_ok();
         let mut bytes = [0; 64];
-        passed && crate::task::file_fault_io(|| crate::storage::read_disk_file(PATH, 0, &mut bytes)) == Ok(MARKER.len())
+        passed
+            && crate::task::file_fault_io(|| crate::storage::read_disk_file(PATH, 0, &mut bytes))
+                == Ok(MARKER.len())
             && &bytes[..MARKER.len()] == MARKER
     })
 }
@@ -4333,20 +4441,37 @@ pub fn disk_unlink_mmap_self_test() -> bool {
         const PATH: &str = "/mnt/vmpin.txt";
         let mut bytes = [0; 4096];
         if crate::vfs::stat(PATH).is_ok() {
-            return crate::task::file_fault_io(|| crate::storage::read_disk_file(PATH, 0, &mut bytes)) == Ok(4096)
+            return crate::task::file_fault_io(|| {
+                crate::storage::read_disk_file(PATH, 0, &mut bytes)
+            }) == Ok(4096)
                 && bytes == [66; 4096];
         }
         if crate::vfs::write_file(PATH, &[65; 4096]).is_err()
             || crate::task::file_fault_io(|| crate::storage::persist_path(PATH)).is_err()
             || crate::vfs::remove(PATH).is_err()
-            || crate::vfs::create_disk_file(PATH, 4096).is_err() { return false; }
-        let Ok(file) = crate::vfs::open(PATH) else { return false; };
-        let Some(root) = paging::create_user_address_space(USER_MMAP_START) else { return false; };
-        let space = AddressSpace { paging: root, stack_base: 0,
-            mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS], mapping_count: 0 };
+            || crate::vfs::create_disk_file(PATH, 4096).is_err()
+        {
+            return false;
+        }
+        let Ok(file) = crate::vfs::open(PATH) else {
+            return false;
+        };
+        let Some(root) = paging::create_user_address_space(USER_MMAP_START) else {
+            return false;
+        };
+        let space = AddressSpace {
+            paging: root,
+            stack_base: 0,
+            mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS],
+            mapping_count: 0,
+        };
         let anchor = USER_MMAP_START + 15 * USER_MMAP_STRIDE;
-        if paging::map_user_range_in(root, anchor, 4096, false, false).is_err() { return false; }
-        let Some(mut mapping) = map_file_lazy(space, 0, file, 0, 4096, false) else { return false; };
+        if paging::map_user_range_in(root, anchor, 4096, false, false).is_err() {
+            return false;
+        }
+        let Some(mut mapping) = map_file_lazy(space, 0, file, 0, 4096, false) else {
+            return false;
+        };
         let mut passed = crate::vfs::close_open_file(file).is_ok()
             && crate::vfs::remove(PATH).is_ok()
             && crate::vfs::write_file(PATH, &[66; 4096]).is_ok()
@@ -4356,7 +4481,9 @@ pub fn disk_unlink_mmap_self_test() -> bool {
             && bytes == [65; 4096];
         passed &= unmap_anonymous(space, mapping);
         passed &= paging::destroy_user_address_space(root, &[(anchor, 4096)]).is_ok();
-        passed && crate::task::file_fault_io(|| crate::storage::read_disk_file(PATH, 0, &mut bytes)) == Ok(4096)
+        passed
+            && crate::task::file_fault_io(|| crate::storage::read_disk_file(PATH, 0, &mut bytes))
+                == Ok(4096)
             && bytes == [66; 4096]
     })
 }
@@ -4366,27 +4493,51 @@ pub fn shared_file_mmap_self_test() -> bool {
     static DATA: [u8; 8193] = [65; 8193];
     let frames = crate::memory::stats().allocated_frames;
     let descriptors = crate::vfs::open_file_description_count();
-    if crate::vfs::stat(PATH).is_ok() || crate::vfs::write_file(PATH, &DATA).is_err() { return false; }
-    let Ok(file) = crate::vfs::open(PATH) else { return false; };
-    let Some(root) = paging::create_user_address_space(USER_MMAP_START) else { return false; };
-    let space = AddressSpace { paging: root, stack_base: 0,
-        mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS], mapping_count: 0 };
+    if crate::vfs::stat(PATH).is_ok() || crate::vfs::write_file(PATH, &DATA).is_err() {
+        return false;
+    }
+    let Ok(file) = crate::vfs::open(PATH) else {
+        return false;
+    };
+    let Some(root) = paging::create_user_address_space(USER_MMAP_START) else {
+        return false;
+    };
+    let space = AddressSpace {
+        paging: root,
+        stack_base: 0,
+        mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS],
+        mapping_count: 0,
+    };
     let anchor = USER_MMAP_START + 15 * USER_MMAP_STRIDE;
-    if paging::map_user_range_in(root, anchor, 4096, false, false).is_err() { return false; }
-    let Some(mut first) = map_file_shared(space, 0, file, 0, DATA.len()) else { return false; };
-    let Some(mut second) = map_file_shared(space, 1, file, 0, DATA.len()) else { return false; };
-    let Some(mut private) = map_file_lazy(space, 2, file, 0, DATA.len(), true) else { return false; };
+    if paging::map_user_range_in(root, anchor, 4096, false, false).is_err() {
+        return false;
+    }
+    let Some(mut first) = map_file_shared(space, 0, file, 0, DATA.len()) else {
+        return false;
+    };
+    let Some(mut second) = map_file_shared(space, 1, file, 0, DATA.len()) else {
+        return false;
+    };
+    let Some(mut private) = map_file_lazy(space, 2, file, 0, DATA.len(), true) else {
+        return false;
+    };
     let mut passed = populate_file_page(space, &mut first, USER_MMAP_START, true);
     let after_first = crate::memory::stats().allocated_frames;
     passed &= populate_file_page(space, &mut second, USER_MMAP_START + USER_MMAP_STRIDE, true);
     passed &= crate::memory::stats().allocated_frames == after_first
-        && paging::user_frame_in(root, first.address) == paging::user_frame_in(root, second.address)
+        && paging::user_frame_in(root, first.address)
+            == paging::user_frame_in(root, second.address)
         && crate::file_frames::reclaim_unused() == 0;
     passed &= paging::write_user_bytes(root, first.address, &[66]).is_ok();
     let mut byte = [0];
     passed &= paging::read_user_bytes_in(root, second.address, &mut byte).is_ok() && byte == [66];
     passed &= crate::vfs::read_at(file, 0, &mut byte) == Ok(1) && byte == [66];
-    passed &= populate_file_page(space, &mut private, USER_MMAP_START + 2 * USER_MMAP_STRIDE, false);
+    passed &= populate_file_page(
+        space,
+        &mut private,
+        USER_MMAP_START + 2 * USER_MMAP_STRIDE,
+        false,
+    );
     passed &= paging::read_user_bytes_in(root, private.address, &mut byte).is_ok() && byte == [66];
     passed &= paging::try_break_cow(root, private.address);
     passed &= paging::write_user_bytes(root, private.address, &[80]).is_ok();
@@ -4395,7 +4546,8 @@ pub fn shared_file_mmap_self_test() -> bool {
     passed &= sync_file_mapping(space, first, false);
     passed &= crate::vfs::write_file(PATH, b"Z").is_ok();
     let mut tail = [9; 2];
-    passed &= paging::read_user_bytes_in(root, second.address, &mut tail).is_ok() && tail == [90, 0];
+    passed &=
+        paging::read_user_bytes_in(root, second.address, &mut tail).is_ok() && tail == [90, 0];
     passed &= paging::read_user_bytes_in(root, private.address, &mut byte).is_ok() && byte == [80];
     // Truncated absent pages fault; existing shared pages have a zeroed tail.
     passed &= !populate_file_page(space, &mut first, USER_MMAP_START + 4096, false);
@@ -4408,27 +4560,46 @@ pub fn shared_file_mmap_self_test() -> bool {
     passed &= unmap_anonymous(space, second) && unmap_anonymous(space, private);
     passed &= paging::destroy_user_address_space(root, &[(anchor, 4096)]).is_ok();
     passed &= crate::vfs::remove(PATH).is_ok();
-    passed && crate::memory::stats().allocated_frames == frames
+    passed
+        && crate::memory::stats().allocated_frames == frames
         && crate::vfs::open_file_description_count() == descriptors
 }
 
 /// Verify reservations are truly absent, and loading touches exactly one page.
 pub fn lazy_file_mmap_self_test() -> bool {
     const PATH: &str = "/tmp/lazy-mmap-test";
-    static DATA: [u8; 8193] = { let mut data = [65; 8193]; data[3] = 0x33; data };
+    static DATA: [u8; 8193] = {
+        let mut data = [65; 8193];
+        data[3] = 0x33;
+        data
+    };
     static CHANGED: [u8; 8193] = [66; 8193];
     let frames_before = crate::memory::stats().allocated_frames;
     let before = crate::vfs::open_file_description_count();
-    if crate::vfs::stat(PATH).is_ok() || crate::vfs::write_file(PATH, &DATA).is_err() { return false; }
-    let Ok(file) = crate::vfs::open(PATH) else { return false; };
-    let Some(root) = paging::create_user_address_space(USER_MMAP_START) else { return false; };
-    let space = AddressSpace { paging: root, stack_base: 0,
-        mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS], mapping_count: 0 };
+    if crate::vfs::stat(PATH).is_ok() || crate::vfs::write_file(PATH, &DATA).is_err() {
+        return false;
+    }
+    let Ok(file) = crate::vfs::open(PATH) else {
+        return false;
+    };
+    let Some(root) = paging::create_user_address_space(USER_MMAP_START) else {
+        return false;
+    };
+    let space = AddressSpace {
+        paging: root,
+        stack_base: 0,
+        mappings: [UserMapping::EMPTY; MAX_ELF_SEGMENTS],
+        mapping_count: 0,
+    };
     // Keep a teardown anchor while sparse mapping pages are removed individually.
     let anchor = USER_MMAP_START + 15 * USER_MMAP_STRIDE;
-    if paging::map_user_range_in(root, anchor, 4096, false, false).is_err() { return false; }
+    if paging::map_user_range_in(root, anchor, 4096, false, false).is_err() {
+        return false;
+    }
     let reservation_frames = crate::memory::stats().allocated_frames;
-    let Some(mut mapping) = map_file_lazy(space, 0, file, 0, DATA.len(), false) else { return false; };
+    let Some(mut mapping) = map_file_lazy(space, 0, file, 0, DATA.len(), false) else {
+        return false;
+    };
     let mut passed = crate::memory::stats().allocated_frames == reservation_frames
         && mapping.resident == 0
         && paging::user_range_is_unmapped_in(root, mapping.address, mapping.size)
@@ -4455,18 +4626,20 @@ pub fn lazy_file_mmap_self_test() -> bool {
     passed &= crate::vfs::write_file(PATH, &CHANGED).is_ok();
     passed &= populate_file_page(space, &mut mapping, USER_MMAP_START, false);
     passed &= paging::read_user_bytes_in(root, mapping.address, &mut byte).is_ok() && byte == [66];
-    passed &= paging::read_user_bytes_in(root, mapping.address + 8192, &mut byte).is_ok() && byte == [65];
+    passed &=
+        paging::read_user_bytes_in(root, mapping.address + 8192, &mut byte).is_ok() && byte == [65];
     passed &= crate::vfs::remove(PATH).is_ok();
     passed &= crate::vfs::write_file(PATH, &DATA).is_ok();
     // Unlink removes the name, while the mapping retains the original node.
     // Recreating the same path must not redirect faults to the replacement.
     passed &= populate_file_page(space, &mut mapping, USER_MMAP_START + 4096, false);
-    passed &= paging::read_user_bytes_in(root, mapping.address + 4096, &mut byte).is_ok()
-        && byte == [66];
+    passed &=
+        paging::read_user_bytes_in(root, mapping.address + 4096, &mut byte).is_ok() && byte == [66];
     passed &= unmap_anonymous(space, mapping);
     passed &= paging::destroy_user_address_space(root, &[(anchor, 4096)]).is_ok();
     passed &= crate::vfs::remove(PATH).is_ok();
-    passed && crate::vfs::open_file_description_count() == before
+    passed
+        && crate::vfs::open_file_description_count() == before
         && crate::memory::stats().allocated_frames == frames_before
 }
 
@@ -5004,13 +5177,22 @@ pub fn install_file_mmap_test() -> bool {
         let mut data = [65; 8193];
         let path = b"/etc/motd";
         let mut index = 0;
-        while index < path.len() { data[index] = path[index]; index += 1; }
+        while index < path.len() {
+            data[index] = path[index];
+            index += 1;
+        }
         data
     };
     if crate::vfs::stat("/etc/mmap-pages").is_err()
-        && crate::vfs::create_read_only("/etc/mmap-pages", &LAZY_DATA).is_err() { return false; }
+        && crate::vfs::create_read_only("/etc/mmap-pages", &LAZY_DATA).is_err()
+    {
+        return false;
+    }
     if crate::vfs::stat("/tmp/mmap-share").is_err()
-        && crate::vfs::write_file("/tmp/mmap-share", &[65; 4096]).is_err() { return false; }
+        && crate::vfs::write_file("/tmp/mmap-share", &[65; 4096]).is_err()
+    {
+        return false;
+    }
     unsafe extern "C" {
         static wovenhat_file_mmap_start: u8;
         static wovenhat_file_mmap_end: u8;

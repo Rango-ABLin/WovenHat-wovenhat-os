@@ -10,9 +10,6 @@ mod audit;
 mod benchmark;
 mod block;
 mod block_cache;
-mod page_cache;
-mod file_mapping;
-mod file_frames;
 mod capability;
 mod config;
 mod console;
@@ -20,6 +17,8 @@ mod device;
 mod elf;
 mod entropy;
 mod fat32;
+mod file_frames;
+mod file_mapping;
 mod gdt;
 mod gpt;
 mod graphics;
@@ -30,6 +29,8 @@ mod interrupts;
 mod ipc;
 mod keyboard;
 mod memory;
+mod network;
+mod page_cache;
 mod paging;
 mod panic;
 mod partition;
@@ -45,7 +46,6 @@ mod timer;
 mod userspace;
 mod vfs;
 mod virtio_net;
-mod network;
 
 use bootloader_api::{config::Mapping, entry_point, info::Optional, BootInfo, BootloaderConfig};
 
@@ -272,22 +272,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pic::unmask(timer::IRQ);
         pic::unmask(keyboard::IRQ);
         x86_64::instructions::interrupts::enable();
+        if !task::start_pager() {
+            console.println("PAGER: START FAILED");
+            halt();
+        }
 
         let ata_sectors = ata::init();
         if let Some(sectors) = ata_sectors {
-            serial::write_line(format_args!("[ATA] primary-master online: {} sectors", sectors));
+            serial::write_line(format_args!(
+                "[ATA] primary-master online: {} sectors",
+                sectors
+            ));
         } else {
             serial::write_line(format_args!("[ATA] primary-master not detected"));
         }
 
         match storage::mount_ata_root() {
             storage::MountStatus::Mounted(count) => {
-                let _ = device::register(device::Device { name: "ata0", kind: device::DeviceKind::Block, irq: None });
-                serial::write_line(format_args!("[FS] FAT32 mounted at /mnt; imported {} entries", count));
+                let _ = device::register(device::Device {
+                    name: "ata0",
+                    kind: device::DeviceKind::Block,
+                    irq: None,
+                });
+                serial::write_line(format_args!(
+                    "[FS] FAT32 mounted at /mnt; imported {} entries",
+                    count
+                ));
             }
-            storage::MountStatus::NoDevice => serial::write_line(format_args!("[FS] no ATA disk; continuing with RAM VFS")),
-            storage::MountStatus::NotFat32 => serial::write_line(format_args!("[FS] ATA disk present but no FAT32 root")),
-            storage::MountStatus::Failed => serial::write_line(format_args!("[FS] FAT32 mount failed; continuing with RAM VFS")),
+            storage::MountStatus::NoDevice => {
+                serial::write_line(format_args!("[FS] no ATA disk; continuing with RAM VFS"))
+            }
+            storage::MountStatus::NotFat32 => {
+                serial::write_line(format_args!("[FS] ATA disk present but no FAT32 root"))
+            }
+            storage::MountStatus::Failed => serial::write_line(format_args!(
+                "[FS] FAT32 mount failed; continuing with RAM VFS"
+            )),
         }
 
         for dir in ["/etc", "/var", "/home", "/tmp"] {
@@ -295,8 +315,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
 
         match network::init() {
-            Ok(()) => serial::write_line(format_args!("[NET] virtio-net + smoltcp online at 10.0.2.15/24")),
-            Err(error) => serial::write_line(format_args!("[NET] optional network init skipped: {:?}", error)),
+            Ok(()) => serial::write_line(format_args!(
+                "[NET] virtio-net + smoltcp online at 10.0.2.15/24"
+            )),
+            Err(error) => serial::write_line(format_args!(
+                "[NET] optional network init skipped: {:?}",
+                error
+            )),
         }
 
         serial::write_line(format_args!(
@@ -458,19 +483,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         halt();
     }
     if paging::frame_ownership_self_test() {
-        serial::write_line(format_args!("[FRAME OWNERSHIP] overflow and exhaustion rollback: PASSED"));
+        serial::write_line(format_args!(
+            "[FRAME OWNERSHIP] overflow and exhaustion rollback: PASSED"
+        ));
     } else {
-        serial::write_line(format_args!("[FRAME OWNERSHIP] exhaustion rollback: FAILED"));
+        serial::write_line(format_args!(
+            "[FRAME OWNERSHIP] exhaustion rollback: FAILED"
+        ));
         halt();
     }
     if file_frames::self_test() {
-        serial::write_line(format_args!("[FRAME CACHE] pinned aliases, LRU eviction, reclaim: PASSED"));
+        serial::write_line(format_args!(
+            "[FRAME CACHE] pinned aliases, LRU eviction, reclaim: PASSED"
+        ));
     } else {
         serial::write_line(format_args!("[FRAME CACHE] regression tests: FAILED"));
         halt();
     }
     if userspace::shared_file_mmap_self_test() {
-        serial::write_line(format_args!("[SHARED FILE MMAP] aliases, COW, truncation, unlink, reclaim: PASSED"));
+        serial::write_line(format_args!(
+            "[SHARED FILE MMAP] aliases, COW, truncation, unlink, reclaim: PASSED"
+        ));
     } else {
         serial::write_line(format_args!("[SHARED FILE MMAP] regression tests: FAILED"));
         halt();
@@ -706,6 +739,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     pic::unmask(timer::IRQ);
     pic::unmask(keyboard::IRQ);
     x86_64::instructions::interrupts::enable();
+    if !task::start_pager() {
+        console.println("PAGER: START FAILED");
+        halt();
+    }
 
     while timer::ticks() < 3 {
         task::yield_now();
@@ -818,10 +855,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     ));
 
     if !task::file_fault_io_self_test() {
-        serial::write_line(format_args!("[FAULT IO] interrupt/preemption guard: FAILED"));
+        serial::write_line(format_args!(
+            "[FAULT IO] interrupt/preemption guard: FAILED"
+        ));
         halt();
     }
-    serial::write_line(format_args!("[FAULT IO] timer IRQs live, task stable, state restored: PASSED"));
+    serial::write_line(format_args!(
+        "[FAULT IO] timer IRQs live, task stable, state restored: PASSED"
+    ));
     let first_root = first_program.address_space.root_address();
     let second_root = second_program.address_space.root_address();
     let first_pid = match task::spawn_user_process("init-user-a", first_program) {
@@ -899,6 +940,48 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "[BOOT] user write/open/read/close and pointer validation verified"
     ));
 
+    // Exercise a real Ring-3 absent-page exception. The pager must park the
+    // faulting context, populate the backing page on its worker task, then
+    // resume the original instruction. mmaptest covers sparse lazy faults,
+    // writes, fork, and kernel copy_to/from_user fault resolution.
+    let pager_before = task::pager_stats();
+    if !userspace::install_file_mmap_test() {
+        console.println("PAGER MMAP IMAGE: INSTALL FAILED");
+        halt();
+    }
+    let mut pager_image = alloc::vec![0u8; vfs::NODE_CAPACITY];
+    let Ok(pager_image_len) = vfs::read_all("/bin/mmaptest", &mut pager_image) else {
+        console.println("PAGER MMAP IMAGE: READ FAILED");
+        halt();
+    };
+    let Some(pager_program) = userspace::load_elf_with_argv(&pager_image[..pager_image_len], &["/bin/mmaptest"]) else {
+        console.println("PAGER MMAP IMAGE: LOAD FAILED");
+        halt();
+    };
+    let pager_pid = match task::spawn_user_process("pager-mmaptest", pager_program) {
+        Ok((pid, _)) => pid,
+        Err(_) => {
+            console.println("PAGER MMAP PROCESS: SPAWN FAILED");
+            halt();
+        }
+    };
+    while !task::process_exited(pager_pid) {
+        x86_64::instructions::hlt();
+    }
+    let pager_status = task::wait_process(pager_pid.as_u64());
+    let pager_after = task::pager_stats();
+    if pager_status != Ok(0)
+        || pager_after.0 <= pager_before.0
+        || pager_after.1 < pager_after.0
+    {
+        console.println("ASYNCHRONOUS PAGER: FAILED");
+        halt();
+    }
+    serial::write_line(format_args!(
+        "[PAGER] Ring-3 faults queued={} completed={}: PASSED",
+        pager_after.0 - pager_before.0,
+        pager_after.1 - pager_before.1
+    ));
     if !syscall::last_completed(syscall::Number::Getpid) {
         console.println("USER SYSCALL ABI: FAILED");
         halt();

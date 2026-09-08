@@ -82,8 +82,12 @@ impl<'a, D: BlockDevice> PartitionDevice<'a, D> {
 }
 
 impl<D: BlockDevice> BlockDevice for PartitionDevice<'_, D> {
-    fn is_read_only(&self) -> bool { self.device.is_read_only() }
-    fn flush(&mut self) -> Result<(), BlockError> { self.device.flush() }
+    fn is_read_only(&self) -> bool {
+        self.device.is_read_only()
+    }
+    fn flush(&mut self) -> Result<(), BlockError> {
+        self.device.flush()
+    }
     fn sector_count(&self) -> u64 {
         self.partition.sectors
     }

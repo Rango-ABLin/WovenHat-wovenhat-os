@@ -133,7 +133,9 @@ impl BlockDevice for AtaPio {
 
 pub fn init() -> Option<u64> {
     let mut primary = PRIMARY_MASTER.lock();
-    if let Some(disk) = primary.as_ref() { return Some(disk.sector_count()); }
+    if let Some(disk) = primary.as_ref() {
+        return Some(disk.sector_count());
+    }
     let disk = AtaPio::identify()?;
     let sectors = disk.sectors;
     *primary = Some(BufferedAta::new(disk));

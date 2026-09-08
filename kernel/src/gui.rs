@@ -12,7 +12,12 @@ pub struct Rect {
 
 impl Rect {
     pub const fn new(x: i32, y: i32, width: usize, height: usize) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn contains(self, x: i32, y: i32) -> bool {
@@ -262,10 +267,10 @@ pub fn self_test() -> bool {
     ));
     desktop.add_window(window);
 
-    let first_focused = desktop.handle(&InputEvent::Key('\t'))
-        && desktop.windows[0].buttons[0].focused;
-    let second_focused = desktop.handle(&InputEvent::Key('\t'))
-        && desktop.windows[0].buttons[1].focused;
+    let first_focused =
+        desktop.handle(&InputEvent::Key('\t')) && desktop.windows[0].buttons[0].focused;
+    let second_focused =
+        desktop.handle(&InputEvent::Key('\t')) && desktop.windows[0].buttons[1].focused;
     let activated = desktop.handle(&InputEvent::Key('\n'));
     let pointer_activation = desktop.handle(&InputEvent::PointerDown { x: 20, y: 20 });
     first_focused
