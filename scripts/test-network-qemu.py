@@ -21,11 +21,16 @@ def reserve_udp_port():
         return sock.getsockname()[1]
 
 
-def wait_for_marker(serial_path, marker, process, deadline):
+def wait_for_marker(serial_path, marker, process, deadline, failure_markers=()):
     while time.monotonic() < deadline:
         log = serial_path.read_text(errors="replace")
         if marker in log:
             return log
+        for failure in failure_markers:
+            if failure in log:
+                raise RuntimeError(
+                    f"Kernel reported {failure!r} while waiting for {marker!r}"
+                )
         if process.poll() is not None:
             raise RuntimeError(f"QEMU exited before {marker!r}")
         time.sleep(0.05)
@@ -85,7 +90,9 @@ def main():
     if args.release:
         build.append('--release')
     build += ['--features', 'network-test', '--', '--print-image']
+    print(f"[1/6] Building WovenHat network-test image ({'release' if args.release else 'debug'})...", flush=True)
     image = subprocess.check_output(build, cwd=root, text=True).strip()
+    print(f"      image: {image}", flush=True)
 
     mode = 'release' if args.release else 'debug'
     out = root / 'target' / f'network-regression-{args.cpus}-{mode}'
@@ -114,16 +121,66 @@ def main():
     qemu_log = out / 'qemu.log'
     deadline = time.monotonic() + args.timeout
 
+    print(f"[2/6] Starting QEMU with {args.cpus} CPU(s)...", flush=True)
+    print(f"      UDP host:{udp_port} -> guest:7000", flush=True)
+    print(f"      TCP host:{tcp_port} -> guest:8080", flush=True)
+
+    early_failures = (
+        '[NETTEST] init failed:',
+        '[NETTEST] DHCP: TIMEOUT',
+        '[NETTEST] DNS: START FAILED',
+        '[NETTEST] DNS: FAILED',
+        '[NETTEST] DNS: TIMEOUT',
+        '[NETTEST] ICMP: START FAILED',
+        '[NETTEST] ICMP: FAILED',
+        '[NETTEST] ICMP: TIMEOUT',
+        '[NETTEST] runtime regression: FAILED',
+    )
+
     with qemu_log.open('w') as errors:
         process = subprocess.Popen(command, cwd=root, stdout=errors, stderr=errors, creationflags=flags)
         try:
-            wait_for_marker(serial, '[NETTEST] UDP READY port=7000', process, deadline)
-            udp_round_trip(udp_port)
-            wait_for_marker(serial, '[NETTEST] UDP: PASSED', process, deadline)
+            print('[3/6] Waiting for DHCP + DNS + ICMP...', flush=True)
+            wait_for_marker(
+                serial,
+                '[NETTEST] UDP READY port=7000',
+                process,
+                deadline,
+                early_failures,
+            )
+            print('      DHCP + DNS + ICMP: PASS', flush=True)
 
-            wait_for_marker(serial, '[NETTEST] TCP READY port=8080', process, deadline)
+            print('[4/6] Verifying host <-> WovenHat UDP round trip...', flush=True)
+            udp_round_trip(udp_port)
+            wait_for_marker(
+                serial,
+                '[NETTEST] UDP: PASSED',
+                process,
+                deadline,
+                ('[NETTEST] UDP: TIMEOUT', '[NETTEST] runtime regression: FAILED'),
+            )
+            print('      UDP: PASS', flush=True)
+
+            print('[5/6] Verifying host <-> WovenHat TCP round trip...', flush=True)
+            wait_for_marker(
+                serial,
+                '[NETTEST] TCP READY port=8080',
+                process,
+                deadline,
+                ('[NETTEST] TCP: OPEN FAILED', '[NETTEST] TCP: LISTEN FAILED',
+                 '[NETTEST] runtime regression: FAILED'),
+            )
             tcp_round_trip(tcp_port)
-            wait_for_marker(serial, '[NETTEST] TCP: PASSED', process, deadline)
+            wait_for_marker(
+                serial,
+                '[NETTEST] TCP: PASSED',
+                process,
+                deadline,
+                ('[NETTEST] TCP: RECEIVE FAILED', '[NETTEST] TCP: RECEIVE TIMEOUT',
+                 '[NETTEST] TCP: SEND FAILED', '[NETTEST] TCP: SEND TIMEOUT',
+                 '[NETTEST] runtime regression: FAILED'),
+            )
+            print('      TCP: PASS', flush=True)
 
             remaining = max(1.0, deadline - time.monotonic())
             result = process.wait(timeout=remaining)
@@ -137,6 +194,7 @@ def main():
                 process.kill()
                 process.wait(timeout=5)
 
+    print('[6/6] Verifying final SMP/TLB/release markers...', flush=True)
     log = serial.read_text(errors='replace')
     required = [
         f'[SMP] online={args.cpus} expected={args.cpus}',

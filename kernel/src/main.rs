@@ -782,20 +782,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pic::unmask(keyboard::IRQ);
     }
     x86_64::instructions::interrupts::enable();
-    #[cfg(feature = "network-test")]
+    // The root `network-test` mode always enables `qemu-test`.  Cargo artifact
+    // dependencies can keep a nested kernel-only feature isolated, so key the
+    // runtime probe from the qemu-test feature that is known to reach this
+    // kernel artifact.  Only QEMU configurations that actually expose the
+    // supported VirtIO network device run the live networking regression.
+    //
+    // Memory/storage QEMU suites do not attach that VirtIO NIC: `network::init`
+    // simply fails its transport probe and those suites continue normally.
+    #[cfg(feature = "qemu-test")]
     {
         match network::init() {
-            Ok(()) => serial::write_line(format_args!("[NETTEST] virtio-net + smoltcp initialized")),
-            Err(error) => {
-                serial::write_line(format_args!("[NETTEST] init failed: {:?}", error));
-                halt();
+            Ok(()) => {
+                serial::write_line(format_args!(
+                    "[NETTEST] virtio-net + smoltcp initialized"
+                ));
+                if network::qemu_runtime_self_test() {
+                    serial::write_line(format_args!(
+                        "[NETTEST] DHCP/DNS/ICMP/UDP/TCP: PASSED"
+                    ));
+                } else {
+                    serial::write_line(format_args!(
+                        "[NETTEST] runtime regression: FAILED"
+                    ));
+                    halt();
+                }
             }
-        }
-        if network::qemu_runtime_self_test() {
-            serial::write_line(format_args!("[NETTEST] DHCP/DNS/ICMP/UDP/TCP: PASSED"));
-        } else {
-            serial::write_line(format_args!("[NETTEST] runtime regression: FAILED"));
-            halt();
+            Err(_) => {
+                // No supported VirtIO NIC belongs to the normal memory/storage
+                // QEMU regressions, so networking is intentionally skipped.
+            }
         }
     }
     if !block_io::start_worker() {
@@ -953,7 +969,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     ));
     let first_root = first_program.address_space.root_address();
     let second_root = second_program.address_space.root_address();
-    let first_pid = match task::spawn_user_process("init-user-a", first_program) {
+    // Publish the paired bootstrap processes as one BSP-local transaction.
+    // A timer interrupt used to be able to schedule process A after its TCB was
+    // made Ready but before process B and its process-table entry were created.
+    // That timing window became visible with multiple LAPIC timers running and
+    // could leave the boot validation waiting forever before the identity audit.
+    // APs may continue taking timer interrupts, but their scheduler path uses
+    // try_lock and cannot run CPU-0-owned userspace tasks.
+    serial::write_line(format_args!(
+        "[BOOT] paired userspace spawn: BEGIN"
+    ));
+    let (first_spawn, second_spawn) = x86_64::instructions::interrupts::without_interrupts(|| {
+        let first = task::spawn_user_process("init-user-a", first_program);
+        let second = if first.is_ok() {
+            Some(task::spawn_user_process("init-user-b", second_program))
+        } else {
+            None
+        };
+        (first, second)
+    });
+
+    let first_pid = match first_spawn {
         Ok((pid, context)) => {
             serial::write_line(format_args!(
                 "[BOOT] ring3 frame CS={:#x} SS={:#x} RIP={:#x} RSP={:#x}",
@@ -966,13 +1002,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             halt();
         }
     };
-    let second_pid = match task::spawn_user_process("init-user-b", second_program) {
-        Ok((pid, _)) => pid,
-        Err(_) => {
+    let second_pid = match second_spawn {
+        Some(Ok((pid, _))) => pid,
+        _ => {
             console.println("SECOND USER PROCESS: SPAWN FAILED");
             halt();
         }
     };
+    serial::write_line(format_args!(
+        "[BOOT] paired userspace spawn: READY"
+    ));
     if task::process_credentials(first_pid) != Some(task::Credentials::USERSPACE)
         || task::process_credentials(second_pid) != Some(task::Credentials::USERSPACE)
     {
@@ -985,9 +1024,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         task::Credentials::USERSPACE.gid,
     ));
 
+    let user_pair_wait_start = timer::ticks();
     while !task::process_exited(first_pid) || !task::process_exited(second_pid) {
+        if timer::ticks().wrapping_sub(user_pair_wait_start) > 2_000 {
+            serial::write_line(format_args!(
+                "[BOOT] paired userspace execution: TIMEOUT first_exited={} second_exited={}",
+                task::process_exited(first_pid),
+                task::process_exited(second_pid),
+            ));
+            console.println("PAIRED USERSPACE EXECUTION: TIMEOUT");
+            halt();
+        }
         x86_64::instructions::hlt();
     }
+    serial::write_line(format_args!(
+        "[BOOT] paired userspace execution: PASSED"
+    ));
 
     if !syscall::user_memory_verified() || task::anonymous_mapping_count() != 0 {
         console.println("USER MMAP/MUNMAP: FAILED");

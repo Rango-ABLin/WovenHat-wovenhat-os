@@ -92,8 +92,17 @@ impl Device for VirtioSmolDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = 1500;
-        caps.checksum = ChecksumCapabilities::ignored();
+        // VirtioSmolDevice currently submits complete Ethernet frames and does
+        // not request or implement virtio-net checksum offload.  Therefore
+        // smoltcp must compute/verify IPv4, ICMP, UDP and TCP checksums in
+        // software.  `ChecksumCapabilities::ignored()` disables that work and
+        // produces invalid live-network traffic (most visibly DHCP timeouts).
+        //
+        // For Ethernet devices smoltcp expects this value to include the
+        // 14-byte Ethernet header, so 1514 corresponds to the normal 1500-byte
+        // IPv4 MTU.
+        caps.max_transmission_unit = 1514;
+        caps.checksum = ChecksumCapabilities::default();
         caps
     }
 }
@@ -706,7 +715,7 @@ pub fn ping_start(ip: Ipv4Address) -> Result<(), SocketError> {
     let handle = runtime.ping_handle.ok_or(SocketError::Offline)?;
     runtime.ping_sequence = runtime.ping_sequence.wrapping_add(1);
     let seq = runtime.ping_sequence;
-    let mut packet = [0u8; 24];
+    let mut packet = [0u8; 25];
     packet[0] = 8; // ICMPv4 echo request
     packet[1] = 0;
     packet[4..6].copy_from_slice(&0x5748u16.to_be_bytes());
@@ -833,7 +842,7 @@ fn now() -> Instant {
 /// test in the kernel means DHCP, DNS, ICMP, UDP and TCP are exercised through
 /// the same virtio-net/smoltcp runtime used by normal boots rather than through
 /// a host-side mock.
-#[cfg(feature = "network-test")]
+#[cfg(any(feature = "qemu-test", feature = "network-test"))]
 pub fn qemu_runtime_self_test() -> bool {
     const UDP_PORT: u16 = 7000;
     const TCP_PORT: u16 = 8080;
