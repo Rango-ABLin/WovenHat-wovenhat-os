@@ -18,6 +18,7 @@ It is a bounded multicore kernel foundation, not unrestricted multicore userspac
   disables local preemption and waits for every online CPU's generation acknowledgement.
   Mapping changes invalidate translations before old physical frames are reclaimed.
 - `smp` diagnostics and `smptest` regression command in the diagnostic shell.
+- Live QEMU/slirp networking regression mode covering DHCP lease acquisition, DNS A-record resolution, ICMP echo, and host-verified UDP/TCP round trips. The network gate runs at 1, 2 and 4 CPUs in debug mode and again at 4 CPUs in the optimized release matrix.
 - Fixed pre-existing storage compiler errors (inconsistent depth constant and a
   recursive mutable-device borrow); directory traversal finishes before recursion.
 - Fixed strict lint failures and separated freestanding kernel lint from host lint.
@@ -42,9 +43,10 @@ The automated gates cover:
 3. A forced missing-topology/PIC fallback boot (`legacy-pic-test`); ACPI remains
    enabled for the UEFI firmware so the test exercises the kernel fallback.
 4. Complete debug boot on 1, 2 and 4 CPUs, both diskless and with disposable ATA/FAT32.
-5. Optimized 4-CPU boot, both diskless and with disposable ATA/FAT32.
-6. Normal optimized image build.
-7. A normal-image keyboard smoke test: QMP injects PS/2 keys for `smptest`,
+5. Live networking on 1, 2 and 4 CPUs: DHCP, DNS, ICMP, UDP echo and TCP echo through QEMU user networking. UDP/TCP payloads are injected and verified by the host harness, so queueing alone cannot satisfy the gate.
+6. Optimized 4-CPU boot, both diskless and with disposable ATA/FAT32, plus the live network suite.
+7. Normal optimized image build.
+8. A normal-image keyboard smoke test: QMP injects PS/2 keys for `smptest`,
    which must execute through the IOAPIC and complete all SMP checks.
 
 SMP checkpoints require an exact online CPU count, an all-CPU execution barrier,
@@ -53,7 +55,8 @@ and frame reclamation, and repeated acknowledged shootdowns. A VM configured
 with `-smp 4` alone is not accepted as proof of SMP.
 
 Storage tests now require the complete boot-suite success marker and QEMU exit 33,
-rather than terminating as soon as the first storage checkpoint appears. They
+rather than terminating as soon as the first storage checkpoint appears.
+Networking is now a release gate rather than an optional manual check: the test build must obtain a DHCP lease, resolve DNS, ping the QEMU gateway and complete host-verified UDP/TCP round trips while the same SMP validations remain active. They
 only recreate disks under `target/storage-regression-*`; the runtime data disk
 is not used by these tests.
 
@@ -70,6 +73,12 @@ UEFI image, checksum, release notes and validation evidence under
 In the diagnostic shell, run `version`, `smp`, `smptest`, `tasks`, `ls /mnt`,
 `df /mnt`, and `fscheck /mnt`. `smptest` is one-shot per boot. The launcher uses
 and preserves the existing `wovenhat-disk.img`; ordinary shell writes persist.
+
+## Stage 5 completion status
+
+The **Multicore/SMP Foundation stage is complete at its intended boundary**: 1/2/4-CPU startup, CPU-local scheduler state, LAPIC/IPI + IOAPIC routing, acknowledged TLB shootdowns, lock/ownership documentation, timer-preemption and stale-translation stress tests, and preservation of memory, storage, shell/userspace and networking through repeatable release gates.
+
+General movable userspace, unrestricted concurrent device/filesystem service execution, NUMA, CPU hotplug and x2APIC remain later SMP-maturity work; they are intentionally not requirements of the bounded foundation stage.
 
 ## Supported scope and remaining work
 

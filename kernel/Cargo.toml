@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 qemu-test = []
+network-test = ["qemu-test"]
 legacy-pic-test = ["qemu-test"]
 
 [dependencies]

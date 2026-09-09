@@ -825,3 +825,160 @@ fn now() -> Instant {
     let millis = timer::ticks().saturating_mul(1000) / timer::FREQUENCY_HZ as u64;
     Instant::from_millis(millis as i64)
 }
+
+/// Live QEMU/slirp network regression used by the Stage-5 release gate.
+///
+/// The Python harness supplies host forwards for UDP/7000 and TCP/8080 and
+/// waits for the READY markers below before injecting traffic.  Keeping the
+/// test in the kernel means DHCP, DNS, ICMP, UDP and TCP are exercised through
+/// the same virtio-net/smoltcp runtime used by normal boots rather than through
+/// a host-side mock.
+#[cfg(feature = "network-test")]
+pub fn qemu_runtime_self_test() -> bool {
+    const UDP_PORT: u16 = 7000;
+    const TCP_PORT: u16 = 8080;
+    const OWNER: u64 = u64::MAX - 0x5748;
+    let dhcp_timeout = u64::from(timer::FREQUENCY_HZ) * 8;
+    let dns_timeout = u64::from(timer::FREQUENCY_HZ) * 8;
+    let ping_timeout = u64::from(timer::FREQUENCY_HZ) * 8;
+    let io_timeout = u64::from(timer::FREQUENCY_HZ) * 12;
+
+    if set_dhcp(true).is_err() {
+        return false;
+    }
+    let deadline = timer::ticks().saturating_add(dhcp_timeout);
+    while !stats().using_dhcp {
+        poll();
+        if timer::ticks() >= deadline {
+            crate::serial::write_line(format_args!("[NETTEST] DHCP: TIMEOUT"));
+            return false;
+        }
+        crate::task::yield_now();
+    }
+    crate::serial::write_line(format_args!("[NETTEST] DHCP: PASSED"));
+
+    let Ok(query) = dns_start("example.com") else {
+        crate::serial::write_line(format_args!("[NETTEST] DNS: START FAILED"));
+        return false;
+    };
+    let deadline = timer::ticks().saturating_add(dns_timeout);
+    loop {
+        poll();
+        match dns_poll(query) {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => {
+                crate::serial::write_line(format_args!("[NETTEST] DNS: FAILED"));
+                return false;
+            }
+        }
+        if timer::ticks() >= deadline {
+            crate::serial::write_line(format_args!("[NETTEST] DNS: TIMEOUT"));
+            return false;
+        }
+        crate::task::yield_now();
+    }
+    crate::serial::write_line(format_args!("[NETTEST] DNS: PASSED"));
+
+    if ping_start(DEFAULT_GATEWAY).is_err() {
+        crate::serial::write_line(format_args!("[NETTEST] ICMP: START FAILED"));
+        return false;
+    }
+    let deadline = timer::ticks().saturating_add(ping_timeout);
+    loop {
+        poll();
+        match ping_poll() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => {
+                crate::serial::write_line(format_args!("[NETTEST] ICMP: FAILED"));
+                return false;
+            }
+        }
+        if timer::ticks() >= deadline {
+            crate::serial::write_line(format_args!("[NETTEST] ICMP: TIMEOUT"));
+            return false;
+        }
+        crate::task::yield_now();
+    }
+    crate::serial::write_line(format_args!("[NETTEST] ICMP: PASSED"));
+
+    if start_udp_echo(UDP_PORT).is_err() {
+        crate::serial::write_line(format_args!("[NETTEST] UDP: BIND FAILED"));
+        return false;
+    }
+    let initial_packets = stats().echo_packets;
+    crate::serial::write_line(format_args!("[NETTEST] UDP READY port={}", UDP_PORT));
+    let deadline = timer::ticks().saturating_add(io_timeout);
+    while stats().echo_packets == initial_packets {
+        poll();
+        if timer::ticks() >= deadline {
+            crate::serial::write_line(format_args!("[NETTEST] UDP: TIMEOUT"));
+            return false;
+        }
+        crate::task::yield_now();
+    }
+    crate::serial::write_line(format_args!("[NETTEST] UDP: PASSED"));
+
+    let Ok(tcp_id) = socket_open(OWNER, SocketKind::Tcp) else {
+        crate::serial::write_line(format_args!("[NETTEST] TCP: OPEN FAILED"));
+        return false;
+    };
+    if socket_bind(OWNER, tcp_id, TCP_PORT).is_err() {
+        let _ = socket_close(OWNER, tcp_id);
+        crate::serial::write_line(format_args!("[NETTEST] TCP: LISTEN FAILED"));
+        return false;
+    }
+    crate::serial::write_line(format_args!("[NETTEST] TCP READY port={}", TCP_PORT));
+
+    let mut payload = [0u8; 256];
+    let deadline = timer::ticks().saturating_add(io_timeout);
+    let received = loop {
+        poll();
+        match socket_recv(OWNER, tcp_id, &mut payload) {
+            Ok((len, _)) if len != 0 => break len,
+            Ok(_) | Err(SocketError::WouldBlock) => {}
+            Err(_) => {
+                let _ = socket_close(OWNER, tcp_id);
+                crate::serial::write_line(format_args!("[NETTEST] TCP: RECEIVE FAILED"));
+                return false;
+            }
+        }
+        if timer::ticks() >= deadline {
+            let _ = socket_close(OWNER, tcp_id);
+            crate::serial::write_line(format_args!("[NETTEST] TCP: RECEIVE TIMEOUT"));
+            return false;
+        }
+        crate::task::yield_now();
+    };
+
+    let deadline = timer::ticks().saturating_add(io_timeout);
+    loop {
+        poll();
+        match socket_send(OWNER, tcp_id, &payload[..received]) {
+            Ok(len) if len == received => break,
+            Ok(_) | Err(SocketError::WouldBlock) | Err(SocketError::BufferFull) => {}
+            Err(_) => {
+                let _ = socket_close(OWNER, tcp_id);
+                crate::serial::write_line(format_args!("[NETTEST] TCP: SEND FAILED"));
+                return false;
+            }
+        }
+        if timer::ticks() >= deadline {
+            let _ = socket_close(OWNER, tcp_id);
+            crate::serial::write_line(format_args!("[NETTEST] TCP: SEND TIMEOUT"));
+            return false;
+        }
+        crate::task::yield_now();
+    }
+    // Give smoltcp time to put the echoed bytes on the wire before removing the
+    // socket.  The host harness verifies the bytes, so this is not just a
+    // queueing test.
+    for _ in 0..4 {
+        poll();
+        crate::task::yield_now();
+    }
+    let _ = socket_close(OWNER, tcp_id);
+    crate::serial::write_line(format_args!("[NETTEST] TCP: PASSED"));
+    true
+}

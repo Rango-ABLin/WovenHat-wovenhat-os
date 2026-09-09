@@ -46,8 +46,9 @@ def main():
     for cpus in (1, 2, 4):
         for suite in ('memory', 'storage'):
             run(f'{suite}-{cpus}-debug', [sys.executable, f'scripts/test-{suite}-qemu.py', '--cpus', str(cpus)] + options)
+        run(f'network-{cpus}-debug', [sys.executable, 'scripts/test-network-qemu.py', '--cpus', str(cpus)] + options)
     run('legacy-pic', [sys.executable, 'scripts/test-memory-qemu.py', '--cpus', '1', '--legacy-irq'] + options)
-    for suite in ('memory', 'storage'):
+    for suite in ('memory', 'storage', 'network'):
         run(f'{suite}-4-release', [sys.executable, f'scripts/test-{suite}-qemu.py', '--cpus', '4', '--release'] + options)
     run('build-release', ['cargo', 'build', '--release'])
     run('shell-smoke', [sys.executable, 'scripts/test-shell-qemu.py'] + options)

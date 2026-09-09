@@ -782,6 +782,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         pic::unmask(keyboard::IRQ);
     }
     x86_64::instructions::interrupts::enable();
+    #[cfg(feature = "network-test")]
+    {
+        match network::init() {
+            Ok(()) => serial::write_line(format_args!("[NETTEST] virtio-net + smoltcp initialized")),
+            Err(error) => {
+                serial::write_line(format_args!("[NETTEST] init failed: {:?}", error));
+                halt();
+            }
+        }
+        if network::qemu_runtime_self_test() {
+            serial::write_line(format_args!("[NETTEST] DHCP/DNS/ICMP/UDP/TCP: PASSED"));
+        } else {
+            serial::write_line(format_args!("[NETTEST] runtime regression: FAILED"));
+            halt();
+        }
+    }
     if !block_io::start_worker() {
         console.println("BLOCK I/O WORKER: START FAILED");
         halt();

@@ -35,7 +35,7 @@ Corrected against source, not the stale docs:
 | Audit | Privileged-syscall audit log | `audit.rs` |
 | GUI | Framebuffer + basic widget/window primitives, **no compositor, no real desktop shell** | `graphics.rs`, `gui.rs` |
 | Networking | **Present** — virtio-net transport + smoltcp (DHCP, DNS, ICMP ping, UDP/TCP sockets) behind a capability-gated syscall ABI; corrected from an earlier "Absent" claim in this doc, see 2026-09-04 note above | `virtio_net.rs`, `network.rs` |
-| SMP | **Bounded foundation implemented in 0.8.0**: 1-4 CPUs, CPU-owned kernel scheduling, LAPIC/IOAPIC and TLB shootdowns; userspace/I/O remain BSP-owned | `smp.rs`, `task.rs`, `docs/release-0.8.0.md` |
+| SMP | **Stage-5 bounded foundation complete in 0.8.0**: 1-4 CPUs, CPU-owned kernel scheduling, LAPIC/IOAPIC and acknowledged TLB shootdowns, plus 1/2/4-core memory/storage/network release gates; general movable userspace/I/O remain later SMP-maturity work | `smp.rs`, `task.rs`, `scripts/test-release.py`, `scripts/test-network-qemu.py`, `docs/release-0.8.0.md` |
 | Drivers | Hard-coded to QEMU (serial, PS/2, PIT, ATA/PIO) | `ata.rs`, `keyboard.rs`, `timer.rs` |
 | CI | `cargo clippy -D warnings` + QEMU boot + exit-code validation | `.github/workflows/kernel.yml` |
 | Self-tests | 31 boot-time subsystem self-tests gating kernel continuation | `main.rs` |

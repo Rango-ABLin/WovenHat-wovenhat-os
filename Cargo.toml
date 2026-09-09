@@ -4,6 +4,7 @@ members = ["kernel"]
 
 [features]
 qemu-test = ["kernel/qemu-test"]
+network-test = ["qemu-test", "kernel/network-test"]
 legacy-pic-test = ["qemu-test", "kernel/legacy-pic-test"]
 
 [profile.dev]
